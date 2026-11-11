@@ -8,7 +8,9 @@ layer's fetch split, without importing the (torch-heavy) benchmark. ``benchbw.py
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 
 from freetoken.utils import init_logger
 
@@ -111,6 +113,50 @@ def layer_kind_key(fmt: str, options: dict[str, int], hidden: int, inter: int, t
     opts = ",".join(f"{k}={v}" for k, v in sorted(options.items()))
     fmt = f"{fmt}[{opts}]" if opts else fmt
     return f"{fmt}:{hidden}x{inter}:top{top_k}:t{cpu_threads}"
+
+
+_KIND = re.compile(r"^(?P<fmt>.+):(?P<h>\d+)x(?P<i>\d+):top(?P<k>\d+):t(?P<t>\d+)$")
+MAX_SHAPE_RATIO = 2.0     # unmeasured: how far a stand-in row's expert size may be from the layer's
+MAX_THREAD_RATIO = 1.25   # unmeasured: how far its CPU thread count may be from the executor's
+
+
+def parse_kind(key: str) -> tuple[str, int, int, int, int] | None:
+    """``gguf[down_type=8,gate_up_type=8]:2816x704:top8:t12`` -> (format with options, 2816, 704, 8, 12)."""
+    m = _KIND.match(key)
+    if not m:
+        return None
+    return m["fmt"], int(m["h"]), int(m["i"]), int(m["k"]), int(m["t"])
+
+
+def nearest_kind(rows: dict, key: str, *, max_shape: float = MAX_SHAPE_RATIO, max_threads: float = MAX_THREAD_RATIO) -> str | None:
+    """The key of the benched row that can stand in for ``key`` when ``key`` itself was not benched, or None.
+
+    A stand-in has the same format, options and top_k, an expert size within ``max_shape`` of the wanted one and a
+    thread count within ``max_threads``. The closest wins (log distance, shape and threads added); a tie goes to
+    the smaller expert, so the split leans to fetching, which is the offload side."""
+    want = parse_kind(key)
+    if want is None or not rows:
+        return None
+    if key in rows:
+        return key
+    fmt, h, i, k, t = want
+    if h * i <= 0 or t <= 0:
+        return None
+    best: tuple[float, int, str] | None = None
+    for other in rows:
+        got = parse_kind(other)
+        if got is None or got[0] != fmt or got[3] != k:
+            continue
+        _, h2, i2, _, t2 = got
+        shape = (h2 * i2) / (h * i)
+        threads = t2 / t
+        if not (1 / max_shape <= shape <= max_shape) or not (1 / max_threads <= threads <= max_threads):
+            continue
+        dist = abs(math.log(shape)) + abs(math.log(threads))
+        cand = (round(dist, 9), h2 * i2, other)
+        if best is None or cand < best:
+            best = cand
+    return best[2] if best else None
 
 
 def fetch_fraction(row: dict | None) -> float | None:

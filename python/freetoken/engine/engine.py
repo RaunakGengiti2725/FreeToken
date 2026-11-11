@@ -1122,7 +1122,7 @@ class Engine:
 
     def _profile_layer_rows(self):
         """(row key, label) of each MoE layer's kind in the `ft bench bw` profile, and the profile's rows; None without expert methods."""
-        from freetoken.moe.bench_profile import layer_kind_key, load_layer_kinds
+        from freetoken.moe.bench_profile import layer_kind_key, load_layer_kinds, nearest_kind
         from freetoken.moe.cpu_executor import _format_label
 
         methods = offload_layer_methods(self.model)
@@ -1130,12 +1130,22 @@ class Engine:
             return None
         gpu_name, gpu_uuid = _profile_gpu(self.device.index)
         rows = load_layer_kinds(gpu_name=gpu_name, gpu_uuid=gpu_uuid) or {}
-        keys, labels = [], []
+        keys, labels, stand_ins = [], [], {}
         for m in methods:
             fmt, opts = m.cpu_spec()
             c = m.cfg
-            keys.append(layer_kind_key(fmt, opts, c.hidden, c.local_intermediate, c.top_k, self.cpu_moe_executor.num_threads))
+            key = layer_kind_key(fmt, opts, c.hidden, c.local_intermediate, c.top_k, self.cpu_moe_executor.num_threads)
+            if key not in rows and (near := nearest_kind(rows, key)) is not None:
+                # a benched row of the same format and top_k, close in expert size and thread count, stands in for the missing one
+                stand_ins[key] = near
+                key = near
+            keys.append(key)
             labels.append(f"{_format_label(fmt, tuple(sorted(opts.items())))} {c.hidden}x{c.local_intermediate}")
+        if stand_ins:
+            logger.info_rank0(
+                "`ft bench bw` profile: no row for " + "; ".join(f"{want} (using the row of {got})" for want, got in sorted(stand_ins.items()))
+                + ". `ft bench bw --model <checkpoint>` benches the exact layer kinds"
+            )
         return keys, labels, rows
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
