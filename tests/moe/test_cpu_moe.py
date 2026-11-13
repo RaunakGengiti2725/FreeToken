@@ -1074,8 +1074,35 @@ def test_auto_cpu_pool_fits_the_cgroup_cpu_quota(tmp_path, monkeypatch, cores, p
     monkeypatch.setattr(cpu_executor, "_PROC_CGROUP", str(tmp_path / "proc_cgroup"))
     monkeypatch.setattr(cpu_executor, "_CGROUP_ROOT", str(tmp_path / "sys"))
     monkeypatch.setattr(cpu_executor, "physical_core_cpus", lambda: list(range(cores)))  # stands in for the host's topology
+    monkeypatch.setattr(cpu_executor, "_allowed_cpus", lambda: 2 * cores)  # every core has a spare sibling
 
     n, core_ids = cpu_executor.resolve_threads_and_affinity(requested)
     assert (n, len(core_ids)) == (threads, threads)
     if not requested:
         assert core_ids == list(range(threads))
+
+
+@pytest.mark.parametrize(
+    "allowed, cores",
+    [
+        (48, 48),  # every allowed CPU its own core (a VM): one thread per core leaves none spare
+        (49, 48),
+        (32, 16),  # SMT siblings are the spare CPUs: the pool keeps every core
+    ],
+)
+def test_auto_cpu_pool_is_the_largest_that_can_spin(tmp_path, monkeypatch, allowed, cores):
+    import os
+
+    from freetoken.moe import cpu_executor
+
+    monkeypatch.setattr(cpu_executor, "_PROC_CGROUP", str(tmp_path / "proc_cgroup"))
+    monkeypatch.setattr(cpu_executor, "_CGROUP_ROOT", str(tmp_path))  # no cgroup files: no quota
+    monkeypatch.setattr(cpu_executor, "physical_core_cpus", lambda: list(range(cores)))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(allowed)), raising=False)
+    monkeypatch.setattr(cpu_executor, "_SPIN_WAIT", True)
+
+    n, core_ids = cpu_executor.resolve_threads_and_affinity(0)
+    # the executor gives the last of these to the coordinator: the rule that decides spinning must then agree,
+    # and must refuse a pool one core larger unless the pool already has every core
+    assert cpu_executor._spin_wait_ok(core_ids[:-1], core_ids[-1])
+    assert n == cores or not cpu_executor._spin_wait_ok(list(range(n)), n)

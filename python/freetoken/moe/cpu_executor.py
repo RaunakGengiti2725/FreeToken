@@ -115,6 +115,8 @@ def physical_core_cpus() -> list[int]:
 # CPUs of a cgroup quota left beside the pool for the server's other threads. Measured on an EPYC 7B13 (quota 61.44)
 # and an EPYC 9755 (46.08): hybrid decode was throttled with 2.08 CPUs left, and not with 2.44 or 3.08.
 _QUOTA_SPARE = 3
+_SPIN_SPARE = 2  # mirrors _spin_wait_ok, which wants two allowed CPUs free for the main and CUDA callback threads
+_SPIN_MIN_CORES = 8  # unmeasured: below this, two cores are taken to be too large a share of the pool to give up
 _PROC_CGROUP = "/proc/self/cgroup"
 _CGROUP_ROOT = "/sys/fs/cgroup"  # v2: <cgroup>/cpu.max; v1: cpu/cpu.cfs_quota_us (-1 without a quota), cpu.cfs_period_us
 
@@ -167,6 +169,14 @@ def quota_cpus(cpus: int) -> int:
     return cpus if quota is None else max(1, min(cpus, int(quota)))
 
 
+def _allowed_cpus() -> int | None:
+    """How many CPUs this process may run on, or None where the platform cannot say."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return None
+
+
 def _spin_wait_ok(core_ids: list[int], coord_core: int) -> bool:
     """Spin only if each pool thread owns a distinct CPU and two CPUs stay free for the main and CUDA callback threads."""
     if not _SPIN_WAIT or not hasattr(os, "sched_getaffinity"):
@@ -183,8 +193,9 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
 
     ``requested == 0`` -> one thread per physical core, pinned to it (best for the
     bandwidth-bound GEMV: SMT siblings only contend for a core's load ports and the
-    spin-barrier degrades badly when oversubscribed), and no more threads than the
-    cgroup CPU quota leaves room for. An explicit count is honored,
+    spin-barrier degrades badly when oversubscribed), no more threads than the
+    cgroup CPU quota leaves room for, and two allowed CPUs left free where the
+    cores have no spare siblings, so the pool can spin. An explicit count is honored,
     spreading first across physical cores, then across the remaining logical CPUs
     (so distinct hardware threads are used before any core is doubled up).
     """
@@ -211,6 +222,16 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
             f"{quota:.2f} CPUs (--moe-cpu-threads sets the count)"
         )
         reps = reps[:fit]
+    # Where every allowed CPU is its own core (a VM, a container pinned without SMT siblings), one thread per core
+    # leaves none of the two free CPUs _spin_wait_ok asks for, and the pool parks between tasks.
+    allowed = _allowed_cpus()
+    if _SPIN_WAIT and allowed is not None and len(reps) >= _SPIN_MIN_CORES and allowed - len(reps) < _SPIN_SPARE:
+        room = allowed - _SPIN_SPARE
+        logger.info_rank0(
+            f"CPU MoE pool: {room} of {len(reps)} physical cores, to leave {_SPIN_SPARE} of the {allowed} allowed CPUs "
+            "free so the pool can spin (--moe-cpu-threads sets the count)"
+        )
+        reps = reps[:room]
     return len(reps), list(reps)
 
 
