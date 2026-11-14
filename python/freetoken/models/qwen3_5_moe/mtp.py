@@ -83,6 +83,21 @@ class Qwen3_5MTPDraft(BaseOP):
         elif os.path.isdir(path) and not any(name.startswith("mtp.") for name in safetensors_weight_map(path)):
             raise ValueError(f"{path} has no mtp.* tensors")
 
+    @staticmethod
+    def check_expert_quant(config: ModelConfig, path: str, quant: str) -> None:
+        """Raise ValueError if the draft's routed experts cannot be quantized to ``quant`` at load; called before the target loads."""
+        from freetoken.models.gguf.reader import is_gguf_path
+        from freetoken.moe.expert_quant import check_expert_quant
+
+        if is_gguf_path(path):
+            raise ValueError(f"--speculative-draft-quant {quant}: a GGUF draft keeps its experts in the file's ggml types")
+        if not config.moe_enabled:
+            raise ValueError(f"--speculative-draft-quant {quant}: this model's MTP draft has no routed experts")
+        stored = config.quant.scheme_for("mtp.layers.0.mlp.experts") if config.quant is not None else None
+        if stored is not None:
+            raise ValueError(f"--speculative-draft-quant {quant}: the draft's experts are already {stored.kind} in the checkpoint")
+        check_expert_quant(quant, config.hidden_size, config.moe_intermediate_size)
+
     def __init__(self, config: ModelConfig, target_model) -> None:
         self.config = draft_config(config)
         hidden = config.hidden_size
@@ -95,7 +110,10 @@ class Qwen3_5MTPDraft(BaseOP):
         self._embed_tokens = target_model.model.embed_tokens
 
     @classmethod
-    def load(cls, config: ModelConfig, target_model, model_path: str, device: torch.device, dtype: torch.dtype) -> Qwen3_5MTPDraft:
+    def load(
+        cls, config: ModelConfig, target_model, model_path: str, device: torch.device, dtype: torch.dtype, expert_quant: str | None = None
+    ) -> Qwen3_5MTPDraft:
+        """``expert_quant`` (fp8 / nvfp4) quantizes the bf16 routed experts at load and keeps them resident in that format."""
         from freetoken.models.gguf.reader import is_gguf_path
 
         # a GGUF trunk keeps the draft in its own ggml types, mapped by the target config's own to_gguf;
@@ -133,6 +151,12 @@ class Qwen3_5MTPDraft(BaseOP):
                 banks = nextn_expert_banks(model_path, device)
             else:
                 pieces = iter_mtp_expert_pieces(model_path)
+                if expert_quant is not None:
+                    from freetoken.moe.expert_quant import expert_quant_method, quantized_pieces
+
+                    # the layer was built for the bf16 experts the checkpoint stores: rebind it before its banks exist
+                    moe.quant_method = expert_quant_method(moe, expert_quant)
+                    pieces = quantized_pieces(pieces, moe.quant_method.kind, device)
                 banks = build_expert_banks(moe.quant_method, 1, pieces, device=device, resident=True)
             attach_resident_banks([moe], banks)
         # not the root: it reaches the target's embedding, which the target finalized already

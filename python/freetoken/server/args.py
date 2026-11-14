@@ -1157,6 +1157,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--speculative-draft-quant",
+        "--spec-draft-quant",
+        type=str,
+        choices=["none", "fp8", "nvfp4"],
+        default=ServerArgs.speculative_draft_quant,
+        help=(
+            "Quantize the MTP draft's bf16 routed experts at load and keep them resident in that format "
+            "(fp8: 128x128 block scales; nvfp4), freeing VRAM for the expert or KV cache. The target still "
+            "verifies every draft, so only the acceptance rate can change. Default none."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

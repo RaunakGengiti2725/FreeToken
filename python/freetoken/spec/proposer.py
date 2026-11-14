@@ -49,15 +49,19 @@ class Proposer:
 
     # True: the draft's KV slot i depends on token i+1, so the prefix cache keys position i by (t_i, t_{i+1})
     radix_lookahead: ClassVar[bool] = False
+    # True: the proposer serves --speculative-draft-quant
+    draft_quant: ClassVar[bool] = False
 
     @classmethod
     def adjust_config(cls, config, override) -> None:
-        """Raise if this proposer cannot serve the config; the base rejects TP > 1."""
+        """Raise if this proposer cannot serve the config; the base rejects TP > 1 and a draft quant the proposer does not serve."""
         if config.tp_info.size > 1:
             raise ValueError(
                 "speculative decoding needs --tp 1 for now: without a cross-rank agreement on the drafts, "
                 "near-tied draft argmaxes can differ between ranks and the ranks diverge"
             )
+        if getattr(config, "speculative_draft_quant", "none") != "none" and not cls.draft_quant:
+            raise ValueError("--speculative-draft-quant only works with an MTP draft that loads its own bf16 routed experts")
 
     @classmethod
     def prepare_target(cls, config, model) -> None:

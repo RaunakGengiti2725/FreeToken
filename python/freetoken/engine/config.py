@@ -133,6 +133,8 @@ class EngineConfig:
     speculative_num_steps: int = 0
     speculative_draft_model_path: str | None = None
     speculative_token_map: str | None = None
+    # --speculative-draft-quant: fp8 / nvfp4 quantizes the MTP draft's bf16 routed experts at load
+    speculative_draft_quant: str = "none"
     # the proposer's states on the target's linear-state slots, resolved by _adjust_config
     spec_slot_states: tuple[SlotStateSpec, ...] = ()
     # --preset, and the fields whose value is the preset's because the command line left them alone. The engine drops

@@ -27,7 +27,10 @@ logger = init_logger(__name__)
 
 
 class MTPDraft(Protocol):
-    """The class a family registers as ``ModelSpec.spec_drafts["mtp"]``."""
+    """The class a family registers as ``ModelSpec.spec_drafts["mtp"]``.
+
+    A draft that serves --speculative-draft-quant also defines ``check_expert_quant(config, path, quant)``, which raises
+    ValueError before the target loads, and takes ``expert_quant`` in ``load``."""
 
     # None: the proposer picks from the target's backends
     attention_backend: ClassVar[str | None]
@@ -120,8 +123,29 @@ def read_token_map(path: str, vocab_size: int) -> torch.Tensor:
     return ids
 
 
+def _log_draft_quant(config, draft, target_model) -> None:
+    """One startup line: the draft's expert bank before and after, and where the freed bytes go."""
+    from freetoken.layers.moe import OffloadMoELayer, iter_moe_layers
+    from freetoken.moe.expert_quant import slot_bytes
+
+    layers = list(iter_moe_layers(draft))
+    # the bf16 layout: gate_up [2I, H] and down [H, I] per expert, in the model dtype
+    before = sum(m.num_experts * 3 * m.hidden_size * m.intermediate_size * config.dtype.itemsize for m in layers)
+    after = sum(t.nbytes for m in layers for t in m._expert_banks.values())
+    freed = before - after
+    slot = next((slot_bytes(m.quant_method) for m in iter_moe_layers(target_model) if isinstance(m, OffloadMoELayer)), 0)
+    if slot and config.moe_cache_auto:
+        gain = f": {freed // slot} more expert cache slots of {slot} bytes under --moe-cache-auto"
+    elif slot:
+        gain = f" ({freed // slot} expert cache slots of {slot} bytes) for the KV cache, as the expert cache size is fixed"
+    else:
+        gain = " for the KV cache"
+    logger.info_rank0(f"--speculative-draft-quant {config.speculative_draft_quant}: draft expert bank {before} -> {after} bytes, {freed} bytes freed{gain}")
+
+
 class MTPProposer(Proposer):
     radix_lookahead = True
+    draft_quant = True
 
     @classmethod
     def num_steps(cls, config) -> tuple[int, int]:
@@ -149,6 +173,11 @@ class MTPProposer(Proposer):
             if config.model_config.tie_word_embeddings:
                 raise ValueError("--speculative-token-map needs an LM head with its own weights, but this one is tied to the embedding")
             read_token_map(config.speculative_token_map, config.model_config.vocab_size)
+        if config.speculative_draft_quant != "none":
+            check = getattr(cls._draft_class(config), "check_expert_quant", None)
+            if check is None:
+                raise ValueError(f"--speculative-draft-quant is not supported for the MTP draft of {arch} yet")
+            check(config.model_config, path, config.speculative_draft_quant)
 
     @classmethod
     def prepare_target(cls, config, model) -> None:
@@ -197,11 +226,14 @@ class MTPProposer(Proposer):
         from freetoken.layers.moe import OffloadMoELayer, iter_moe_layers
 
         draft_cls = self._draft_class(config)
-        self.draft = draft_cls.load(with_resident_moe(config.model_config), target_model, path, self.device, config.dtype)
+        quant = {} if config.speculative_draft_quant == "none" else {"expert_quant": config.speculative_draft_quant}
+        self.draft = draft_cls.load(with_resident_moe(config.model_config), target_model, path, self.device, config.dtype, **quant)
         # an offloaded or shared MoE layer here would read the target's experts as its own, silently
         target_moe = {id(m) for m in iter_moe_layers(target_model)}
         if any(isinstance(m, OffloadMoELayer) or id(m) in target_moe for m in iter_moe_layers(self.draft)):
             raise RuntimeError(f"{draft_cls.__name__} must build its own MoE layers, resident on the GPU")
+        if quant:
+            _log_draft_quant(config, self.draft, target_model)
         # hot_ids[i] is the target's token id of the draft head's row i
         self.lm_head, self.hot_ids = target_model.lm_head.kept_rows or (target_model.lm_head, None)
         self.mrope = config.model_config.model_is_mrope

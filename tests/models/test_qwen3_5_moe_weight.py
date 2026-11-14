@@ -682,6 +682,73 @@ def test_mtp_head_fills_the_draft_and_its_experts(checkpoint):
         assert _same(piece["gate_scale"][0], raw[f"{MTP}.mlp.experts.{expert}.gate_proj.weight_scale_inv"])
 
 
+@pytest.mark.parametrize("quant", ["fp8", "nvfp4"])
+def test_draft_quant_fills_the_drafts_resident_banks_in_that_kinds_layout(tmp_path, monkeypatch, quant):
+    """--speculative-draft-quant on a checkpoint with bf16 MTP experts: the draft's resident banks take the layout the kind's kernel reads, and decoded as that kernel decodes them they are the stored experts to the format's rounding. A draft the checkpoint already quantized is refused before anything loads."""
+    from dataclasses import replace
+
+    from freetoken.kernel.triton.fp8_block_linear import dequant_block_fp8
+    from freetoken.layers import rotary
+    from freetoken.models.qwen3_5_moe.mtp import Qwen3_5MTPDraft
+    from freetoken.moe import expert_quant
+    from freetoken.spec.mtp.proposer import with_resident_moe
+
+    torch.manual_seed(31)
+    moe, quantization_config, raw = _layout("bf16")
+    folder = _write(tmp_path, moe, quantization_config, raw)
+    _install(folder)
+    hf = cached_load_hf_config(folder)
+    config = replace(parse_config(hf), quant=checkpoint_quant_config(folder, hf, get_model_spec(hf.architectures[0])))
+    Qwen3_5MTPDraft.check_expert_quant(config, folder, quant)
+    # the four experts cross a chunk boundary
+    monkeypatch.setattr(expert_quant, "_CHUNK", 3)
+    saved = rotary._ROPE_DEVICE
+    rotary.set_rope_device(torch.device("cpu"))
+    rotary.get_rope.cache_clear()
+    try:
+        target = SimpleNamespace(model=SimpleNamespace(embed_tokens=None))
+        draft = Qwen3_5MTPDraft.load(with_resident_moe(config), target, folder, torch.device("cpu"), torch.bfloat16, expert_quant=quant)
+    finally:
+        rotary.set_rope_device(saved)
+        rotary.get_rope.cache_clear()
+
+    experts = draft.layers.op_list[0].mlp.experts
+    banks = experts._expert_banks
+    stored = {"gate_up": raw[f"{MTP}.mlp.experts.gate_up_proj"].float(), "down": raw[f"{MTP}.mlp.experts.down_proj"].float()}
+    if quant == "fp8":
+        assert experts.quant_method.kind is QuantKind.FP8_BLOCK
+        assert {role: (tuple(t.shape), t.dtype) for role, t in banks.items() if not role.endswith("_scale")} == {
+            "gate_up": ((E, 2 * MI, H), FP8), "down": ((E, H, MI), FP8)}
+        for proj, weight in stored.items():
+            rows, cols = weight.shape[1] // BLOCK, weight.shape[2] // BLOCK
+            scale = banks[f"{proj}_scale"]
+            # the scale bank pads its last dim for the fused copy
+            assert scale.dtype is torch.bfloat16 and scale.shape[:2] == (E, rows) and scale.shape[2] >= cols
+            for e in range(E):
+                back = dequant_block_fp8(banks[proj][e], scale[e, :, :cols]).float()
+                assert ((back - weight[e]).abs() <= weight[e].abs() * 0.071 + 3e-6 * weight[e].abs().max()).all(), (proj, e)
+    else:
+        assert experts.quant_method.kind is QuantKind.NVFP4
+        assert {role: (tuple(t.shape), t.dtype) for role, t in banks.items()} == {
+            "gate_up": ((E, 2 * MI, H // 2), torch.uint8), "gate_up_scale": ((E, 2 * MI, H // 16), FP8), "gate_up_global": ((E, 2 * MI), torch.float32),
+            "down": ((E, H, MI // 2), torch.uint8), "down_scale": ((E, H, MI // 16), FP8), "down_global": ((E, H), torch.float32)}
+        for proj, weight in stored.items():
+            for e in range(E):
+                back = _nvfp4_reference(banks[proj][e], banks[f"{proj}_scale"][e], banks[f"{proj}_global"][e]).float()
+                # one e2m1 step is the block scale times the row global: the widest gap is 4 to 6, so a tie sits a step away (plus the reference's bf16 rounding)
+                step = (banks[f"{proj}_scale"][e].float() * banks[f"{proj}_global"][e][:, None]).repeat_interleave(16, dim=1)
+                assert ((back - weight[e]).abs() <= step * 1.02).all(), (proj, e)
+                assert (back - weight[e]).norm() / weight[e].norm() < 0.12, (proj, e)
+
+    (tmp_path / "fp8").mkdir()
+    quantized = _write(tmp_path / "fp8", *_layout("fp8_block"))
+    _install(quantized)
+    hf = cached_load_hf_config(quantized)
+    config = replace(parse_config(hf), quant=checkpoint_quant_config(quantized, hf, get_model_spec(hf.architectures[0])))
+    with pytest.raises(ValueError, match="already fp8_block in the checkpoint"):
+        Qwen3_5MTPDraft.check_expert_quant(config, quantized, quant)
+
+
 # --------------------------------------------------------------------------- the trunk's nextn block (GGUF)
 
 

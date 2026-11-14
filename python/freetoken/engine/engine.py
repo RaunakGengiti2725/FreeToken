@@ -3141,6 +3141,8 @@ def _adjust_config(config: EngineConfig):
     if getattr(config, "speculative_algorithm", None) is not None:
         adjust_spec = _adjust_preset_spec_config if "speculative_algorithm" in preset_fields else _adjust_spec_config
         adjust_spec(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
+    elif getattr(config, "speculative_draft_quant", "none") != "none":
+        raise ValueError("--speculative-draft-quant needs --speculative-algorithm mtp")
     if _preset_capture_bytes(config) and getattr(config, "speculative_algorithm", None) is None:
         _drop_preset_captures(config, "they are captured beside the verify step of speculative decoding, which is off")
 
