@@ -63,6 +63,7 @@ _GEMV_SPLITK_BLOCK_KW = 16
 _GEMV_SPLITK_TARGET = 1024  # target total programs for the split-K grid
 
 # Small-M dot GEMM tiles (batched decode M=2..64 + lm_head last-token prefill batch).
+_GEMM_BLOCK_N = 128
 _GEMM_BLOCK_KW = 16
 _GEMM_SPLITK_TARGET = 1024  # target total programs for the split-K grid (M > 16)
 # M <= 16 (decode bsz 1-16) is pure weight streaming: the split-K grid must span the SMs
@@ -307,6 +308,22 @@ def _nvfp4_gemv_splitk_kernel(
         tl.store(counter_ptr + pid_n, 0)  # leave zeroed for the next launch/replay
 
 
+def _gemv_splitk_plan(N: int, K: int, transposed: bool) -> tuple[int, int, int, bool]:
+    """``(BLOCK_N, split_k, tiles_per, even)`` of the M==1 split-K GEMV for a logical
+    ``[N, K//8]`` weight; together they fix the reduction order of every output.
+    ``split_k == 1``: the single-pass kernel runs instead."""
+    sk_block_n = _GEMV_SPLITK_BLOCK_N_T if transposed else _GEMV_SPLITK_BLOCK_N_ROW
+    n_blocks_n = triton.cdiv(N, sk_block_n)
+    num_tiles = triton.cdiv(K // 8, _GEMV_SPLITK_BLOCK_KW)
+    # Target ~a thousand blocks total; pow2 split_k -> stable reduction order.
+    split_k = max(1, min(_GEMV_SPLITK_TARGET // max(n_blocks_n, 1), num_tiles))
+    split_k = 1 << (split_k.bit_length() - 1)
+    tiles_per = triton.cdiv(num_tiles, split_k)
+    # Even iff every (tile_start + t) word tile is fully in range for every pid_k.
+    even = (K % (_GEMV_SPLITK_BLOCK_KW * 8) == 0) and (num_tiles == tiles_per * split_k)
+    return sk_block_n, split_k, tiles_per, even
+
+
 def _gemv(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
           gscale: torch.Tensor, out_dtype: torch.dtype, transposed: bool) -> torch.Tensor:
     """M==1 W4A16 GEMV. ``a`` [K] compute-dtype; ``packed_i32`` logical [N, K//8] int32
@@ -319,14 +336,10 @@ def _gemv(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
     scale = e4m3_kernel_view(scale)
     out = torch.empty(N, dtype=out_dtype, device=a.device)
     block_kw = _GEMV_BLOCK_KW_T if transposed else _GEMV_BLOCK_KW_ROW
-    sk_block_n = _GEMV_SPLITK_BLOCK_N_T if transposed else _GEMV_SPLITK_BLOCK_N_ROW
 
     K_WORDS = K // 8
+    sk_block_n, split_k, tiles_per, even = _gemv_splitk_plan(N, K, transposed)
     n_blocks_n = triton.cdiv(N, sk_block_n)
-    num_tiles = triton.cdiv(K_WORDS, _GEMV_SPLITK_BLOCK_KW)
-    # Target ~a thousand blocks total; pow2 split_k -> stable reduction order.
-    split_k = max(1, min(_GEMV_SPLITK_TARGET // max(n_blocks_n, 1), num_tiles))
-    split_k = 1 << (split_k.bit_length() - 1)
 
     if split_k == 1:  # large N (lm_head): single-pass full-K, direct global-scaled write
         even = K % (block_kw * 8) == 0
@@ -338,9 +351,6 @@ def _gemv(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
         )
         return out
 
-    tiles_per = triton.cdiv(num_tiles, split_k)
-    # Even iff every (tile_start + t) word tile is fully in range for every pid_k.
-    even = (K % (_GEMV_SPLITK_BLOCK_KW * 8) == 0) and (num_tiles == tiles_per * split_k)
     part = torch.empty((split_k, N), dtype=torch.float32, device=a.device)
     counters = _splitk_counters(n_blocks_n, a.device)
     _nvfp4_gemv_splitk_kernel[(n_blocks_n, split_k)](
@@ -543,26 +553,16 @@ def _pick_split_k_bm16(num_mn: int, num_tiles: int, wave: int) -> int:
     return split_k
 
 
-def _gemm_inkernel(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
-                   gscale: torch.Tensor, out_dtype: torch.dtype,
-                   transposed: bool) -> torch.Tensor:
-    """Batched-decode dot GEMM (M <= 64): weight read once, split-K keeps the SMs fed when
-    ``M x N`` alone yields too few programs (shared-expert N at small M)."""
-    M, K = a.shape
-    N = packed_i32.shape[0]
-    compute = out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16
-    scale = e4m3_kernel_view(scale)
-    out = torch.empty((M, N), dtype=compute, device=a.device)
+def _gemm_inkernel_plan(M: int, N: int, K: int,
+                        device: torch.device) -> tuple[int, int, int, bool]:
+    """``(BLOCK_M, split_k, tiles_per, even)`` of the M <= 64 dot GEMM for a logical
+    ``[N, K//8]`` weight on ``device``; together they fix its reduction order.
+    ``split_k == 1``: the GEMM writes the output itself, with no reduce launch."""
     BLOCK_M = 16 if M <= 16 else (32 if M <= 32 else 64)
-    BLOCK_N = 128
-    num_warps = 8 if BLOCK_M == 64 else 4
-    num_stages = 3
-
-    K_WORDS = K // 8
-    num_mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-    num_tiles = triton.cdiv(K_WORDS, _GEMM_BLOCK_KW)
+    num_mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, _GEMM_BLOCK_N)
+    num_tiles = triton.cdiv(K // 8, _GEMM_BLOCK_KW)
     if BLOCK_M == 16:
-        split_k = _pick_split_k_bm16(num_mn, num_tiles, _gemm_wave(a.device))
+        split_k = _pick_split_k_bm16(num_mn, num_tiles, _gemm_wave(device))
     else:
         split_k = max(1, min(_GEMM_SPLITK_TARGET // max(num_mn, 1), num_tiles))
         split_k = 1 << (split_k.bit_length() - 1)
@@ -576,11 +576,22 @@ def _gemm_inkernel(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tenso
             split_k = even_k
     tiles_per = triton.cdiv(num_tiles, split_k)
     even = (K % (_GEMM_BLOCK_KW * 8) == 0) and (num_tiles == tiles_per * split_k)
-    part = (torch.empty((split_k, M, N), dtype=torch.float32, device=a.device)
-            if split_k > 1 else out)  # unused dummy when split_k == 1
+    return BLOCK_M, split_k, tiles_per, even
+
+
+def _gemm_launch(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
+                 gscale: torch.Tensor, out: torch.Tensor, part: torch.Tensor,
+                 plan: tuple[int, int, int, bool]) -> None:
+    """The dot GEMM under ``plan``: into ``out`` when the plan has one K slice, else its fp32
+    partial sums into ``part`` [split_k, M, N] for a reduce launch. ``scale`` is the
+    :func:`e4m3_kernel_view`."""
+    BLOCK_M, split_k, tiles_per, even = plan
+    M, K = a.shape
+    N = packed_i32.shape[0]
+    num_mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, _GEMM_BLOCK_N)
     _nvfp4_gemm_kernel[(num_mn, split_k)](
         a, packed_i32, scale, gscale, out, part,
-        M, N, K, K_WORDS, tiles_per,
+        M, N, K, K // 8, tiles_per,
         a.stride(0), a.stride(1),
         packed_i32.stride(0), packed_i32.stride(1),
         scale.stride(0), scale.stride(1),
@@ -588,10 +599,27 @@ def _gemm_inkernel(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tenso
         part.stride(0) if split_k > 1 else 0,
         part.stride(1) if split_k > 1 else 0,
         part.stride(2) if split_k > 1 else 0,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_KW=_GEMM_BLOCK_KW,
-        SPLIT_K=split_k, OUT=_TL_DTYPE[compute], EVEN_K=even,
-        num_warps=num_warps, num_stages=num_stages,
+        BLOCK_M=BLOCK_M, BLOCK_N=_GEMM_BLOCK_N, BLOCK_KW=_GEMM_BLOCK_KW,
+        SPLIT_K=split_k, OUT=_TL_DTYPE[out.dtype], EVEN_K=even,
+        num_warps=8 if BLOCK_M == 64 else 4, num_stages=3,
     )
+
+
+def _gemm_inkernel(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
+                   gscale: torch.Tensor, out_dtype: torch.dtype,
+                   transposed: bool) -> torch.Tensor:
+    """Batched-decode dot GEMM (M <= 64): weight read once, split-K keeps the SMs fed when
+    ``M x N`` alone yields too few programs (shared-expert N at small M)."""
+    M, K = a.shape
+    N = packed_i32.shape[0]
+    compute = out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16
+    scale = e4m3_kernel_view(scale)
+    out = torch.empty((M, N), dtype=compute, device=a.device)
+    plan = _gemm_inkernel_plan(M, N, K, a.device)
+    split_k = plan[1]
+    part = (torch.empty((split_k, M, N), dtype=torch.float32, device=a.device)
+            if split_k > 1 else out)  # unused dummy when split_k == 1
+    _gemm_launch(a, packed_i32, scale, gscale, out, part, plan)
     if split_k > 1:
         # Small blocks spread the reduce over more SMs (it is latency-bound, ~2.5us);
         # very wide N amortizes better with fewer, fatter blocks.
