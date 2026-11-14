@@ -58,6 +58,35 @@ def _fp8_dequant(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return codes.float() * scale.float().repeat_interleave(128, dim=-2).repeat_interleave(128, dim=-1)
 
 
+def _first_difference(weight: torch.Tensor, a, b, names: tuple[str, str]) -> str:
+    """For an assertion message, where two quantizations ``(codes, scale[, global])`` of ``weight`` part: the differing bytes of each
+    tensor, and behind the first differing code its weight, block scale and weight / step."""
+    a, b = ([t.cpu() for t in q] for q in (a, b))
+    nvfp4 = len(a) == 3
+    lines = []
+    for what, x, y in zip(("codes", "scales", "globals"), a, b):
+        x, y = x.contiguous().view(torch.uint8), y.contiguous().view(torch.uint8)
+        where = (x != y).nonzero()
+        if len(where):
+            i = tuple(where[0].tolist())
+            lines.append(f"{what}: {len(where)} of {x.numel()} bytes differ, first at {i}: {int(x[i])} {names[0]}, {int(y[i])} {names[1]}")
+    codes = [_nibbles(q[0]) if nvfp4 else q[0].view(torch.uint8) for q in (a, b)]
+    where = (codes[0] != codes[1]).nonzero()
+    if len(where):
+        i = tuple(where[0].tolist())
+        w = float(weight.cpu()[i])
+        lines.append(f"first differing code at {i}: weight {w!r} ({w.hex()})")
+        for name, q, c in zip(names, (a, b), codes):
+            if nvfp4:
+                scale, glob = float(q[1][i[:-1] + (i[-1] // 16,)].float()), float(q[2][i[:-1]])
+                step, detail = scale * glob, f"block scale {scale!r}, row global {glob!r} ({glob.hex()})"
+            else:
+                step = float(q[1][i[:-2] + (i[-2] // 128, i[-1] // 128)].float())
+                detail = f"block scale {step!r}"
+            lines.append(f"  {name}: code {int(c[i])}, {detail}, weight / step {w / step if step else float('nan')!r}")
+    return "\n".join(lines) or "no byte differs"
+
+
 def test_e2m1_rounding_takes_ties_to_the_even_code():
     """Under a step of 1 the grid's midpoints go to the even code, 6 is the top, a zero keeps its sign and a denormal is a zero. Without a step every code is 0."""
     w = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0, 7.0, 0.26, 4.99, -0.25, -5.0, -9.0, 0.0, -0.0, 1e-40, -1e-40, float("inf")])
@@ -347,7 +376,11 @@ def test_nvfp4_banks_decode_the_same_under_the_dequant_kernel():
 
 @cuda
 def test_nvfp4_quantizer_matches_the_gpu_e2m1_conversion():
-    """Row by row under the row's global, the torch quantizer writes the bytes quantize_nvfp4 (the GPU's own e2m1 / e4m3 conversions) writes."""
+    """Row by row under the row's global, the torch quantizer writes the scales and codes quantize_nvfp4 (the GPU's own e2m1 / e4m3 conversions)
+    writes, except on a rounding midpoint, where the two may take either neighbour.
+
+    The kernel divides with Triton's approximate fp32 division (div.full, within 2 ulps) and the torch quantizer compares exactly. A row
+    global of max / 2688 puts a weight of every few rows on an e2m1 midpoint to the last bit, where the kernel's quotient falls on either side."""
     if torch.cuda.get_device_capability() < (10, 0):
         pytest.skip("the e2m1 conversion instruction needs sm_100 or newer")
     from freetoken.kernel.triton.nvfp4_act_quant import quantize_nvfp4 as quantize_rows
@@ -355,10 +388,26 @@ def test_nvfp4_quantizer_matches_the_gpu_e2m1_conversion():
     device = torch.device("cuda")
     w = _weights(1, 64, 256, seed=6).to(device)[0].float()
     packed, scale, glob = quantize_nvfp4(w)
-    for row in range(w.shape[0]):
-        q, s = quantize_rows(w[row : row + 1].contiguous(), glob[row : row + 1].contiguous())
-        assert torch.equal(s.view(torch.uint8), scale[row : row + 1].view(torch.uint8)), row
-        assert torch.equal(q, packed[row : row + 1]), row
+    q, s = (torch.cat(t) for t in zip(*(quantize_rows(w[row : row + 1].contiguous(), glob[row : row + 1].contiguous()) for row in range(w.shape[0]))))
+    report = _first_difference(w, (q, s, glob), (packed, scale, glob), ("kernel", "torch"))
+    # the kernel's 2-ulp quotient, then one rounding of its product
+    near = 4 * torch.finfo(torch.float32).eps
+
+    # a scale differs only between the two e4m3 values around a midpoint the ideal scale sits on
+    kernel_scale, torch_scale = s.view(torch.uint8).int(), scale.view(torch.uint8).int()
+    scale_off = kernel_scale != torch_scale
+    ideal = w.reshape(64, 16, 16).abs().amax(dim=-1).double() / (6.0 * glob).double().unsqueeze(-1)
+    assert ((kernel_scale - torch_scale).abs() == 1)[scale_off].all(), report
+    assert (((s.float().double() + scale.float().double()) / 2 - ideal).abs() <= near * ideal)[scale_off].all(), report
+
+    # under the same scale, a code differs only between the two e2m1 values around a midpoint the weight sits on
+    kernel_code, torch_code = _nibbles(q).long(), _nibbles(packed).long()
+    code_off = (kernel_code != torch_code) & ~scale_off.repeat_interleave(16, dim=-1)
+    step = (scale.float().double() * glob.double().unsqueeze(-1)).repeat_interleave(16, dim=-1)
+    grid = E2M1_GRID.double().to(device)
+    edge = (grid[kernel_code & 7] + grid[torch_code & 7]) / 2 * step
+    assert (((kernel_code ^ torch_code) < 8) & ((kernel_code - torch_code).abs() == 1))[code_off].all(), report
+    assert ((step > 0) & ((edge - w.double().abs()).abs() <= near * edge))[code_off].all(), report
 
 
 @cuda
@@ -370,5 +419,7 @@ def test_quantizing_on_the_gpu_writes_the_cpu_bytes(kind):
     for device in (torch.device("cpu"), torch.device("cuda")):
         pieces = list(quantized_pieces(iter([(0, 0, E, {"gate_up": gate_up, "down": down})]), kind, device))
         on[device.type] = {role: torch.cat([p[3][role] for p in pieces]).cpu() for role in pieces[0][3]}
-    for role, tensor in on["cpu"].items():
-        assert torch.equal(tensor.view(torch.uint8), on["cuda"][role].view(torch.uint8)), role
+    for proj, weight in (("gate_up", gate_up), ("down", down)):
+        cpu, gpu = ([tensor for role, tensor in on[name].items() if role.startswith(proj)] for name in ("cpu", "cuda"))
+        assert len(cpu) == len(gpu) == (2 if kind is QuantKind.FP8_BLOCK else 3)
+        assert all(torch.equal(a.view(torch.uint8), b.view(torch.uint8)) for a, b in zip(cpu, gpu)), _first_difference(weight, cpu, gpu, ("cpu", "cuda"))
