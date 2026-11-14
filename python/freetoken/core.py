@@ -29,6 +29,10 @@ class SamplingParams:
     # Stamp the ReqStats snapshot on every reply, not just the terminal one (llama.cpp's
     # timings_per_token; the API layer has already ANDed it with --enable-timings-report).
     timings_per_token: bool = False
+    # 0 disables: keep the tokens with at least min_p times the top token's probability
+    min_p: float = 0.0
+    # 1 disables: divides the positive logits and multiplies the negative ones of every token in the prompt or the output so far
+    repetition_penalty: float = 1.0
 
     @property
     def is_greedy(self) -> bool:
@@ -117,6 +121,8 @@ class Req:
     # the PrefillManager from the PendingReq's instance; a default blank otherwise).
     stats: ReqStats = field(default_factory=ReqStats, init=False, repr=False)
     output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
+    # [V] bool on the device, prompt and output tokens; only for a request with a repetition penalty
+    context_token_seen: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

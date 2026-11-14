@@ -17,6 +17,9 @@ class BatchSamplingArgs:
     top_p: torch.Tensor | None = None
     greedy_mask: torch.Tensor | None = None
     penalties: list[tuple[int, torch.Tensor, float, float]] = field(default_factory=list)
+    min_p: torch.Tensor | None = None
+    # (row, the request's [V] bool mask of the tokens in its context, penalty)
+    repetition: list[tuple[int, torch.Tensor, float]] = field(default_factory=list)
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -34,14 +37,33 @@ def sampling_module():
     return sampling
 
 
+def min_p_renorm_probs(probs: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
+    """``probs`` [B, V] with every token under ``min_p`` [B] times its row's top probability zeroed, renormalized."""
+    kept = torch.where(probs >= min_p.unsqueeze(1) * probs.amax(dim=1, keepdim=True), probs, 0.0)
+    return kept / kept.sum(dim=1, keepdim=True)
+
+
+def repetition_penalize(logits: torch.Tensor, seen: torch.Tensor, penalty: float) -> torch.Tensor:
+    """``logits`` with the tokens of the bool mask ``seen`` made less likely: a positive logit divided by ``penalty``, a negative one multiplied."""
+    return torch.where(seen, torch.where(logits > 0, logits / penalty, logits * penalty), logits)
+
+
 def sample_impl(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_k: torch.Tensor | int | None,
     top_p: torch.Tensor | float | None,
+    min_p: torch.Tensor | None = None,
 ) -> torch.Tensor:
     sampling = sampling_module()
     probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
+    if min_p is not None:
+        # min-p runs last: its cut is relative to the top token, which top-k and top-p always keep
+        if top_k is not None:
+            probs = sampling.top_k_renorm_probs(probs, top_k)
+        if top_p is not None:
+            probs = sampling.top_p_renorm_probs(probs, top_p)
+        return sampling.min_p_sampling_from_probs(probs, min_p)
     if top_k is None and top_p is None:
         return sampling.sampling_from_probs(probs)
 
@@ -66,8 +88,17 @@ class Sampler:
         params = [r.sampling_params for r in batch.reqs]
         is_greedy = [p.is_greedy for p in params]
         penalties = []
+        repetition = []
         for row, req in enumerate(batch.reqs):
             p = req.sampling_params
+            if p.repetition_penalty != 1.0 and req.can_decode:
+                if req.context_token_seen is None:
+                    # the prompt; sample() and commit_verify add every token committed after it
+                    ids = req.input_ids[req.input_ids < self.vocab_size]
+                    seen = torch.zeros(self.vocab_size, dtype=torch.bool, device=self.device)
+                    seen[ids.to(self.device).long()] = True
+                    req.context_token_seen = seen
+                repetition.append((row, req.context_token_seen, p.repetition_penalty))
             if not (p.presence_penalty or p.frequency_penalty) or not req.can_decode:
                 continue
             if req.output_token_counts is None:
@@ -78,7 +109,7 @@ class Sampler:
                 (row, req.output_token_counts, p.presence_penalty, p.frequency_penalty)
             )
         if all(is_greedy):
-            return BatchSamplingArgs(temperatures=None, penalties=penalties)
+            return BatchSamplingArgs(temperatures=None, penalties=penalties, repetition=repetition)
 
         MIN_P = MIN_T = 1e-6
         # Greedy outputs are selected explicitly in sample(); use neutral sampling
@@ -92,30 +123,37 @@ class Sampler:
             1.0 if g else min(max(p.top_p, MIN_P), 1.0)
             for p, g in zip(params, is_greedy)
         ]
+        min_ps = [0.0 if g else p.min_p for p, g in zip(params, is_greedy)]
         temperatures = make_device_tensor(ts, torch.float32, self.device)
-        top_k, top_p = None, None
+        top_k, top_p, min_p = None, None, None
         if any(k != self.vocab_size for k in top_ks):
             top_k = make_device_tensor(top_ks, torch.int32, self.device)
         if any(p < 1.0 for p in top_ps):
             top_p = make_device_tensor(top_ps, torch.float32, self.device)
+        if any(m > 0.0 for m in min_ps):
+            min_p = make_device_tensor(min_ps, torch.float32, self.device)
         greedy_mask = (
             make_device_tensor(is_greedy, torch.bool, self.device) if any(is_greedy) else None
         )
         return BatchSamplingArgs(
-            temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, penalties=penalties
+            temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, penalties=penalties,
+            min_p=min_p, repetition=repetition,
         )
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
-            if args.penalties:
+            if args.penalties or args.repetition:
                 logits = logits.float().clone()
+                # repetition scales the raw logit, so it goes before the additive penalties
+                for row, seen, penalty in args.repetition:
+                    logits[row] = repetition_penalize(logits[row], seen, penalty)
                 for row, counts, presence, frequency in args.penalties:
                     logits[row] -= frequency * counts + presence * (counts > 0)
             if args.temperatures is None:  # greedy sampling
                 tokens = torch.argmax(logits, dim=-1)
             else:
-                tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
+                tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p, args.min_p)
                 if args.greedy_mask is not None:
                     # Mixed batches still run probability sampling for all rows, but
                     # greedy rows must follow argmax's deterministic tie-breaking.
@@ -127,16 +165,18 @@ class Sampler:
                 counts.scatter_add_(
                     0, tokens[row : row + 1].long(), counts.new_ones(1)
                 )
+            for row, seen, _ in args.repetition:
+                seen.index_fill_(0, tokens[row : row + 1].long(), True)
             return tokens
 
     def sample_verify(self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor) -> torch.Tensor:
         """One token per verify row as decode would sample it, ``drafts`` [bs, k] giving k+1 rows per request.
 
-        Row j of a request is penalized as if its drafts d1..dj were already committed; the penalty counts are not updated.
+        Row j of a request is penalized as if its drafts d1..dj were already committed; the penalty counts and the context mask are not updated.
         """
         bs, k = drafts.shape
         width = k + 1
-        if args.penalties:
+        if args.penalties or args.repetition:
             logits = self._penalize_rows(logits, args, drafts)
         if args.temperatures is None:
             return torch.argmax(logits, dim=-1)
@@ -144,19 +184,19 @@ class Sampler:
         def rows(t: torch.Tensor | None) -> torch.Tensor | None:
             return None if t is None else t.repeat_interleave(width)
 
-        tokens = sample_impl(logits.float(), rows(args.temperatures), rows(args.top_k), rows(args.top_p))
+        tokens = sample_impl(logits.float(), rows(args.temperatures), rows(args.top_k), rows(args.top_p), rows(args.min_p))
         if args.greedy_mask is not None:
             greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
             tokens = torch.where(rows(args.greedy_mask), greedy_tokens, tokens)
         return tokens
 
     def probs(self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor) -> torch.Tensor | None:
-        """[bs*(k+1), V] fp32 distribution each verify row samples from (softmax(T), then top-k, then top-p, as the fused samplers apply them), penalized like sample_verify and one-hot at the argmax on greedy rows; None when every request is greedy."""
+        """[bs*(k+1), V] fp32 distribution each verify row samples from (softmax(T), then top-k, then top-p, then min-p, as sample_impl applies them), penalized like sample_verify and one-hot at the argmax on greedy rows; None when every request is greedy."""
         if args.temperatures is None:
             return None
         sampling = sampling_module()
         width = drafts.shape[1] + 1
-        if args.penalties:
+        if args.penalties or args.repetition:
             logits = self._penalize_rows(logits, args, drafts)
         top = None if args.greedy_mask is None else torch.argmax(logits, dim=-1, keepdim=True)
         probs = sampling.softmax(logits.float(), args.temperatures.repeat_interleave(width), enable_pdl=is_sm90_supported())
@@ -166,6 +206,8 @@ class Sampler:
             probs = sampling.top_k_renorm_probs(probs, args.top_k.repeat_interleave(width))
         if args.top_p is not None:
             probs = sampling.top_p_renorm_probs(probs, args.top_p.repeat_interleave(width))
+        if args.min_p is not None:
+            probs = min_p_renorm_probs(probs, args.min_p.repeat_interleave(width))
         if top is not None:
             greedy = args.greedy_mask.repeat_interleave(width).unsqueeze(1)
             hot = torch.where(greedy, 1.0, probs.gather(1, top))
@@ -178,6 +220,11 @@ class Sampler:
         logits = logits.float().clone()
         # (row j, draft i) pairs with i < j: row j has seen drafts 0..j-1
         pair_rows, pair_drafts = torch.tril_indices(width, k, offset=-1, device=logits.device)
+        for req_row, seen, penalty in args.repetition:
+            block = logits[req_row * width : (req_row + 1) * width]
+            in_context = seen.repeat(width, 1)
+            in_context[pair_rows, drafts[req_row].long()[pair_drafts]] = True
+            block.copy_(repetition_penalize(block, in_context, penalty))
         earlier = torch.ones(k, k, dtype=torch.bool, device=logits.device).tril(-1)
         for req_row, counts, presence, frequency in args.penalties:
             block = logits[req_row * width : (req_row + 1) * width]

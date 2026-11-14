@@ -74,3 +74,31 @@ def test_sampling_softmax_fallback_with_masked_logits(mask):
     expected = torch.softmax(logits / temperature[:, None], dim=-1)
 
     torch.testing.assert_close(softmax(logits, temperature), expected, rtol=1e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize("rows, calls", [(4, 4000), (256, 200)])
+def test_sampling_min_p_draw_matches_torch(rows, calls):
+    """min_p_sampling_from_probs draws only tokens with at least min_p times the row's top probability, in proportion to their probability, over many seeds; 4 rows split each row over several CTAs, 256 leave one per row."""
+    from freetoken.kernel.triton.sampling import min_p_sampling_from_probs
+
+    torch.manual_seed(0)
+    distinct, vocab = 4, 151936
+    probs = torch.softmax(torch.randn((distinct, vocab), device="cuda") * 4, dim=-1)
+    min_p = torch.tensor([0.02, 0.1, 0.5, 1.0], device="cuda")
+    expected = torch.where(probs >= min_p[:, None] * probs.amax(dim=1, keepdim=True), probs, 0.0)
+    expected /= expected.sum(dim=1, keepdim=True)
+
+    copies = rows // distinct
+    batch_probs, batch_min_p = probs.repeat(copies, 1), min_p.repeat(copies)
+    counts = torch.zeros_like(probs)
+    ones = torch.ones(distinct, copies, device="cuda")
+    for seed in range(calls):
+        tokens = min_p_sampling_from_probs(batch_probs, batch_min_p, seed=seed).long().view(copies, distinct)
+        counts.scatter_add_(1, tokens.T, ones)
+
+    n = copies * calls
+    assert not counts[expected == 0].any()
+    # min_p = 1 leaves the top token alone
+    assert counts[3, probs[3].argmax()] == n
+    # 5 sigma of a frequency over n draws
+    assert (counts / n - expected).abs().max() < 5 * (0.25 / n) ** 0.5

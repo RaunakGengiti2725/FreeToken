@@ -1008,3 +1008,51 @@ def test_minimax_http_non_stream_forces_implicit_reasoning_without_request_knob(
     message = response["choices"][0]["message"]
     assert message["reasoning_content"] == "private thought"
     assert message["content"] == "visible answer"
+
+
+# ------------------------------------------------- min_p / repetition_penalty
+MODEL_SAMPLING = {"temperature": 0.7, "repetition_penalty": 1.05, "min_p": 0.05}
+
+
+def _resolved_sampling(endpoint: str, model_sampling: dict, **fields):
+    """The SamplingParams the endpoint hands the engine for a request carrying ``fields``, or its error response."""
+    state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    if endpoint == "chat":
+        req = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}], **fields)
+        response = run(handle_chat_completion(req, request=None, state=state, model_sampling=model_sampling))
+    elif endpoint == "completions":
+        req = CompletionRequest(model="m", prompt="hi", **fields)
+        response = run(handle_completion(req, request=None, state=state, model_sampling=model_sampling))
+    else:
+        req = ResponsesRequest.model_validate({"model": "m", "input": "hi", **fields})
+        response = run(handle_responses(req, request=None, state=state, model_sampling=model_sampling))
+    return response if state.sent is None else state.sent.sampling_params
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "completions", "responses"])
+def test_sampling_extras_come_from_the_request_then_the_model_defaults(endpoint):
+    sent = _resolved_sampling(endpoint, MODEL_SAMPLING, min_p=0.2, repetition_penalty=1.3)
+    assert (sent.min_p, sent.repetition_penalty) == (0.2, 1.3)
+    # the off value is a request value too: it must beat the model's default
+    sent = _resolved_sampling(endpoint, MODEL_SAMPLING, min_p=0.0, repetition_penalty=1.0)
+    assert (sent.min_p, sent.repetition_penalty) == (0.0, 1.0)
+    sent = _resolved_sampling(endpoint, MODEL_SAMPLING)
+    assert (sent.min_p, sent.repetition_penalty) == (0.05, 1.05)
+    # --sampling-defaults none hands the endpoints an empty dict
+    sent = _resolved_sampling(endpoint, {})
+    assert (sent.temperature, sent.min_p, sent.repetition_penalty) == (0.0, 0.0, 1.0)
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "completions", "responses"])
+@pytest.mark.parametrize("field, value", [
+    ("min_p", -0.1), ("min_p", 1.01), ("min_p", float("nan")),
+    ("repetition_penalty", 0.0), ("repetition_penalty", -1.5), ("repetition_penalty", float("inf")),
+])
+def test_out_of_range_sampling_extras_are_a_400(endpoint, field, value):
+    response = _resolved_sampling(endpoint, MODEL_SAMPLING, **{field: value})
+
+    assert response.status_code == 400
+    error = json.loads(response.body)["error"]
+    assert error["type"] == "invalid_request_error" and field in error["message"]
+    if endpoint != "responses":
+        assert error["param"] == field

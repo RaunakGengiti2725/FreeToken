@@ -331,6 +331,8 @@ def convert_anthropic_to_genspec(
             model_sampling=model_sampling,
             stop=req.stop_sequences,
             default_max_tokens=default_max_tokens,
+            min_p=req.min_p,
+            repetition_penalty=req.repetition_penalty,
         ),
         chat_template_kwargs=ctk,
         template_tools=template_tools,

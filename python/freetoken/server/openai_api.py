@@ -85,6 +85,8 @@ def chat_request_to_genspec(
             presence_penalty=req.presence_penalty,
             frequency_penalty=req.frequency_penalty,
             timings_per_token=timings_per_token,
+            min_p=req.min_p,
+            repetition_penalty=req.repetition_penalty,
         ),
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
@@ -204,7 +206,7 @@ async def handle_chat_completion(
             ),
         )
     except ValueError as exc:
-        return create_error_response(str(exc))
+        return create_error_response(str(exc), param=getattr(exc, "param", None))
 
     if req.stream:
         # Non-stream requests already surface render failures as a clean 400
@@ -436,7 +438,7 @@ async def handle_completion(
         )
         _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
     except ValueError as exc:
-        return create_error_response(str(exc), param="max_tokens")
+        return create_error_response(str(exc), param=getattr(exc, "param", "max_tokens"))
 
     # stamp per-token only when the server opted into timings too; llama.cpp publishes
     # partial timings on streams, so non-stream requests never pay for the snapshots
@@ -626,6 +628,8 @@ def _resolve_sampling(
         presence_penalty=req.presence_penalty,
         frequency_penalty=req.frequency_penalty,
         timings_per_token=timings_per_token,
+        min_p=req.min_p,
+        repetition_penalty=req.repetition_penalty,
     )
 
 

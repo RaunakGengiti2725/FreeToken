@@ -1433,6 +1433,8 @@ class Engine:
         for req, n, tokens in zip(reqs, counts, out):
             if req.output_token_counts is not None:
                 req.output_token_counts.scatter_add_(0, tokens[:n], req.output_token_counts.new_ones(n))
+            if req.context_token_seen is not None:
+                req.context_token_seen.index_fill_(0, tokens[:n], True)
 
     def _spec_budget(self, config) -> tuple[int, int]:
         """(fixed bytes, draft KV bytes per page) speculative decoding adds next to the KV pool."""

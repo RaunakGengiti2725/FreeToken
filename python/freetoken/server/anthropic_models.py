@@ -101,6 +101,9 @@ class AnthropicMessagesRequest(BaseModel):
     tools: list[AnthropicTool] | None = None
     top_k: int | None = None
     top_p: float | None = None
+    # extensions to the Anthropic request; range-checked when the request is resolved
+    min_p: float | None = None
+    repetition_penalty: float | None = None
 
     @field_validator("max_tokens")
     @classmethod
