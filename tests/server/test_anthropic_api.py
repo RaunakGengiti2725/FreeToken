@@ -661,6 +661,20 @@ def test_convert_native_thinking_toggle():
     absent = A.convert_anthropic_to_genspec(AnthropicMessagesRequest.model_validate(base), {})
     assert absent.chat_template_kwargs == {}
 
+    # chat_template_kwargs is the same extension the OpenAI route takes: other
+    # kwargs ride along with the toggle, an explicit thinking key replaces it.
+    def kwargs_for(**extra):
+        req = AnthropicMessagesRequest.model_validate({**base, **extra})
+        return A.convert_anthropic_to_genspec(req, {}).chat_template_kwargs
+
+    assert kwargs_for(chat_template_kwargs={"preserve_thinking": True}) == {"preserve_thinking": True}
+    assert kwargs_for(thinking={"type": "enabled"}, chat_template_kwargs={"preserve_thinking": True}) == {
+        "enable_thinking": True, "thinking_mode": "enabled", "preserve_thinking": True
+    }
+    assert kwargs_for(thinking={"type": "enabled"}, chat_template_kwargs={"enable_thinking": False}) == {
+        "enable_thinking": False
+    }
+
 
 # --------------------------------------------------------------------------- #
 # /v1/messages/count_tokens (route + neutral count_prompt_tokens primitive)

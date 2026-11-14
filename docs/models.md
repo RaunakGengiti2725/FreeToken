@@ -148,6 +148,15 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
 - Qwen3.5 / Qwen3.6 / Qwen3.8-27B load their zero-centred norm weights as stored and add the 1 in
   fp32 at runtime. An FTW of these models converted by an older build stores the norms with the 1
   already added: it loads without an error but gives wrong output; reconvert it with `ft checkpoint`.
+- Qwen3.6's chat template renders the reasoning of the assistant turns after the last user
+  message only. `"chat_template_kwargs": {"preserve_thinking": true}` keeps the reasoning of
+  earlier turns too, for clients that send it back (`reasoning_content` on `/v1/chat/completions`,
+  `thinking` blocks on `/v1/messages`, reasoning items on `/v1/responses`).
+  `/v1/chat/completions` and `/v1/messages` take `chat_template_kwargs` as a request field;
+  `/v1/responses` does not declare it and passes it to the template unvalidated when a request
+  carries it. The prefix cache follows the rendered prompt, so send the kwarg on every request
+  of a conversation: a request without it reuses the cache only up to the first kept reasoning
+  block.
 - An FTW converted before its family served images holds no vision encoder: `ft serve`
   refuses it unless started with `--text-model-only` (or `--mm-disable vision`); reconvert it
   with `ft checkpoint`, or add the encoder in place with [scripts/ftw_hotfix.py](ftw-hotfix.md).
