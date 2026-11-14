@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from freetoken.core import get_global_ctx
 from freetoken.layers import (
     BaseOP,
     LinearColParallelMerged,
@@ -68,6 +69,39 @@ class Qwen3_5MoE(BaseOP):
             prefix=f"{prefix}.shared_expert",
         )
         self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
+        self._fuse_shared = self._shared_expert_fusable(config)
+
+    def _shared_expert_fusable(self, config: ModelConfig) -> bool:
+        """Whether decode can run the shared expert in the fused NVFP4 kernels: both projections
+        resident under the triton kernel, on one rank, where those kernels' own gate holds."""
+        from freetoken.layers.quantization.linear.nvfp4 import TritonNvfp4LinearKernel
+
+        gate_up, down = self.shared_expert.gate_up_proj, self.shared_expert.down_proj
+        if down._tp_size > 1 or not all(isinstance(proj.quant_method.kernel, TritonNvfp4LinearKernel) for proj in (gate_up, down)):
+            return False
+        from freetoken.kernel.triton.nvfp4_shared_expert import shared_expert_fusable
+
+        return shared_expert_fusable(config.hidden_size, config.shared_expert_intermediate_size)
+
+    def _fuses_step(self, hidden_states: torch.Tensor) -> bool:
+        if not self._fuse_shared or hidden_states.dtype != torch.bfloat16 or get_global_ctx().batch.is_prefill:
+            return False
+        from freetoken.kernel.triton.nvfp4_shared_expert import shared_expert_fuses_rows
+
+        down = self.shared_expert.down_proj
+        return shared_expert_fuses_rows(hidden_states.shape[0], down.out_features, down.in_features, hidden_states.device)
+
+    def _forward_fused(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        """A decode step with the shared expert's elementwise kernels inside its two projections,
+        bit for bit the unfused statements of ``forward``."""
+        from freetoken.kernel.triton.nvfp4_shared_expert import shared_expert_down_add, shared_expert_gate_up
+
+        gate_up, down = self.shared_expert.gate_up_proj, self.shared_expert.down_proj
+        # as in forward, everything that reads hidden_states runs before the routed experts
+        act = shared_expert_gate_up(hidden_states, gate_up.weight, gate_up.weight_scale, gate_up.weight_global)
+        gate = self.shared_expert_gate.forward(hidden_states).view(-1)
+        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        return shared_expert_down_add(act, down.weight, down.weight_scale, down.weight_global, gate, routed)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -76,6 +110,8 @@ class Qwen3_5MoE(BaseOP):
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
         router_logits = self.gate.forward(hidden_states)
+        if self._fuses_step(hidden_states):
+            return self._forward_fused(hidden_states, router_logits).view(num_tokens, hidden_dim)
         shared = self.shared_expert.forward(hidden_states)
         shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)

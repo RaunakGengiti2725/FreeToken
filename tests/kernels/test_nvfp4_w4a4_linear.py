@@ -1,6 +1,7 @@
 """The W4A4 NVFP4 linears: cublas (our activation quant with 128x4-swizzled scales feeding torch's NVFP4 scaled_mm) and b12x (flashinfer only),
 and the sm_120 W4A16 GEMV / skinny GEMM both run for small batches on the same row-major weight.
-Also the triton W4A16 linear's decode kernels, which run on any CUDA GPU."""
+Also the triton W4A16 linear's decode kernels, which run on any CUDA GPU, and the fused decode kernels of the gated
+shared expert against the projection and elementwise kernels they replace."""
 
 from __future__ import annotations
 
@@ -253,3 +254,250 @@ def test_w4a16_decode_linear_keeps_its_bits_across_the_plan_and_launch_split(N, 
         ref = _dense_linear_before_the_split(x, *logical, row_global, transposed)
         differ = out.view(torch.int16) != ref.view(torch.int16)
         assert not bool(differ.any()), f"{M} rows: {int(differ.sum())} of {differ.numel()} elements differ"
+
+
+# 17 and 33 rows take the dot GEMM's wider row tiles; 64 is the most it takes
+_ROWS = [1, 2, 3, 4, 8, 17, 33, 64]
+# Qwen3.6-35B-A3B's shared expert, and one with a partial last tile along both N and K
+_SHARED = [(2048, 512), (2064, 528)]
+_KINDS = ["decode", "cancel", "large", "denormal", "ties"]
+
+
+def _skip_unless_the_shared_expert_fuses():
+    from freetoken.kernel.triton.nvfp4_shared_expert import shared_expert_fusable
+
+    if not shared_expert_fusable(2048, 512):
+        pytest.skip("the shared expert fusion is off here: its silu copies flashinfer's, which is not installed")
+
+
+def _resident(n, k, kind, row_global, gen):
+    """An NVFP4 projection in the K-major resident layout. "random" codes; "paired" gives inputs 2j and 2j + 1 one code;
+    "tap" makes output n the input n % k times one, so the row global alone sets what the projection rounds."""
+    from freetoken.kernel.triton.nvfp4_linear import nvfp4_transpose_resident
+
+    if kind == "tap":
+        rows = torch.arange(n, device="cuda")
+        col = rows % k
+        weight = torch.zeros(n, k // 2, dtype=torch.uint8, device="cuda")
+        weight[rows, col // 2] = torch.where(col % 2 == 0, 0x02, 0x20).to(torch.uint8)  # e2m1 code of 1.0
+        scale = torch.ones(n, k // 16, device="cuda").to(torch.float8_e4m3fn)
+        return *nvfp4_transpose_resident(weight, scale), row_global
+    if kind == "paired":
+        weight = (torch.randint(0, 16, (n, k // 2), device="cuda", generator=gen) * 17).to(torch.uint8)
+    else:
+        weight = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device="cuda", generator=gen)
+    scale = (torch.rand(n, k // 16, device="cuda", generator=gen) + 0.25).to(torch.float8_e4m3fn)
+    return *nvfp4_transpose_resident(weight, scale), row_global
+
+
+def _bf16_grid(shape, lo, hi, gen):
+    """Random bf16 values of either sign with an exponent in [lo, hi)."""
+    mantissa = torch.randint(128, 256, shape, device="cuda", generator=gen).float() / 128
+    sign = torch.randint(0, 2, shape, device="cuda", generator=gen).float() * 2 - 1
+    return torch.ldexp(sign * mantissa, torch.randint(lo, hi, shape, device="cuda", generator=gen)).to(torch.bfloat16)
+
+
+def _bf16_denormals(shape, gen):
+    bits = torch.randint(1, 128, shape, device="cuda", generator=gen) - 32768 * torch.randint(0, 2, shape, device="cuda", generator=gen)
+    return bits.to(torch.int16).view(torch.bfloat16)
+
+
+def _mirrored(M, k, gen):
+    """Inputs 2j and 2j + 1 are v and -v, every third pair one bf16 step apart in magnitude: under paired weights a
+    row's products cancel to a residue that depends on the order they are summed in."""
+    base = torch.randn(M, k // 2, device="cuda", generator=gen).to(torch.bfloat16)
+    mirror = (-base).view(torch.int16).clone()
+    mirror[:, ::3] += 1
+    return torch.stack([base, mirror.view(torch.bfloat16)], dim=-1).view(M, k).contiguous()
+
+
+def _cycle(n, values):
+    return torch.tensor(values, dtype=torch.float32, device="cuda")[torch.arange(n, device="cuda") % len(values)]
+
+
+def _shared_case(kind, M, hidden, inter, gen):
+    """A shared expert and one step of M rows through it. ``act`` is the down projection's input where the case sets
+    it (the silu-mul's output otherwise); ``routed(scaled)`` is the routed output for a gated shared output."""
+    weights = {"decode": "random", "cancel": "paired"}.get(kind, "tap")
+    gate_up_global = torch.full((2 * inter,), 0.012, dtype=torch.float32, device="cuda")
+    gate_up_global[inter:] = 0.02  # the halves of gate_up under different globals
+    down_global = torch.full((hidden,), 0.03, dtype=torch.float32, device="cuda")
+    x = torch.randn(M, hidden, device="cuda", dtype=torch.bfloat16, generator=gen)
+    fixed = torch.randn(M, hidden, device="cuda", dtype=torch.bfloat16, generator=gen)
+    logit = (torch.randn(M, device="cuda", generator=gen) * 2).to(torch.bfloat16)
+    act = None
+    routed = lambda scaled: fixed  # noqa: E731
+    rows = torch.arange(M, device="cuda")
+
+    if kind == "cancel":
+        # products that cancel to near zero in both projections and in the add of the routed output
+        x, act = _mirrored(M, hidden, gen), _mirrored(M, inter, gen)
+
+        def routed(scaled):
+            mirror = (-scaled).view(torch.int16).clone()
+            mirror.view(-1)[::3] += 1
+            return mirror.view(torch.bfloat16)
+    elif kind == "large":
+        # outputs up to and past the largest bf16 value; inputs stay under fp16's 65504, which the dot GEMM converts them to
+        x, act = _bf16_grid((M, hidden), 13, 15, gen), _bf16_grid((M, inter), 13, 15, gen)
+        steps = [2.0**112, 2.0**112 * (1 + 2.0**-8), 2.0**-8, 2.0**-20, 2.0**113]
+        gate_up_global, down_global = _cycle(2 * inter, steps), _cycle(hidden, steps)
+        # silu gates of -87.5, -88 and -88.5 (columns under the 2^-8 global): flashinfer's approximate divide gives zero there
+        x[:, 2], x[:, 7], x[:, 12] = -87.5 * 2.0**8, -88.0 * 2.0**8, -88.5 * 2.0**8
+        big, inf = torch.finfo(torch.bfloat16).max, float("inf")
+        pool = [big, -big, 88.5, -88.5, 100.0, -100.0, 16.5, -16.5, 0.0, -0.0, inf, -inf, 1e-30, -1e-30, 744.0, -744.0]
+        logit = torch.tensor(pool, device="cuda").to(torch.bfloat16)[(rows * 5 + M) % len(pool)]
+        fixed = _bf16_grid((M, hidden), 110, 127, gen)
+    elif kind == "denormal":
+        # outputs that land among the bf16 denormals, which flashinfer's silu-mul takes as zero
+        x, act = _bf16_grid((M, hidden), -12, -4, gen), _bf16_grid((M, inter), -12, -4, gen)
+        steps = [2.0**-121, 2.0**-118, 2.0**-125, 2.0**-121 * (1 + 2.0**-8), 2.0**-110]
+        gate_up_global, down_global = _cycle(2 * inter, steps), _cycle(hidden, steps)
+        # the first 32 gate, up and down outputs read denormal inputs under a global that makes them normal again
+        x[:, :32], x[:, inter:inter + 32], act[:, :32] = (_bf16_denormals((M, 32), gen) for _ in range(3))
+        gate_up_global[:32], gate_up_global[inter:inter + 32], down_global[:32] = 2.0**100, 2.0**100, 2.0**100
+        # denormal and barely normal gates against large ups, then gates near one against denormal ups
+        gate_up_global[inter + 32:inter + 96], gate_up_global[96:160] = 2.0**120, 2.0**8
+        fixed = _bf16_grid((M, hidden), -133, -118, gen)
+    elif kind == "ties":
+        # powers of two; every fourth column 1 + 2^-7 times one, which times a sigmoid of 0.75 is a tie
+        def inputs(k):
+            v = _bf16_grid((M, k), -8, 9, gen).float()
+            v = torch.ldexp(torch.sign(v), torch.frexp(v).exponent)
+            v[:, 3::4] *= 1 + 2.0**-7
+            return v.to(torch.bfloat16)
+
+        x, act = inputs(hidden), inputs(inter)
+        gate_up_global = _cycle(2 * inter, [1 + 2.0**-8, 1 + 3 * 2.0**-8, 1.0, 1.5])
+        down_global = _cycle(hidden, [1.0, 1 + 2.0**-8, 1 + 3 * 2.0**-8, 1.0])
+        # the bf16 value nearest ln 3, whose sigmoid rounds to 0.75, and 0, whose sigmoid is 0.5
+        logit = torch.tensor([1.1015625, 0.0], device="cuda").to(torch.bfloat16)[rows % 2]
+
+        def routed(scaled):
+            # half a bf16 step of each value, or one and a half: the sum is a tie either way
+            half = torch.ldexp(torch.ones_like(scaled, dtype=torch.float32), torch.frexp(scaled.float()).exponent - 9)
+            half[:, 1::2] *= 3
+            return torch.copysign(half, scaled.float()).to(torch.bfloat16)
+
+    return SimpleNamespace(
+        gate_up=_resident(2 * inter, hidden, weights, gate_up_global, gen),
+        down=_resident(hidden, inter, weights, down_global, gen),
+        x=x, act=act, logit=logit, routed=routed,
+    )
+
+
+def _assert_same_bits(out, ref, what):
+    """Equal bf16 bits; a NaN matches a NaN of any payload."""
+    assert out.shape == ref.shape and out.dtype == ref.dtype == torch.bfloat16, f"{what}: {out.shape} {out.dtype} against {ref.shape} {ref.dtype}"
+    differ = (out.contiguous().view(torch.int16) != ref.contiguous().view(torch.int16)) & ~(out.isnan() & ref.isnan())
+    if bool(differ.any()):
+        first = tuple(int(i) for i in differ.nonzero()[0])
+        raise AssertionError(
+            f"{what}: {int(differ.sum())} of {out.numel()} elements differ, first at {first}: "
+            f"fused {float(out[first])!r}, unfused {float(ref[first])!r}"
+        )
+
+
+def _ties(v):
+    """How many fp32 values lie exactly halfway between two bf16 values."""
+    return int(((v.contiguous().view(torch.int32) & 0xFFFF) == 0x8000).sum())
+
+
+@pytest.mark.parametrize("M", _ROWS)
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("hidden,inter", _SHARED)
+def test_fused_shared_expert_is_the_unfused_kernels_bit_for_bit(hidden, inter, kind, M):
+    """A decode step of M rows through the two fused kernels, against the projections, flashinfer's silu-mul and
+    torch's sigmoid, mul and add. Each kind asserts that it reaches the rounding edge it is built for."""
+    _skip_unless_the_shared_expert_fuses()
+    from freetoken.kernel.triton.nvfp4_linear import nvfp4_dense_linear_t
+    from freetoken.kernel.triton.nvfp4_shared_expert import shared_expert_down_add, shared_expert_fuses_rows, shared_expert_gate_up
+    from freetoken.layers import silu_and_mul
+
+    if not shared_expert_fuses_rows(M, hidden, inter, torch.device("cuda", torch.cuda.current_device())):
+        pytest.skip("the dot GEMM reduces this shape in one K slice at this row count, so the step runs unfused")
+    gen = torch.Generator(device="cuda").manual_seed(hidden + 131 * M)
+    for _ in range(2):  # a launch must leave the arrival counters zeroed for the next
+        case = _shared_case(kind, M, hidden, inter, gen)
+        gate_up_out = nvfp4_dense_linear_t(case.x, *case.gate_up)
+        act_ref = silu_and_mul(gate_up_out)
+        _assert_same_bits(shared_expert_gate_up(case.x, *case.gate_up), act_ref, f"silu, {M} rows")
+        silu_gate, silu_up = gate_up_out[:, :inter].float(), gate_up_out[:, inter:].float()
+        if kind == "ties":
+            assert _ties(case.x[:, : 2 * inter].float() * case.gate_up[2]), "no projection output is a tie"
+        elif kind == "large":
+            divisor = 1 + torch.exp(-silu_gate.double())
+            assert ((divisor > 2.0**126) & (divisor < 2.0**128) & silu_up.isfinite() & (silu_up != 0)).any(), \
+                "no gate is in the approximate divide's zero range"
+        elif kind == "denormal":
+            tiny = torch.finfo(torch.float32).tiny
+            assert ((silu_gate != 0) & (silu_gate.abs() < tiny) & (silu_up.abs() > 1)).any(), "no denormal gate meets a large up"
+            assert ((silu_up != 0) & (silu_up.abs() < tiny) & (silu_gate.abs() > 2.0**-5)).any(), "no denormal up meets a gate near one"
+
+        act = act_ref if case.act is None else case.act
+        shared = nvfp4_dense_linear_t(act, *case.down)
+        sigmoid = torch.sigmoid(case.logit)
+        scaled = shared * sigmoid[:, None]
+        routed = case.routed(scaled)
+        if kind == "ties":
+            assert _ties(shared.float() * sigmoid.float()[:, None]), "no gate product is a tie"
+            assert _ties(routed.float() + scaled.float()), "no sum is a tie"
+        out = shared_expert_down_add(act, *case.down, case.logit, routed)
+        _assert_same_bits(out, routed + scaled, f"down, {M} rows")
+
+
+@pytest.mark.parametrize("route", ["one row", "reduce"])
+def test_fused_shared_expert_sigmoid_is_torch_sigmoid_for_every_bf16_logit(route):
+    """The sigmoid inside each fused down kernel against torch.sigmoid on every bf16 value but the NaNs, one a row.
+    A row's down output is exactly 1.0 in column 0 and its routed output is zero, so column 0 is the sigmoid itself."""
+    _skip_unless_the_shared_expert_fuses()
+    from freetoken.kernel.triton.nvfp4_linear import nvfp4_transpose_resident
+    from freetoken.kernel.triton.nvfp4_shared_expert import _down_add_rows, shared_expert_down_add
+
+    logit = torch.arange(-32768, 32768, dtype=torch.int16, device="cuda").view(torch.bfloat16)
+    logit = logit[~logit.isnan()].contiguous()
+    M, N, K = logit.numel(), 32, 256
+    weight = torch.zeros(N, K // 2, dtype=torch.uint8, device="cuda")
+    weight[0, 0] = 0x02  # e2m1 code of 1.0 at row 0, k = 0
+    scale = torch.ones(N, K // 16, device="cuda").to(torch.float8_e4m3fn)
+    down = (*nvfp4_transpose_resident(weight, scale), torch.ones(N, dtype=torch.float32, device="cuda"))
+    act = torch.zeros(M, K, dtype=torch.bfloat16, device="cuda")
+    act[:, 0] = 1.0
+    routed = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+
+    if route == "one row":
+        # the kernel of a one-row step over every row at once
+        out = _down_add_rows(act, *down, logit, routed)
+    else:
+        # 64 rows a call: the most the dot GEMM and its reduce take
+        out = torch.cat([
+            shared_expert_down_add(act[r:r + 64], *down, logit[r:r + 64], routed[r:r + 64]) for r in range(0, M, 64)
+        ])
+    _assert_same_bits(out[:, 0], torch.sigmoid(logit), "sigmoid")
+    assert not out[:, 1:].any()
+
+
+@pytest.mark.parametrize("route", ["one row", "reduce"])
+def test_fused_shared_expert_silu_is_flashinfers_for_every_gate_at_decode_magnitudes(route):
+    """The silu-mul inside each fused gate_up kernel against flashinfer's, on every bf16 gate from 2^-8 to 2^8 in
+    magnitude, each against 4096 ups: a divide that is not flashinfer's own shows about once in 2^15 elements.
+    The projection reads each input once at a weight of one, so its outputs are the inputs themselves."""
+    _skip_unless_the_shared_expert_fuses()
+    from freetoken.kernel.triton.nvfp4_shared_expert import _gate_up_rows, shared_expert_gate_up
+    from freetoken.layers import silu_and_mul
+
+    half = 256
+    gate_up = _resident(2 * half, 2 * half, "tap", torch.ones(2 * half, device="cuda"), None)
+    gates = torch.arange(-32768, 32768, dtype=torch.int16, device="cuda").view(torch.bfloat16)
+    gates = gates[(gates.abs() >= 2.0**-8) & (gates.abs() < 2.0**8)]
+    assert gates.numel() == 4096
+    rows = gates.numel() * 4096 // half
+    x = torch.empty(rows, 2 * half, dtype=torch.bfloat16, device="cuda")
+    x[:, :half] = gates.repeat(4096).view(rows, half)
+    x[:, half:] = _bf16_grid((rows, half), -2, 3, torch.Generator(device="cuda").manual_seed(0))
+
+    # the kernel of a one-row step over 4096 rows at once; 64 rows a call are the most the dot GEMM and its reduce take
+    fused, step = (_gate_up_rows, 4096) if route == "one row" else (shared_expert_gate_up, 64)
+    for start in range(0, rows, step):
+        chunk = x[start:start + step]
+        _assert_same_bits(fused(chunk, *gate_up), silu_and_mul(chunk), f"silu of rows {start} to {start + step}")
