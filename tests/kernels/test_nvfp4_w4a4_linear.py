@@ -1,7 +1,7 @@
 """The W4A4 NVFP4 linears: cublas (our activation quant with 128x4-swizzled scales feeding torch's NVFP4 scaled_mm) and b12x (flashinfer only),
 and the sm_120 W4A16 GEMV / skinny GEMM both run for small batches on the same row-major weight.
 Also the triton W4A16 linear's decode kernels, which run on any CUDA GPU, and the fused decode kernels of the gated
-shared expert against the projection and elementwise kernels they replace."""
+shared expert and of the routed experts' sum against the projection, sum and elementwise kernels they replace."""
 
 from __future__ import annotations
 
@@ -501,3 +501,92 @@ def test_fused_shared_expert_silu_is_flashinfers_for_every_gate_at_decode_magnit
     for start in range(0, rows, step):
         chunk = x[start:start + step]
         _assert_same_bits(fused(chunk, *gate_up), silu_and_mul(chunk), f"silu of rows {start} to {start + step}")
+
+
+_TOP_K = 8  # Qwen3.6-35B-A3B routes a token to 8 experts
+_ROUTE_KINDS = ["decode", "cancel", "large", "denormal", "ties", "zeros"]
+
+
+def _route_outputs(kind, scaled, gen):
+    """Each route's output [M, _TOP_K, N] bf16, for a step whose gated shared output is ``scaled`` [M, N]."""
+    M, N = scaled.shape
+    shape = (M, _TOP_K, N)
+    if kind == "decode":
+        return (torch.randn(shape, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
+    if kind == "zeros":
+        # the sum kernel adds onto +0, so routes of -0 sum to +0; a sum that began with its first route would give -0
+        return torch.full(shape, -0.0, dtype=torch.bfloat16, device="cuda")
+    if kind == "cancel":
+        # pairs of large routes that cancel around small ones, and a last route that cancels the shared output
+        routes = _bf16_grid(shape, -22, -14, gen)
+        big = _bf16_grid((M, _TOP_K // 4, N), 8, 12, gen)
+        mirror = (-big).view(torch.int16).clone()
+        mirror[..., ::3] += 1
+        routes[:, 0::4], routes[:, 2::4] = big, mirror.view(torch.bfloat16)
+        last = (-scaled).view(torch.int16).clone()
+        last.view(-1)[::3] += 1
+        routes[:, -1] = last.view(torch.bfloat16)
+        return routes
+    if kind == "large":
+        routes = _bf16_grid(shape, 124, 128, gen)
+        big, inf = torch.finfo(torch.bfloat16).max, float("inf")
+        head = torch.zeros(_TOP_K, 6, device="cuda")
+        # by column: +inf; inf - inf; the largest value plus half a step, and plus less; its mirror; a sum past fp32 that comes back
+        head[0] = torch.tensor([inf, inf, big, big, -big, big])
+        head[1] = torch.tensor([1.0, -inf, 2.0**119, 2.0**118, -(2.0**119), big])
+        head[2, 5] = -big
+        routes[:, :, :6] = head.to(torch.bfloat16)
+        return routes
+    if kind == "denormal":
+        routes = _bf16_denormals(shape, gen)
+        routes[:, ::2, 1::2] = _bf16_grid((M, _TOP_K // 2, N // 2), -126, -120, gen)
+        return routes
+    routes = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+    v = _bf16_grid((M, N), -8, 9, gen)
+    # even columns: a value and half a bf16 step of it, or one and a half
+    half = torch.ldexp(torch.ones(M, N, device="cuda"), torch.frexp(v.float()).exponent - 9)
+    half[:, 2::4] *= 3
+    routes[:, 0], routes[:, 3] = v, torch.copysign(half, v.float()).to(torch.bfloat16)
+    # odd columns: the routes sum to half a bf16 step of the shared output, in two parts
+    half = torch.ldexp(torch.ones(M, N, device="cuda"), torch.frexp(scaled.float()).exponent - 10)
+    half = torch.copysign(half, scaled.float()).to(torch.bfloat16)
+    routes[:, :, 1::2] = 0
+    routes[:, 2, 1::2], routes[:, 5, 1::2] = half[:, 1::2], half[:, 1::2]
+    return routes
+
+
+@pytest.mark.parametrize("M", _ROWS)
+@pytest.mark.parametrize("kind", _ROUTE_KINDS)
+@pytest.mark.parametrize("hidden,inter", _SHARED)
+def test_fused_route_sum_is_the_sum_kernel_bit_for_bit(hidden, inter, kind, M):
+    """Each route's output handed to the fused down kernel, against moe_sum_reduce_kernel and the unfused kernels
+    after it: one row sums in the GEMV kernel, 2 to 64 rows in the reduce kernel."""
+    _skip_unless_the_shared_expert_fuses()
+    from freetoken.kernel import moe_sum_reduce_triton
+    from freetoken.kernel.triton.nvfp4_linear import nvfp4_dense_linear_t
+    from freetoken.kernel.triton.nvfp4_shared_expert import shared_expert_down_add, shared_expert_fuses_rows
+    from freetoken.layers import silu_and_mul
+
+    if not shared_expert_fuses_rows(M, hidden, inter, torch.device("cuda", torch.cuda.current_device())):
+        pytest.skip("the dot GEMM reduces this shape in one K slice at this row count, so the step runs unfused")
+    gen = torch.Generator(device="cuda").manual_seed(7 * hidden + 131 * M)
+    case = _shared_case("decode", M, hidden, inter, gen)
+    # a sigmoid of zero leaves a gated shared output of -0 wherever the shared output is negative
+    logit = torch.full_like(case.logit, float("-inf")) if kind == "zeros" else case.logit
+    act = silu_and_mul(nvfp4_dense_linear_t(case.x, *case.gate_up))
+    scaled = nvfp4_dense_linear_t(act, *case.down) * torch.sigmoid(logit)[:, None]
+    routes = _route_outputs(kind, scaled, gen)
+    routed = torch.empty_like(scaled)
+    moe_sum_reduce_triton(routes, routed)
+    # the fp32 partial sums in route order, to check that the kind reaches its edge
+    acc = routes.float().cumsum(dim=1)
+    if kind == "ties":
+        assert _ties(acc[:, -1]), "no sum of routes is a tie"
+        assert _ties(routed.float() + scaled.float()), "no add of the shared output is a tie"
+    elif kind == "large":
+        assert bool(routed.isinf().any()) and bool(routed.isnan().any()) and not bool(acc.isfinite().all())
+    elif kind == "zeros":
+        assert bool((scaled.view(torch.int16) == -32768).any()), "no gated shared output is -0"
+
+    out = shared_expert_down_add(act, *case.down, logit, routes)
+    _assert_same_bits(out, routed + scaled, f"sum, {kind}, {M} rows")

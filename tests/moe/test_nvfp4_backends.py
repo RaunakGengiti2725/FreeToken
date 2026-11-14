@@ -583,6 +583,30 @@ def test_triton_decode_marlin_matches_baseline_kernel():
 
 
 @cuda
+def test_triton_decode_marlin_unsummed_routes_are_what_its_sum_kernel_reads():
+    """sum_routes=False returns each route's weighted output [M, top_k, H]: the sum kernel over it gives the summed
+    call's bits, so a caller that sums the routes as that kernel does changes nothing."""
+    from freetoken.kernel import moe_sum_reduce_triton
+    from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
+
+    device = torch.device("cuda")
+    cache, _ = _triton_cache(device)
+    torch.manual_seed(11)
+    hidden = torch.randn(3, H, dtype=torch.bfloat16, device=device) / 4
+    topk_weights = torch.rand(3, TOPK, dtype=torch.float32, device=device)
+    ids = torch.tensor([[1, 6], [2, 3], [6, 0]], dtype=torch.int32, device=device)
+    cache.ensure_experts(0, ids)
+    cache.copy_missing()
+    banks = cache.pool_bank_views(0)
+    summed = fused_experts_decode_nvfp4_marlin(hidden.clone(), *banks, topk_weights, ids, "silu", False)
+    routes = fused_experts_decode_nvfp4_marlin(hidden.clone(), *banks, topk_weights, ids, "silu", False, sum_routes=False)
+    assert routes.shape == (3, TOPK, H) and routes.dtype == summed.dtype
+    out = torch.empty_like(summed)
+    moe_sum_reduce_triton(routes, out)
+    assert torch.equal(out.view(torch.int16), summed.view(torch.int16))
+
+
+@cuda
 def test_b12x_decode_matches_dequant_reference():
     """sm_120 + CUDA>=13 only: the flashinfer b12x W4A16 fused MoE over the slot cache
     vs the dequant reference (skipped on hardware/toolkits where b12x cannot run)."""

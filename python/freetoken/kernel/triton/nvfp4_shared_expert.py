@@ -3,8 +3,9 @@
     out = routed + sigmoid(gate) * down(silu_and_mul(gate_up(x)))
 
 with the silu-mul folded into the kernel that reduces gate_up, and the sigmoid, the scale and the
-add into the kernel that reduces down. No reduction is reordered and every value is rounded where
-the unfused kernels store it, so the result is theirs bit for bit. CUDA-graph safe.
+add into the kernel that reduces down, which also sums the routed experts' outputs when handed
+each route's. No reduction is reordered and every value is rounded where the unfused kernels store
+it, so the result is theirs bit for bit. CUDA-graph safe.
 """
 
 from __future__ import annotations
@@ -64,6 +65,20 @@ def _gate_scale_add(down, gate, routed):
     # torch's sigmoid of a bf16 tensor is the fp32 formula rounded once
     scale = _round_bf16(tl.div_rn(1.0, 1.0 + libdevice.exp(-gate)))
     return routed + _round_bf16(down * scale)
+
+
+@triton.jit
+def _routed_sum(routed_ptr, offs, mask, stride_rk, ROUTES: tl.constexpr):
+    """A row's routed output at ``offs`` in fp32. With ROUTES the row holds each route's output, summed
+    as ``moe_sum_reduce_kernel`` sums them: from zero, in route order, in fp32, rounded to bf16 once."""
+    if ROUTES == 0:
+        routed = tl.load(routed_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    else:
+        acc = tl.zeros(offs.shape, dtype=tl.float32)
+        for i in tl.static_range(ROUTES):
+            acc += tl.load(routed_ptr + i * stride_rk + offs, mask=mask, other=0.0).to(tl.float32)
+        routed = _round_bf16(acc)
+    return routed
 
 
 @triton.jit
@@ -191,7 +206,7 @@ def _shared_down_add_kernel(
     scale_ptr,    # logical [N, K // 16] fp8-e4m3
     gscale_ptr,   # [N] fp32 per-output-row global scale
     gate_ptr,     # [M] the shared expert gate's logit in the activation dtype
-    routed_ptr,   # [M, N] routed experts' output, unit inner stride
+    routed_ptr,   # [M, N] routed experts' output, or [M, ROUTES, N] each route's; unit inner stride
     part_ptr,     # [M, SPLIT_K, N] fp32 partial sums
     counter_ptr,  # [M * N_TILES] int32 arrival counters, zeroed (self-resetting)
     out_ptr,      # [M, N]
@@ -200,9 +215,9 @@ def _shared_down_add_kernel(
     stride_pn, stride_pkw,
     stride_sn, stride_sblk,
     stride_qm, stride_qk, stride_qn,
-    stride_rm, stride_om,
+    stride_rm, stride_rk, stride_om,
     BLOCK_N: tl.constexpr, BLOCK_KW: tl.constexpr, SPLIT_K: tl.constexpr,
-    OUT: tl.constexpr, EVEN_K: tl.constexpr,
+    OUT: tl.constexpr, EVEN_K: tl.constexpr, ROUTES: tl.constexpr,
 ):
     """``(row, pid_n, pid_k)``: one K slice of BLOCK_N down outputs. The last program to land a
     slice reduces them, scales by the sigmoid of the row's gate and adds the routed output."""
@@ -229,7 +244,7 @@ def _shared_down_add_kernel(
         g = tl.load(gscale_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
         down = _round_bf16(total * g)
         gate = tl.load(gate_ptr + row).to(tl.float32)
-        routed = tl.load(routed_ptr + row * stride_rm + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+        routed = _routed_sum(routed_ptr + row * stride_rm, offs_n, n_mask, stride_rk, ROUTES)
         out = _gate_scale_add(down, gate, routed)
         tl.store(out_ptr + row * stride_om + offs_n, out.to(OUT), mask=n_mask)
         tl.store(c_ptr, 0)  # leave zeroed for the next launch/replay
@@ -269,12 +284,12 @@ def _shared_down_add_reduce_kernel(
     part_ptr,     # [SPLIT_K, M, N] fp32 partial sums of the dot GEMM
     gscale_ptr,   # [N] fp32 per-output-row global scale
     gate_ptr,     # [M] the shared expert gate's logit in the activation dtype
-    routed_ptr,   # [M, N] routed experts' output, unit inner stride
+    routed_ptr,   # [M, N] routed experts' output, or [M, ROUTES, N] each route's; unit inner stride
     out_ptr,      # [M, N]
     N,
     stride_qk, stride_qm, stride_qn,
-    stride_rm, stride_om,
-    SPLIT_K: tl.constexpr, BLOCK: tl.constexpr, OUT: tl.constexpr,
+    stride_rm, stride_rk, stride_om,
+    SPLIT_K: tl.constexpr, BLOCK: tl.constexpr, OUT: tl.constexpr, ROUTES: tl.constexpr,
 ):
     """``_nvfp4_gemm_splitk_reduce_kernel`` for BLOCK down outputs of a row, with the scale by the
     gate and the add of the routed output in place of its store: keep the two in step."""
@@ -287,7 +302,7 @@ def _shared_down_add_reduce_kernel(
     g = tl.load(gscale_ptr + offs, mask=mask, other=0.0).to(tl.float32) * 128.0
     down = _round_bf16(acc * g)
     gate = tl.load(gate_ptr + pid_m).to(tl.float32)
-    routed = tl.load(routed_ptr + pid_m * stride_rm + offs, mask=mask, other=0.0).to(tl.float32)
+    routed = _routed_sum(routed_ptr + pid_m * stride_rm, offs, mask, stride_rk, ROUTES)
     out = _gate_scale_add(down, gate, routed)
     tl.store(out_ptr + pid_m * stride_om + offs, out.to(OUT), mask=mask)
 
@@ -313,6 +328,18 @@ def shared_expert_fuses_rows(M: int, hidden_size: int, intermediate_size: int, d
     gate_up = _gemm_inkernel_plan(M, 2 * intermediate_size, hidden_size, device)
     down = _gemm_inkernel_plan(M, hidden_size, intermediate_size, device)
     return gate_up[1] > 1 and down[1] > 1
+
+
+def _routes(routed: torch.Tensor, M: int, N: int, dtype: torch.dtype) -> tuple[int, int]:
+    """(ROUTES, the route stride) of a routed output: 0 routes for the summed [M, N], top_k for
+    each route's [M, top_k, N]."""
+    assert routed.dtype == dtype and routed.stride(-1) == 1
+    if routed.dim() == 2:
+        assert routed.shape == (M, N)
+        return 0, 0
+    assert routed.dim() == 3 and routed.shape[0] == M and routed.shape[2] == N and routed.shape[1] > 0
+    assert routed.numel() < 2**31, "the kernel indexes rows in int32"
+    return routed.shape[1], routed.stride(1)
 
 
 def _gate_up_rows(
@@ -397,15 +424,16 @@ def _down_add_rows(
     assert M * split_k * N < 2**31 and M * K < 2**31, "the kernel indexes rows in int32"
     part = torch.empty((M, split_k, N), dtype=torch.float32, device=act.device)
     counters = _splitk_counters(M * n_tiles, act.device)
+    routes, stride_rk = _routes(routed, M, N, act.dtype)
     _shared_down_add_kernel[(M, n_tiles, split_k)](
         act, packed, scale, weight_global, gate, routed, part, counters, out,
         N, K, K // 8, tiles_per, n_tiles,
         act.stride(0),
         packed.stride(0), packed.stride(1), scale.stride(0), scale.stride(1),
         part.stride(0), part.stride(1), part.stride(2),
-        routed.stride(0), out.stride(0),
+        routed.stride(0), stride_rk, out.stride(0),
         BLOCK_N=block_n, BLOCK_KW=_GEMV_SPLITK_BLOCK_KW, SPLIT_K=split_k,
-        OUT=tl.bfloat16, EVEN_K=even,
+        OUT=tl.bfloat16, EVEN_K=even, ROUTES=routes,
         num_warps=_GEMV_WARPS,
     )
     return out
@@ -417,12 +445,13 @@ def shared_expert_down_add(
 ) -> torch.Tensor:
     """``routed + down(act) * sigmoid(gate)[:, None]`` into a fresh [M, N] bf16 tensor, where
     :func:`shared_expert_fuses_rows` holds. ``act`` [M, K], ``gate`` [M] (the logit) and ``routed``
-    [M, N] are bf16; the weight is the down projection in the K-major resident layout."""
+    [M, N] are bf16; the weight is the down projection in the K-major resident layout.
+    ``routed`` may be each route's output [M, top_k, N], summed here as the sum kernel sums it."""
     M, K = act.shape
     N = weight_t.shape[1]
     assert act.dtype == torch.bfloat16 and act.stride(1) == 1
     assert weight_t.shape[0] * 8 == K
-    assert routed.shape == (M, N) and routed.dtype == act.dtype and routed.stride(1) == 1
+    routes, stride_rk = _routes(routed, M, N, act.dtype)
     assert gate.shape == (M,) and gate.dtype == act.dtype and gate.is_contiguous()
     if M <= 1:
         return _down_add_rows(act, weight_t, scale_t, weight_global, gate, routed)
@@ -436,8 +465,8 @@ def shared_expert_down_add(
     _shared_down_add_reduce_kernel[(M, triton.cdiv(N, _REDUCE_BLOCK))](
         part, weight_global, gate, routed, out, N,
         part.stride(0), part.stride(1), part.stride(2),
-        routed.stride(0), out.stride(0),
-        SPLIT_K=split_k, BLOCK=_REDUCE_BLOCK, OUT=tl.bfloat16, num_warps=_REDUCE_WARPS,
+        routed.stride(0), stride_rk, out.stride(0),
+        SPLIT_K=split_k, BLOCK=_REDUCE_BLOCK, OUT=tl.bfloat16, ROUTES=routes, num_warps=_REDUCE_WARPS,
     )
     return out
 

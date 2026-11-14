@@ -100,7 +100,8 @@ class Qwen3_5MoE(BaseOP):
         # as in forward, everything that reads hidden_states runs before the routed experts
         act = shared_expert_gate_up(hidden_states, gate_up.weight, gate_up.weight_scale, gate_up.weight_global)
         gate = self.shared_expert_gate.forward(hidden_states).view(-1)
-        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        # each route's output where the experts' decode kernel has it: the down kernel then sums the routes too
+        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits, sum_routes=False)
         return shared_expert_down_add(act, down.weight, down.weight_scale, down.weight_global, gate, routed)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

@@ -75,7 +75,10 @@ class TritonNvfp4MoEKernel(MoEKernel):
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
         if is_prefill:
             return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
-        return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
+        return fused_experts_decode_nvfp4_marlin(
+            x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit,
+            sum_routes=view.sum_routes,
+        )
 
 
 class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):
