@@ -57,6 +57,9 @@ class ServerArgs(SchedulerConfig):
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
+    # Default for a chat request's reasoning_budget: tokens of thinking before the scheduler
+    # forces the close tag. None leaves thinking unbounded.
+    reasoning_budget: int | None = None
     # Report the prefix-cache hit in each response's usage block (OpenAI
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
@@ -368,6 +371,18 @@ def parse_args(
         type=_positive_int,
         default=ServerArgs.max_output_tokens,
         help="Default max output tokens for requests that omit one (default 32k).",
+    )
+
+    parser.add_argument(
+        "--reasoning-budget",
+        type=_positive_int,
+        default=ServerArgs.reasoning_budget,
+        help=(
+            "Default reasoning budget for chat requests that omit reasoning_budget: after this "
+            "many thinking tokens the server forces the close tag and the answer follows, with a "
+            "wrap-up notice forced into the thinking at about 80%% of it. "
+            "Needs a reasoning parser with think tags. Unset = no limit."
+        ),
     )
 
     parser.add_argument(
@@ -1102,6 +1117,15 @@ def parse_args(
         kwargs["reasoning_parser"] = _infer_reasoning_parser(kwargs["model_path"])
     elif kwargs["reasoning_parser"] == "off":
         kwargs["reasoning_parser"] = None
+
+    if kwargs["reasoning_budget"]:
+        from freetoken.server.reasoning_parser import think_tags
+
+        if think_tags(kwargs["reasoning_parser"]) is None:
+            parser.error(
+                "--reasoning-budget needs a reasoning parser with think tags; "
+                f"--reasoning-parser resolved to {kwargs['reasoning_parser'] or 'off'}"
+            )
 
     # Offload-family backends (offload/cpu/hybrid) need a slot cache; if the user gave no
     # sizing flag at all, default to --moe-cache-auto so a bare `ft serve <FTW MoE>` works

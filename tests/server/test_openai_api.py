@@ -38,6 +38,7 @@ class FakeState:
             served_model_name="unit-model",
             tool_call_parser=tool_call_parser,
             reasoning_parser=reasoning_parser,
+            reasoning_budget=None,
         )
         self.replies = replies
         self.sent: TokenizeMsg | None = None
@@ -767,6 +768,64 @@ def test_stream_chat_usage_chunk_carries_cached_tokens():
     usage = next(e["usage"] for e in reversed(events) if isinstance(e, dict) and e.get("usage"))
     assert usage["prompt_tokens"] == 5
     assert usage["prompt_tokens_details"] == {"cached_tokens": 3}
+
+
+@pytest.mark.parametrize(
+    "server, request_fields, expected",
+    [
+        # --reasoning-budget, request fields, the budget the engine gets
+        (None, {}, None),
+        (None, {"reasoning_budget": 256}, 256),
+        (512, {}, 512),
+        # a request value wins over the server's, zero included
+        (512, {"reasoning_budget": 64}, 64),
+        (512, {"reasoning_budget": 0}, 0),
+    ],
+)
+def test_the_reasoning_budget_reaches_the_engine_with_the_request_over_the_server_default(server, request_fields, expected):
+    state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)], reasoning_parser="qwen3")
+    state.config.reasoning_budget = server
+    run(handle_chat_completion(chat_request(tools=None, **request_fields), request=None, state=state, model_sampling={}))
+    assert state.sent.sampling_params.reasoning_budget == expected
+
+
+@pytest.mark.parametrize("reasoning_parser", [None, "gpt_oss"])
+def test_a_reasoning_budget_is_refused_without_think_tags_to_track(reasoning_parser):
+    """The scheduler finds the thinking span by the parser's tag pair; without one the request fails instead of running unbounded."""
+    state = FakeState([], reasoning_parser=reasoning_parser)
+    response = run(handle_chat_completion(
+        chat_request(tools=None, reasoning_budget=128), request=None, state=state, model_sampling={}))
+    assert response.status_code == 400 and "reasoning parser" in json.loads(response.body)["error"]["message"]
+    assert state.sent is None
+
+
+@pytest.mark.parametrize(
+    "stats, details",
+    [
+        ({"reasoning_tokens": 64, "closed_by": "budget"}, {"reasoning_closed_by": "budget"}),
+        ({"reasoning_tokens": 12}, {}),  # the model closed its thinking itself
+    ],
+)
+def test_usage_reports_the_reasoning_count_and_what_closed_it(stats, details):
+    def replies():
+        return [
+            UserReply(uid=42, incremental_output="", finished=False, prompt_tokens_delta=5),
+            UserReply(uid=42, incremental_output="hi", finished=True, completion_tokens_delta=70, reasoning=stats),
+        ]
+
+    want = {
+        "prompt_tokens": 5, "completion_tokens": 70, "total_tokens": 75,
+        "completion_tokens_details": {"reasoning_tokens": stats["reasoning_tokens"]}, **details,
+    }
+    req = chat_request(tools=None, reasoning_budget=64, stream_options={"include_usage": True})
+    response = run(handle_chat_completion(req, request=None, state=FakeState(replies(), reasoning_parser="qwen3"), model_sampling={}))
+    assert response["usage"] == want
+
+    async def collect():
+        return [chunk async for chunk in stream_chat_completion_chunks(42, req, FakeState(replies(), reasoning_parser="qwen3"))]
+
+    events = [e for e in parse_sse(run(collect())) if isinstance(e, dict)]
+    assert events[-1]["choices"] == [] and events[-1]["usage"] == want
 
 
 @pytest.mark.parametrize("endpoint", ["chat", "completions"])

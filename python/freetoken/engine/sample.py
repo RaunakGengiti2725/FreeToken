@@ -1,13 +1,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, NamedTuple
 
 import torch
 from freetoken.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
+
+
+class ForcedTokens(NamedTuple):
+    """Tokens the host picked in place of sampled ones: request i commits ``token[i]`` as token ``index[i]`` of its step, -1 for none."""
+
+    index: torch.Tensor  # [bs] int64
+    token: torch.Tensor  # [bs] int64
+    void: torch.Tensor   # [n] int64: one of these among a request's earlier tokens of the step cancels its forced token
+
+    def replace(self, tokens: torch.Tensor) -> torch.Tensor:
+        """A decode step's tokens [bs] with the forced ones in place."""
+        return torch.where(self.index == 0, self.token.to(tokens.dtype), tokens)
+
+    def cut(self, out: torch.Tensor, emitted: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """A verify step's (out [bs, k+1], emitted [bs]) with each forced token ending its request's accepted run, as a draft rejected at that row does."""
+        cols = torch.arange(out.shape[1], device=out.device)
+        index = self.index.unsqueeze(1)
+        voided = (torch.isin(out, self.void) & (cols < index)).any(dim=1)
+        # a row past the first rejected draft was computed on a token that is not committed
+        hit = (self.index >= 0) & (self.index <= emitted) & ~voided
+        out = torch.where(hit.unsqueeze(1) & (cols == index), self.token.unsqueeze(1).to(out.dtype), out)
+        return out, torch.where(hit, self.index.to(emitted.dtype), emitted)
 
 
 @dataclass
@@ -17,6 +39,8 @@ class BatchSamplingArgs:
     top_p: torch.Tensor | None = None
     greedy_mask: torch.Tensor | None = None
     penalties: list[tuple[int, torch.Tensor, float, float]] = field(default_factory=list)
+    # set by the scheduler between steps; None on every batch without a forced token
+    forced: ForcedTokens | None = None
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -121,6 +145,8 @@ class Sampler:
                     # greedy rows must follow argmax's deterministic tie-breaking.
                     greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
                     tokens = torch.where(args.greedy_mask, greedy_tokens, tokens)
+            if args.forced is not None:
+                tokens = args.forced.replace(tokens)
             # Update on the sampling stream: overlapped scheduling can prepare the next
             # batch before the previous token reaches Req.input_ids on the CPU.
             for row, counts, _, _ in args.penalties:

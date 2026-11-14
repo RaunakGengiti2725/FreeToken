@@ -41,6 +41,7 @@ from .reasoning_parser import (
     ReasoningParser,
     build_reasoning_parser,
     strip_special_tokens,
+    think_tags,
 )
 
 
@@ -116,6 +117,7 @@ class GenDone:
     matched_stop: str | None = None
     cached_tokens: int = 0
     timings: dict[str, Any] | None = None
+    reasoning_stats: dict[str, Any] | None = None
 
 
 GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
@@ -129,6 +131,8 @@ class GenUsage:
     completion_tokens: int = 0
     cached_tokens: int = 0
     timings: dict[str, Any] | None = None
+    # the scheduler's reasoning count and close reason, from the terminal reply of a request with a reasoning budget
+    reasoning_stats: dict[str, Any] | None = None
 
 
 @dataclass
@@ -142,6 +146,7 @@ class GenResult:
     matched_stop: str | None = None
     cached_tokens: int = 0
     timings: dict[str, Any] | None = None
+    reasoning_stats: dict[str, Any] | None = None
 
 
 def timings_block(state: Any, timings: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -345,12 +350,26 @@ def split_tool_lists(
     return template, all_tool_dicts
 
 
+def resolve_reasoning_budget(params: SamplingParams, config: Any) -> None:
+    """Fill an unset reasoning_budget from the server's --reasoning-budget; a request value, 0
+    included, wins. Raises GenerationError for a budget the request asked for on a server whose
+    reasoning parser has no think tags to track (args.py refuses the flag there)."""
+    if params.reasoning_budget is None:
+        params.reasoning_budget = config.reasoning_budget
+    elif params.reasoning_budget and think_tags(config.reasoning_parser) is None:
+        raise GenerationError(
+            "reasoning_budget needs a reasoning parser with think tags; "
+            f"this server runs --reasoning-parser {config.reasoning_parser or 'off'}"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # The primitive: submit + generate (consume a GenSpec, drive the engine waist).
 # --------------------------------------------------------------------------- #
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
+    resolve_reasoning_budget(spec.sampling_params, state.config)
     refs = collect_image_refs(spec.messages)
     images = await _resolve_images(refs, state) if refs else None
     uid = state.new_user()
@@ -764,6 +783,8 @@ async def _generate_events_impl(
         if getattr(ack, "timings", None) is not None:
             timings = ack.timings
             usage.timings = timings
+        if ack.reasoning is not None:
+            usage.reasoning_stats = ack.reasoning
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
@@ -846,7 +867,7 @@ async def _generate_events_impl(
     yield GenDone(
         finish_reason, usage.prompt_tokens, usage.completion_tokens,
         matched_stop=engine_matched_stop, cached_tokens=usage.cached_tokens,
-        timings=timings,
+        timings=timings, reasoning_stats=usage.reasoning_stats,
     )
 
 
@@ -858,6 +879,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     completion_tokens = 0
     cached_tokens = 0
     timings: dict[str, Any] | None = None
+    reasoning_stats: dict[str, Any] | None = None
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
     async for ack in state.wait_for_ack(uid):
@@ -868,6 +890,8 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         cached_tokens += ack.cached_tokens
         if getattr(ack, "timings", None) is not None:
             timings = ack.timings
+        if ack.reasoning is not None:
+            reasoning_stats = ack.reasoning
         full_content += ack.incremental_output
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
@@ -895,4 +919,5 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         matched_stop=engine_matched_stop,
         cached_tokens=cached_tokens,
         timings=timings,
+        reasoning_stats=reasoning_stats,
     )
