@@ -874,12 +874,61 @@ class OffloadMoeCache:
         for tail in self._stage_tails[self.layer_layout[layer_id]][buffer_id]:
             tail.zero_()
 
+    def _keep_recent_staged_experts(self) -> None:
+        """Move the staged slots' most recently used experts over the least recently used experts outside them.
+
+        The staging buffers lie on a pool's first slots, which are also the slots decode fills first after a prefill
+        (usage 0), so each prefill dropped what the decode before it had just loaded. Pair by pair, the most recent
+        staged expert takes the slot of the least recent kept one while it is the more recent of the two, so a prefill
+        costs a pool its least recently used experts. Fixed shapes and a device-side row count: no host sync.
+        """
+        # GPU decode only: there a slot is an address and the output does not depend on which experts are resident,
+        # while hybrid computes a non-resident expert on the CPU, whose kernel rounds differently
+        if self.decode_target != "gpu" or (self.device.type == "cuda" and not self._copy_fused_ok):
+            return
+        slot_of = self.slot_for_id.view(-1)
+        for p, size in enumerate(self.pool_sizes):
+            staged = self._pool_stable_from[p]
+            n = min(staged, size - staged)
+            if n <= 0:
+                continue
+            ids, usage = self._pool_id_of_slot[p], self._pool_usage[p]
+            hot_use, hot = usage[:staged].sort(descending=True, stable=True)
+            cold_use, cold = usage[staged:].sort(stable=True)
+            hot_use, hot, cold_use, cold = hot_use[:n], hot[:n], cold_use[:n], cold[:n] + staged
+            # true for a prefix of the pairs, and never for an empty staged slot (usage 0)
+            move = hot_use > cold_use
+            moved, dropped = ids[hot], ids[cold]
+            none = torch.full_like(moved, -1)
+            # one spare entry at index -1 takes the writes of the pairs that stay and of empty slots
+            padded = torch.cat([slot_of, slot_of.new_full((1,), -1)])
+            padded[torch.where(move, dropped, none).long()] = -1
+            padded[torch.where(move, moved, none).long()] = cold.to(slot_of.dtype)
+            slot_of.copy_(padded[:-1])
+            ids[cold] = torch.where(move, moved, dropped)
+            usage[cold] = torch.where(move, hot_use, cold_use)
+            ids[hot] = torch.where(move, none, moved)
+            usage[hot] = torch.where(move, torch.zeros_like(hot_use), hot_use)
+            if self.device.type == "cuda":
+                from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+                rows = self._copy_dst_ptrs_pool[p]
+                fast_index_copy_multi_jit(
+                    rows, rows, self._copy_feat_bytes[self._pool_layout(p)], cold, hot, move.sum().view(1), blocks_per_bank=64
+                )
+            else:
+                for view in self._pool_bank_views[p]:
+                    view[cold[move]] = view[hot[move]]
+
     def begin_prefill(self, num_routes: int | None = None) -> None:
         """Start a prefill chunk; ``num_routes`` is its tokens times the routes of each."""
         if not self.prefill_overlap:
             return
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
+        if self.prefill_hit_d2d:
+            # on the compute stream, before the fence below lets the copy stream at the staged slots
+            self._keep_recent_staged_experts()
         if self.prefill_copy_stream is not None:
             # Fence this prefill's copy-stream work behind everything already enqueued
             # on the compute stream. The release/ready events only order against the
