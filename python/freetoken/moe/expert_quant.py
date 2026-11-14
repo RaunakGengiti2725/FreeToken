@@ -23,50 +23,69 @@ EXPERT_QUANTS = {"fp8": QuantKind.FP8_BLOCK, "nvfp4": QuantKind.NVFP4}
 _GROUPS = {QuantKind.FP8_BLOCK: FP8_BLOCK, QuantKind.NVFP4: NVFP4_GROUP}
 _E4M3_MAX = 448.0
 _E2M1_MAX = 6.0
-# experts quantized per step: bounds the fp32 work buffers on the load device
+# between neighbouring e2m1 magnitudes: 0, 0.5, 1, 1.5, 2, 3, 4, 6
+_E2M1_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+# multiplied by, never divided by: CUDA evaluates tensor / python scalar as a multiply by the reciprocal, the CPU
+# as a division, and the two round apart
+_FP8_SCALE = 1.0 / _E4M3_MAX
+_NVFP4_GLOBAL = 1.0 / (_E2M1_MAX * _E4M3_MAX)
+_TINY = torch.finfo(torch.float32).tiny
+# experts quantized per step: bounds the work buffers on the load device
 _CHUNK = 8
 
 
 def quantize_fp8_block(weight: torch.Tensor, block: int = FP8_BLOCK) -> tuple[torch.Tensor, torch.Tensor]:
     """``[..., N, K]`` float -> e4m3 codes ``[..., N, K]`` and bf16 scales ``[..., N / block, K / block]``, ``weight ~= code * scale``.
 
-    Each block's largest magnitude lands on the top of the e4m3 range."""
+    Each block's largest magnitude lands on the top of the e4m3 range. A block too small to scale (all zeros, or
+    under fp32's normal range) keeps scale 1 and zero codes."""
     *lead, n, k = weight.shape
     if n % block or k % block:
         raise ValueError(f"fp8 block quantization needs multiples of {block}, got a {n}x{k} weight")
     w = weight.to(torch.float32).reshape(*lead, n // block, block, k // block, block)
     amax = w.abs().amax(dim=(-3, -1))
-    scale = torch.where(amax > 0, amax / _E4M3_MAX, torch.ones_like(amax)).to(torch.bfloat16)
+    scale = (amax * _FP8_SCALE).to(torch.bfloat16)
+    # a denormal scale is too coarse to divide by, and one rounded to zero turns a zero weight into NaN
+    scale = torch.where(scale >= _TINY, scale, torch.ones_like(scale))
     # the codes are taken against the scale as stored, not the ideal one
     codes = (w / scale.to(torch.float32)[..., :, None, :, None]).to(FP8)
     return codes.reshape(weight.shape), scale
 
 
-def _e2m1_codes(x: torch.Tensor) -> torch.Tensor:
-    """fp32 -> e2m1 codes (bit 3 is the sign), rounded to nearest even and saturated at 6."""
-    a = x.abs()
-    # the grid steps by 0.5 below 2, by 1 below 4 and by 2 above
-    mag = torch.where(a < 2, torch.round(a * 2), torch.where(a < 4, torch.round(a - 2) + 4, torch.round((a - 4) * 0.5) + 6))
-    return mag.clamp_(max=7).to(torch.uint8) | (torch.signbit(x).to(torch.uint8) << 3)
+def _e2m1_codes(w: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+    """The e2m1 codes (bit 3 is the sign) of fp32 ``w`` over the float64 ``step``: the nearest value, a tie to the
+    even code, saturated at 6. A zero step keeps code 0, its block decodes to zero under any code.
+
+    ``w`` is compared with midpoint * step, which float64 holds exactly: no rounded quotient decides a code, so
+    every device writes the same one."""
+    a = w.abs().to(torch.float64)
+    step = torch.where(step > 0, step, torch.inf)
+    mag = torch.zeros(a.shape, dtype=torch.uint8, device=a.device)
+    for upper, mid in enumerate(_E2M1_MIDPOINTS, 1):
+        edge = mid * step
+        # on the midpoint the even code of the two wins
+        mag += (a > edge) if upper % 2 else (a >= edge)
+    return mag | (torch.signbit(w).to(torch.uint8) << 3)
 
 
 def quantize_nvfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``[..., N, K]`` float -> packed e2m1 pairs ``[..., N, K / 2]`` uint8 (low nibble = even k), e4m3 block
     scales ``[..., N, K / 16]`` and fp32 row globals ``[..., N]``, ``weight ~= e2m1 * scale * global``.
 
-    The row global puts the row's largest block scale on the top of the e4m3 range."""
+    The row global puts the row's largest block scale on the top of the e4m3 range. A row too small to scale (all
+    zeros, or under fp32's normal range) keeps global 1 and zero scales."""
     *lead, n, k = weight.shape
     if k % NVFP4_GROUP:
         raise ValueError(f"nvfp4 quantization needs a multiple of {NVFP4_GROUP} columns, got a {n}x{k} weight")
     w = weight.to(torch.float32).reshape(*lead, n, k // NVFP4_GROUP, NVFP4_GROUP)
     amax = w.abs().amax(dim=-1)
-    row_max = amax.amax(dim=-1, keepdim=True)
-    glob = torch.where(row_max > 0, row_max / (_E2M1_MAX * _E4M3_MAX), torch.ones_like(row_max))
+    glob = amax.amax(dim=-1, keepdim=True) * _NVFP4_GLOBAL
+    # a denormal global is too coarse to scale with, and one rounded to zero turns a zero block's scale into NaN
+    glob = torch.where(glob >= _TINY, glob, torch.ones_like(glob))
     scale = (amax / (_E2M1_MAX * glob)).to(FP8)
-    # the codes are taken against the scale as stored, not the ideal one
-    step = scale.to(torch.float32) * glob
-    inv = torch.where(step > 0, 1.0 / step, torch.zeros_like(step))
-    codes = _e2m1_codes(w * inv.unsqueeze(-1)).reshape(*lead, n, k // 2, 2)
+    # the codes are taken against the scale as stored, not the ideal one; float64 holds scale * global exactly
+    step = scale.to(torch.float32).to(torch.float64) * glob
+    codes = _e2m1_codes(w, step.unsqueeze(-1)).reshape(*lead, n, k // 2, 2)
     return codes[..., 0] | (codes[..., 1] << 4), scale, glob.squeeze(-1)
 
 

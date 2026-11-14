@@ -22,6 +22,7 @@ FP8 = torch.float8_e4m3fn
 # every finite non-negative e4m3 value, by code
 E4M3_GRID = torch.arange(127, dtype=torch.uint8).view(FP8).float()
 E2M1_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+E2M1_MIDPOINTS = ((E2M1_GRID[:-1] + E2M1_GRID[1:]) / 2).tolist()
 
 
 def _weights(experts: int, rows: int, cols: int, seed: int = 0) -> torch.Tensor:
@@ -40,9 +41,14 @@ def _nearest_gap(x: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     return (x.abs().unsqueeze(-1) - grid).abs().amin(dim=-1)
 
 
+def _nibbles(packed: torch.Tensor) -> torch.Tensor:
+    """Packed e2m1 pairs -> one code per weight (low nibble = even k)."""
+    return torch.stack([packed & 0xF, packed >> 4], dim=-1).reshape(*packed.shape[:-1], -1)
+
+
 def _nvfp4_dequant(packed: torch.Tensor, scale: torch.Tensor, glob: torch.Tensor) -> torch.Tensor:
-    """e2m1 codes (low nibble = even k) x e4m3 block scale x row global, the product the NVFP4 kernels compute."""
-    codes = torch.stack([packed & 0xF, packed >> 4], dim=-1).reshape(*packed.shape[:-1], -1).long()
+    """e2m1 codes x e4m3 block scale x row global, the product the NVFP4 kernels compute."""
+    codes = _nibbles(packed).long()
     values = E2M1_GRID.to(packed.device)[codes & 7] * torch.where(codes & 8 > 0, -1.0, 1.0)
     return values * (scale.float() * glob.unsqueeze(-1)).repeat_interleave(16, dim=-1)
 
@@ -53,9 +59,31 @@ def _fp8_dequant(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 
 def test_e2m1_rounding_takes_ties_to_the_even_code():
-    """The midpoints of the e2m1 grid round as the GPU's e2m1 conversion does, so the torch quantizer and quantize_nvfp4 agree on a tie."""
-    x = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 7.0, 0.26, 4.99, -0.25, -5.0, -9.0, -0.0])
-    assert expert_quant._e2m1_codes(x).tolist() == [0, 2, 2, 4, 4, 6, 6, 7, 1, 6, 8, 14, 15, 8]
+    """Under a step of 1 the grid's midpoints go to the even code, 6 is the top, a zero keeps its sign and a denormal is a zero. Without a step every code is 0."""
+    w = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0, 7.0, 0.26, 4.99, -0.25, -5.0, -9.0, 0.0, -0.0, 1e-40, -1e-40, float("inf")])
+    one = torch.ones((), dtype=torch.float64)
+    assert expert_quant._e2m1_codes(w, one).tolist() == [0, 2, 2, 4, 4, 6, 6, 7, 7, 1, 6, 8, 14, 15, 0, 8, 0, 8, 7]
+    assert expert_quant._e2m1_codes(torch.tensor([3.0, -3.0, 0.0]), 0 * one).tolist() == [0, 8, 0]
+
+
+# 0.1 and 448 * 1.7e-5 fill fp32's 24 bits, so no fp32 weight sits on their midpoints; the last step is an fp32 denormal
+@pytest.mark.parametrize("step", [1.0, 0.75, 448 * 2.0**-20, 0.1, 448 * 1.7e-5, 1.5 * 2.0**-130], ids=["1", "0.75", "448*2^-20", "0.1", "448*1.7e-5", "1.5*2^-130"])
+def test_e2m1_codes_are_exact_at_and_beside_every_midpoint(step):
+    """A weight on midpoint * step takes the even code of the two, and the fp32 values either side of that product take the side they are on.
+
+    The comparison is exact, so no code depends on how a device rounds a quotient."""
+    step = torch.tensor(step, dtype=torch.float32).double()
+    zero, inf = torch.zeros((), dtype=torch.float32), torch.tensor(float("inf"))
+    for lower, mid in enumerate(E2M1_MIDPOINTS):
+        # exact in float64
+        edge = mid * step
+        w = edge.float()
+        below = w if w < edge else torch.nextafter(w, zero)
+        above = w if w > edge else torch.nextafter(w, inf)
+        assert below < edge < above
+        cases = [(below, lower), (above, lower + 1)] + ([(w, lower + lower % 2)] if w == edge else [])
+        for value, code in cases:
+            assert expert_quant._e2m1_codes(torch.stack([value, -value]), step).tolist() == [code, code | 8], (mid, float(value))
 
 
 def test_nvfp4_scales_and_codes_are_the_nearest_on_their_grids():
@@ -71,23 +99,60 @@ def test_nvfp4_scales_and_codes_are_the_nearest_on_their_grids():
     # the row global puts the row's largest block on the top e4m3 value; an all-zero row keeps a finite global and zero scales
     zero_rows = amax.amax(dim=-1) == 0
     assert zero_rows.sum() == 1
+    # the row max times the fp32 reciprocal of 2688, as CUDA divides by a Python scalar: the CPU's quotient differs on a fifth of the rows
+    assert torch.equal(glob[~zero_rows], (amax.amax(dim=-1) * (1.0 / 2688.0))[~zero_rows])
     assert torch.equal(s.amax(dim=-1)[~zero_rows], torch.full((int((~zero_rows).sum()),), 448.0))
     assert torch.equal(glob[zero_rows], torch.ones(1)) and not s[zero_rows].any() and not packed[zero_rows].any()
     # each block scale is the e4m3 value nearest to amax / (6 * global)
     ideal = amax / (6.0 * glob.unsqueeze(-1))
     assert ((ideal - s).abs() <= _nearest_gap(ideal, E4M3_GRID) * (1 + 1e-6)).all()
 
-    # each code is the e2m1 value nearest to the weight over the stored step, with the weight's sign
-    step = (s * glob.unsqueeze(-1)).repeat_interleave(16, dim=-1)
+    # each code is the e2m1 value nearest to the weight over the stored step, to the last bit (float64 holds grid * step), with the weight's sign
+    step = (s.double() * glob.double().unsqueeze(-1)).repeat_interleave(16, dim=-1)
     live = step > 0
-    x = (wf / step)[live]
-    codes = torch.stack([packed & 0xF, packed >> 4], dim=-1).reshape(3, 64, 256)[live].long()
-    assert ((x.abs() - E2M1_GRID[codes & 7]).abs() <= _nearest_gap(x, E2M1_GRID) + 1e-6).all()
+    x = wf.double()[live]
+    codes = _nibbles(packed)[live].long()
+    gap = (x.abs().unsqueeze(-1) - E2M1_GRID.double() * step[live].unsqueeze(-1)).abs()
+    assert torch.equal(gap.gather(-1, (codes & 7).unsqueeze(-1)).squeeze(-1), gap.amin(dim=-1))
     assert torch.equal((codes & 8 > 0)[x != 0], (x < 0)[x != 0])
     # a block of zeros decodes to zeros
     deq = _nvfp4_dequant(packed, scale, glob)
     assert not deq[~live].any() and not wf[~live].any()
     assert (deq - wf).norm() / wf.norm() < 0.12
+
+
+def test_zeros_and_denormals_quantize_to_zeros():
+    """Zeros of either sign, and weights whose scale would fall under fp32's normal range, keep global 1 (nvfp4) or scale 1 (fp8) and decode to zeros.
+
+    No scale or code is NaN, and inside a live row a zero block and a denormal leave their neighbours alone."""
+    w = torch.zeros(1, 6, 32)
+    w[0, 1] = -0.0
+    # a global of max / 2688 rounds to zero here, next to a zero block
+    w[0, 2, :16] = torch.linspace(-1e-42, 1e-42, 16)
+    w[0, 3] = torch.linspace(-1.0, 1.0, 32) * 2.0**-120
+    w[0, 4, :8] = torch.tensor([3.0, -3.0, 1e-40, -1e-40, 0.0, -0.0, 1.5, 0.5])
+    w[0, 5] = torch.linspace(-1.0, 1.0, 32) * 1e-30
+    packed, scale, glob = quantize_nvfp4(w)
+    assert torch.isfinite(scale.float()).all()
+    assert torch.equal(glob[0, :4], torch.ones(4)) and not scale[0, :4].float().any() and not (_nibbles(packed)[0, :4] & 7).any()
+    assert not _nvfp4_dequant(packed, scale, glob)[0, :4].any()
+    assert _nibbles(packed)[0, 4].tolist() == [7, 15, 0, 8, 0, 8, 5, 2] + [0] * 24
+    assert scale[0, 4].float().tolist() == [448.0, 0.0]
+    # a small row that still scales is quantized like any other; fp32 underflows its norm
+    assert (_nvfp4_dequant(packed, scale, glob)[0, 5].double() - w[0, 5].double()).norm() / w[0, 5].double().norm() < 0.12
+
+    w = torch.zeros(1, 128, 384)
+    # a bf16 scale of max / 448 rounds to zero here, next to a zero weight
+    w[0, :, :128] = torch.linspace(-1e-38, 1e-38, 128)
+    w[0, 0, 0] = 0
+    w[0, :, 128:256] = -0.0
+    w[0, :, 256:] = torch.linspace(-1.0, 1.0, 128)
+    w[0, 0, 256:259] = torch.tensor([1e-40, -1e-40, 0.0])
+    codes, scale = quantize_fp8_block(w)
+    assert torch.isfinite(codes.float()).all()
+    assert scale[0, 0].tolist() == [1.0, 1.0, float(torch.tensor(1 / 448.0).to(torch.bfloat16))]
+    assert not codes[0, :, :256].float().any() and not codes[0, 0, 256:259].float().any()
+    assert (_fp8_dequant(codes, scale)[0, :, 256:] - w[0, :, 256:]).norm() / w[0, :, 256:].norm() < 0.035
 
 
 def test_fp8_block_codes_are_the_nearest_under_the_stored_scale():
