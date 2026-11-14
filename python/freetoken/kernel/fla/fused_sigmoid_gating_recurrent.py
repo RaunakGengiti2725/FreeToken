@@ -6,12 +6,15 @@ per-request state read/write-by-index in ONE kernel — no external gating or
 gather/scatter/clone glue.
 
 FreeToken additions: the verify mode can stash each token's recurrence inputs (STASH_INPUTS), and
-``gdn_state_replay`` re-runs the accepted prefix from that stash to commit the live state."""
+``gdn_state_replay`` re-runs the accepted prefix from that stash to commit the live state. FUSE_NORM
+runs the gated output norm in the program that stores the last block of a value head's output."""
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+from freetoken.kernel.fla.layernorm_gated import _gated_rms_norm_row, gated_norm_row_tile
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -40,6 +43,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stash_v,
     stash_g,
     stash_beta,
+    # the gated output norm (FUSE_NORM): its gate input [tokens, HV, V], weight [V], output [tokens * HV, V] and
+    # 1/rms [tokens * HV] fp32; arrival counters [sequences * HV] int32, zeroed and self-resetting
+    norm_z,
+    norm_weight,
+    norm_out,
+    norm_rstd,
+    norm_counter,
+    norm_eps,
+    stride_z,
     # ================================================
     scale,
     T,
@@ -65,6 +77,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
     STASH_INPUTS: tl.constexpr = False,
+    FUSE_NORM: tl.constexpr = False,
+    NORM_SILU: tl.constexpr = True,
+    NORM_BLOCK: tl.constexpr = 1,
+    NV: tl.constexpr = 1,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -275,6 +291,19 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 )
                 tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
+    if FUSE_NORM:
+        # the NV programs of a (sequence, value head) each stored a V block of its outputs; the last to land norms them
+        c_ptr = norm_counter + i_nh
+        cnt = tl.atomic_add(c_ptr, 1)  # default acq_rel/gpu: publishes the stores of o
+        if cnt == NV - 1:
+            for t in range(0, T):
+                row = (bos + t) * HV + i_hv
+                _gated_rms_norm_row(
+                    o + row * V, norm_weight, norm_z + (bos + t) * stride_z + i_hv * V, norm_out + row * V,
+                    norm_rstd + row, norm_eps, V, NORM_BLOCK, NORM_SILU,
+                )
+            tl.store(c_ptr, 0)  # leave zeroed for the next launch/replay
+
 
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
@@ -301,6 +330,7 @@ def fused_sigmoid_gating_delta_rule_update(
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
     input_stash: Optional[tuple] = None,
+    gated_norm: Optional[tuple] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -315,6 +345,10 @@ def fused_sigmoid_gating_delta_rule_update(
     ``input_stash`` = (k, v, g, beta) fp32 buffers of shape [rows, steps, H, K] / [rows, steps, HV, V] /
     [rows, steps, HV] / [rows, steps, HV], indexed by batch row: each token's l2-normed k,
     raw v and gates, for ``gdn_state_replay``.
+
+    ``gated_norm`` = (z, weight, eps, activation) also runs ``rms_norm_gated(o, weight, z)`` (an RMS norm gated
+    after the norm) inside the kernel and returns (o, normed [tokens, HV, V], 1/rms [tokens * HV]) with that
+    kernel's bits; ``z`` [tokens, HV, V] is read in place. The caller checks ``gated_norm_row_tile`` first.
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
@@ -367,6 +401,25 @@ def fused_sigmoid_gating_delta_rule_update(
         assert stash_k.shape[2:] == (H, K) and stash_v.shape[2:] == (HV, V)
         cache_stride_steps = stash_k.shape[1]
 
+    norm_z = norm_weight = norm_out = norm_rstd = norm_counter = None
+    norm_eps, stride_z, norm_block, norm_silu = 0.0, 0, 1, True
+    if gated_norm is not None:
+        from freetoken.kernel.triton.nvfp4_linear import _splitk_counters
+
+        assert not is_kda and NK == 1
+        norm_z, norm_weight, norm_eps, activation = gated_norm
+        tokens = B * T
+        norm_block = gated_norm_row_tile(tokens * HV, V, q.device)
+        assert norm_block is not None, "the norm kernel takes another tile for these rows"
+        assert activation in ("silu", "swish", "sigmoid")
+        norm_silu = activation != "sigmoid"
+        assert norm_z.shape == (tokens, HV, V) and norm_z.stride(2) == 1 and norm_z.stride(1) == V
+        assert norm_weight.shape == (V,) and norm_weight.stride(0) == 1
+        stride_z = norm_z.stride(0)
+        norm_out = q.new_empty(tokens * HV, V)
+        norm_rstd = torch.empty((tokens * HV,), dtype=torch.float32, device=q.device)
+        norm_counter = _splitk_counters(N * HV, q.device)
+
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
@@ -391,6 +444,13 @@ def fused_sigmoid_gating_delta_rule_update(
         stash_v=stash_v,
         stash_g=stash_g,
         stash_beta=stash_beta,
+        norm_z=norm_z,
+        norm_weight=norm_weight,
+        norm_out=norm_out,
+        norm_rstd=norm_rstd,
+        norm_counter=norm_counter,
+        norm_eps=norm_eps,
+        stride_z=stride_z,
         scale=scale,
         T=T,
         stride_a=stride_a,
@@ -414,10 +474,16 @@ def fused_sigmoid_gating_delta_rule_update(
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         STASH_INPUTS=input_stash is not None,
+        FUSE_NORM=gated_norm is not None,
+        NORM_SILU=norm_silu,
+        NORM_BLOCK=norm_block,
+        NV=NV,
         num_warps=num_warps,
         num_stages=num_stages,
     )
     o = o.squeeze(0)
+    if gated_norm is not None:
+        return o, norm_out.view(B * T, HV, V), norm_rstd
     return o
 
 

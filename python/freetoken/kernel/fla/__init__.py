@@ -48,7 +48,7 @@ from freetoken.kernel.fla.kda import (
     fused_kda_gate,
     fused_recurrent_kda,
 )
-from freetoken.kernel.fla.layernorm_gated import rms_norm_gated
+from freetoken.kernel.fla.layernorm_gated import gated_norm_row_tile, rms_norm_gated
 
 __all__ = [
     "chunk_gated_delta_rule",
@@ -57,5 +57,6 @@ __all__ = [
     "chunk_kda_with_fused_gate",
     "fused_kda_gate",
     "fused_recurrent_kda",
+    "gated_norm_row_tile",
     "rms_norm_gated",
 ]
