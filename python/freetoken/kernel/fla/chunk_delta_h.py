@@ -58,6 +58,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     g,
     gk,
     h,
+    h_track,
     initial_state,
     initial_state_indices,
     cu_seqlens,
@@ -74,6 +75,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     USE_INITIAL_STATE: tl.constexpr,
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
+    SAVE_TRACK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_BUCKET: tl.constexpr,
 ):
@@ -107,6 +109,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     w += ((bos * H + i_h) * K).to(tl.int64)
     if SAVE_NEW_VALUE:
         v_new += ((bos * H + i_h) * V).to(tl.int64)
+    if SAVE_TRACK:
+        h_track += ((i_n * H + i_h) * V * K).to(tl.int64)
     stride_v = H * V
     stride_h = H * V * K
     stride_k = Hg * K
@@ -161,6 +165,20 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
             )
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
+        if SAVE_TRACK:
+            # the state entering the sequence's last chunk, in h_track's own dtype (h holds it in the input dtype)
+            if i_t == NT - 1:
+                p_t1 = tl.make_block_ptr(h_track, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
+                tl.store(p_t1, b_h1.to(p_t1.dtype.element_ty), boundary_check=(0, 1))
+                if K > 64:
+                    p_t2 = tl.make_block_ptr(h_track, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0))
+                    tl.store(p_t2, b_h2.to(p_t2.dtype.element_ty), boundary_check=(0, 1))
+                if K > 128:
+                    p_t3 = tl.make_block_ptr(h_track, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0))
+                    tl.store(p_t3, b_h3.to(p_t3.dtype.element_ty), boundary_check=(0, 1))
+                if K > 192:
+                    p_t4 = tl.make_block_ptr(h_track, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0))
+                    tl.store(p_t4, b_h4.to(p_t4.dtype.element_ty), boundary_check=(0, 1))
 
         p_w = tl.make_block_ptr(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
@@ -303,7 +321,9 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
+    track_state: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``track_state`` [N, H, V, K], when given, is filled with each sequence's state entering its last chunk."""
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
@@ -336,6 +356,7 @@ def chunk_gated_delta_rule_fwd_h(
         g=g,
         gk=gk,
         h=h,
+        h_track=track_state,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
@@ -351,6 +372,7 @@ def chunk_gated_delta_rule_fwd_h(
         USE_INITIAL_STATE=initial_state is not None,
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
+        SAVE_TRACK=track_state is not None,
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
     )

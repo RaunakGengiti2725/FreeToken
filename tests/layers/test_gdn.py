@@ -150,3 +150,52 @@ def test_prefill_decode_and_verify_match_reference(monkeypatch, ratio, output_ga
     for i, h in enumerate(seqs):
         want = _ref_out(ref, torch.cat([h, last[i:i + 1]]))[-1]
         torch.testing.assert_close(dec[i].float(), want, rtol=RTOL, atol=ATOL)
+
+
+def _track_snapshot_and_recomputed(monkeypatch, cached_len: int):
+    """A 150-token prefill after ``cached_len`` cached tokens that snapshots its state at its last chunk boundary (128 tokens in), and the state of a request that prefills exactly those 128 tokens from the same cached state.
+
+    The second forward runs the same 150 rows as two requests, so its projection GEMM is the same call and the first two chunks see the same inputs.
+    Returns (snapshot, recomputed) pairs for the recurrent and the conv state.
+    """
+    op, _ = _make_layer(2, "silu", seed=5)
+    ctx = _ctx(monkeypatch, 2)
+    pool = ctx.linear_state_pool
+    if pool.recurrent_states.dtype != torch.float32:
+        pytest.skip("the recurrent state is not fp32 (FREETOKEN_MAMBA_SSM_DTYPE)")
+    length, boundary, dst = 150, 128, 5
+    torch.manual_seed(17)
+    hidden = torch.randn(length, HIDDEN, device=DEV, dtype=torch.bfloat16)
+
+    def req(n: int, slot: int, cached: int = 0) -> Req:
+        return Req(input_ids=torch.zeros(cached + n, dtype=torch.int32), table_idx=slot, cached_len=cached,
+                   output_len=1, uid=slot, sampling_params=SamplingParams(), cache_handle=None)
+
+    def prefill(reqs: list[Req], rows: torch.Tensor) -> None:
+        batch = Batch(reqs=reqs, phase="prefill")
+        batch.padded_reqs = reqs
+        with ctx.forward_batch(batch):
+            op.forward(rows)
+
+    if cached_len:
+        # both requests continue one cached state, the way a prefix hit copies a snapshot into a live slot
+        prefill([req(cached_len, 1)], torch.randn(cached_len, HIDDEN, device=DEV, dtype=torch.bfloat16))
+        pool.copy_from(1, 2)
+    whole = req(length, 1, cached_len)
+    whole.mamba_ping_pong = (dst, dst + 1)
+    prefill([whole], hidden)
+    assert whole.mamba_last_track_seqlen == cached_len + boundary
+    snapshot = pool.recurrent_states[0, dst].clone(), pool.conv_states[0, dst].clone()
+    prefill([req(boundary, 2, cached_len), req(length - boundary, 3)], hidden)
+    recomputed = pool.recurrent_states[0, 2].clone(), pool.conv_states[0, 2].clone()
+    return tuple(zip(snapshot, recomputed))
+
+
+# 40 cached tokens put the boundary at 168: the chunks are cut from the forward's first token, not from position 0
+@pytest.mark.parametrize("cached_len", [0, 40])
+def test_track_snapshot_keeps_the_fp32_recurrent_state(monkeypatch, cached_len):
+    """The chunk kernel's per-chunk h is in the model dtype; the snapshot must come from its fp32 running state, as a request's final state does."""
+    (rec, want_rec), (conv, want_conv) = _track_snapshot_and_recomputed(monkeypatch, cached_len)
+    assert float(want_rec.norm()) > 0
+    assert torch.equal(conv, want_conv)
+    assert torch.equal(rec, want_rec)
