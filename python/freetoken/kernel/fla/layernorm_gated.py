@@ -15,6 +15,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.backend import is_rocm
+
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
 
@@ -128,6 +130,45 @@ def _layer_norm_fwd_1pass_kernel(
 
     # Write output
     tl.store(Y_base, y, mask=mask)
+
+
+@triton.jit
+def _gated_rms_norm_row(X, W, Z, Y, Rstd, eps, N: tl.constexpr, BLOCK_N: tl.constexpr, SILU: tl.constexpr):
+    """``_layer_norm_fwd_1pass_kernel`` for a one-row tile of one group as an RMS norm gated after the norm,
+    statement for statement, for another single-warp kernel to inline: keep the two in step. Pointers are at the row."""
+    rows = tl.arange(0, 1)
+    cols = tl.arange(0, BLOCK_N)
+    col_offsets = cols[None, :]
+    mask = cols[None, :] < N
+
+    x = tl.load(X + col_offsets, mask=mask, other=0.0).to(tl.float32)
+
+    xbar = tl.where(mask, x, 0.0)
+    var = tl.sum(xbar * xbar, axis=1) / N
+    rstd = tl.rsqrt(var + eps)
+    tl.store(Rstd + rows, rstd)
+
+    w = tl.load(W + cols, mask=cols < N, other=0.0).to(tl.float32)
+    x_hat = x * rstd[:, None]
+    y = x_hat * w[None, :]
+
+    z = tl.load(Z + col_offsets, mask=mask, other=0.0).to(tl.float32)
+    if SILU:
+        y *= z * tl.sigmoid(z)
+    else:
+        y *= tl.sigmoid(z)
+
+    tl.store(Y + col_offsets, y, mask=mask)
+
+
+def gated_norm_row_tile(M: int, N: int, device: torch.device) -> int | None:
+    """The gate of ``_gated_rms_norm_row``: BLOCK_N of ``_layer_norm_fwd`` over M rows of N where it norms one
+    row a program on one warp, the tile that function reproduces (checked on NVIDIA only); None elsewhere."""
+    block_n = triton.next_power_of_2(N)
+    # _layer_norm_fwd's warps for this block
+    if is_rocm() or min(max(block_n // 256, 1), 8) != 1 or calc_rows_per_block(M, device) != 1:
+        return None
+    return block_n
 
 
 @lru_cache
@@ -261,4 +302,4 @@ def rms_norm_gated(
     return y.reshape(x_shape_og)
 
 
-__all__ = ["rms_norm_gated"]
+__all__ = ["gated_norm_row_tile", "rms_norm_gated"]

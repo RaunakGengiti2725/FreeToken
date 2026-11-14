@@ -133,6 +133,15 @@ class GatedDeltaNet(BaseOP):
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
+    def _norm_in_kernel(self, total: int, dtype: torch.dtype, device: torch.device) -> bool:
+        """Whether a decode step of ``total`` rows runs the output norm inside the kernel that updates
+        the state, which gives the norm kernel's bits where ``gated_norm_row_tile`` holds."""
+        if dtype != torch.bfloat16:
+            return False
+        from freetoken.kernel.fla import gated_norm_row_tile
+
+        return gated_norm_row_tile(total * self.num_v_heads, self.head_v_dim, device) is not None
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
@@ -160,6 +169,7 @@ class GatedDeltaNet(BaseOP):
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
+        out = None
 
         if not batch.is_prefill:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
@@ -177,6 +187,7 @@ class GatedDeltaNet(BaseOP):
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+            norm_in_kernel = self._norm_in_kernel(total, dtype, hidden_states.device)
             core_out = fused_sigmoid_gating_delta_rule_update(
                 A_log=self.A_log, a=a, dt_bias=self.dt_bias,  # already fp32 (stored fp32)
                 softplus_beta=1.0, softplus_threshold=20.0,
@@ -185,7 +196,12 @@ class GatedDeltaNet(BaseOP):
                 initial_state_indices=fla.cache_indices,  # already int32 (built int32 by build_fla_metadata)
                 scale=self.head_k_dim ** -0.5, use_qk_l2norm_in_kernel=True, cu_seqlens=fla.cu_seqlens,
                 disable_state_update=verify, input_stash=fla.verify_scratch.input_stash(li) if verify else None,
-            )[0]  # [total, num_v, V]
+                gated_norm=(z, self.norm.weight, self.norm.eps, self.norm.activation) if norm_in_kernel else None,
+            )
+            if norm_in_kernel:
+                out = core_out[1].reshape(total, -1)
+            else:
+                core_out = core_out[0]  # [total, num_v, V]
         else:
             from freetoken.kernel.fla import chunk_gated_delta_rule
 
@@ -213,9 +229,10 @@ class GatedDeltaNet(BaseOP):
             if fla.track_dst is not None:
                 self._write_track_snapshot(pool, li, conv_in, h, fla)
 
-        core_out = core_out.reshape(-1, self.head_v_dim)
-        z = z.reshape(-1, self.head_v_dim)
-        out = self.norm.forward(core_out, z).reshape(total, -1)
+        if out is None:
+            core_out = core_out.reshape(-1, self.head_v_dim)
+            z = z.reshape(-1, self.head_v_dim)
+            out = self.norm.forward(core_out, z).reshape(total, -1)
         if self._out_heads_tiled:
             # grouped value heads (k-head major) -> tiled (k-head minor), the column order of a GGUF ssm_out
             r = self.num_v_heads // self.num_k_heads
