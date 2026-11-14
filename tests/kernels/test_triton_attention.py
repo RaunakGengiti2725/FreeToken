@@ -1277,3 +1277,94 @@ def test_triton_metadata_keeps_full_indices_and_optional_swa_indices(monkeypatch
     assert metadata.indices.tolist() == [10, 11, 20, 21, 22]
     assert metadata.swa_indices is not None
     assert metadata.swa_indices.tolist() == [110, 111, 120, 121, 122]
+
+
+def _bf16_grid(shape, lo, hi, gen):
+    """Random bf16 values of either sign with an exponent in [lo, hi)."""
+    mantissa = torch.randint(128, 256, shape, device="cuda", generator=gen).float() / 128
+    sign = torch.randint(0, 2, shape, device="cuda", generator=gen).float() * 2 - 1
+    return torch.ldexp(sign * mantissa, torch.randint(lo, hi, shape, device="cuda", generator=gen)).to(torch.bfloat16)
+
+
+def _q_gate(gate, gen, tail=40):
+    """The fused q|gate projection as Qwen3.5's attention holds it, [M, heads, 2 * d] with ``gate`` [M, heads, d] in
+    each head's second half: a view of a wider projection output, so its rows are strided."""
+    M, heads, d = gate.shape
+    qkv = torch.randn(M, heads * 2 * d + tail, device="cuda", dtype=torch.bfloat16, generator=gen)
+    qg = qkv[:, : heads * 2 * d].view(M, heads, 2 * d)
+    qg[..., d:] = gate
+    return qg
+
+
+def _gated_unfused(attn, qg):
+    """The unfused statements: a copy gathers the gate, then torch's sigmoid and torch's mul."""
+    M, heads, width = qg.shape
+    gate = qg[..., width // 2:].reshape(-1, heads * width // 2)
+    return attn.reshape(-1, heads * width // 2) * torch.sigmoid(gate)
+
+
+def _assert_same_bf16_bits(out, ref, what):
+    """Equal bf16 bits; a NaN matches a NaN of any payload."""
+    assert out.shape == ref.shape and out.dtype == ref.dtype == torch.bfloat16, f"{what}: {out.shape} {out.dtype} against {ref.shape} {ref.dtype}"
+    differ = (out.contiguous().view(torch.int16) != ref.contiguous().view(torch.int16)) & ~(out.isnan() & ref.isnan())
+    if bool(differ.any()):
+        first = tuple(int(i) for i in differ.nonzero()[0])
+        raise AssertionError(
+            f"{what}: {int(differ.sum())} of {out.numel()} elements differ, first at {first}: "
+            f"fused {float(out[first])!r}, unfused {float(ref[first])!r}"
+        )
+
+
+def _skip_unless_the_attention_gate_fuses():
+    from freetoken.kernel.triton.attn_gate import attn_gate_fusable
+
+    if not attn_gate_fusable():
+        pytest.skip("the attention gate fusion is off here: it copies the rounding of torch's CUDA kernels")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The attention gate kernel needs CUDA")
+def test_fused_attention_gate_is_torch_sigmoid_and_mul_for_every_bf16_gate():
+    """Every bf16 value as a gate, the NaNs too, under attention outputs that make the product exact, a tie, large,
+    denormal, zero, infinite and NaN: against the copy, the sigmoid and the mul the kernel replaces."""
+    _skip_unless_the_attention_gate_fuses()
+    from freetoken.kernel.triton.attn_gate import attn_gate_mul
+
+    heads, d = 16, 256  # Qwen3.6-35B-A3B's attention
+    gate = torch.arange(-32768, 32768, dtype=torch.int16, device="cuda").view(torch.bfloat16)
+    M = gate.numel() // (heads * d)
+    qg = _q_gate(gate.view(M, heads, d), torch.Generator(device="cuda").manual_seed(0))
+    sigmoid = torch.sigmoid(qg[..., d:].reshape(M, heads * d)).float()
+    for factor in (1.5, 1 + 2.0**-7):
+        # a product whose low 16 fp32 bits are 0x8000 lies halfway between two bf16 values
+        assert bool((((sigmoid * factor).view(torch.int32) & 0xFFFF) == 0x8000).any()), "no gated output is a tie"
+    big, inf, nan = torch.finfo(torch.bfloat16).max, float("inf"), float("nan")
+    for value in [1.0, 1.5, 1 + 2.0**-7, -(1 + 3 * 2.0**-7), big, -big, 2.0**-126, 2.0**-130, -(2.0**-133), 0.0, -0.0, inf, -inf, nan]:
+        attn = torch.full((M, heads * d), value, dtype=torch.bfloat16, device="cuda")
+        _assert_same_bf16_bits(attn_gate_mul(attn, qg), _gated_unfused(attn, qg), f"attention output {value!r}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The attention gate kernel needs CUDA")
+@pytest.mark.parametrize("M", [1, 2, 4, 8, 33])
+@pytest.mark.parametrize("heads,d", [(16, 256), (3, 96)])
+@pytest.mark.parametrize("kind", ["decode", "large", "denormal"])
+def test_fused_attention_gate_reads_a_strided_projection_bit_for_bit(heads, d, kind, M):
+    """A step of M rows: the gate read in place out of a strided q|gate projection and the attention output out of a
+    strided buffer, neither written. Heads 96 wide leave a partial block."""
+    _skip_unless_the_attention_gate_fuses()
+    from freetoken.kernel.triton.attn_gate import attn_gate_mul
+
+    gen = torch.Generator(device="cuda").manual_seed(heads + 131 * M)
+    lo, hi = {"decode": (-6, 5), "large": (100, 128), "denormal": (-140, -120)}[kind]
+    qg = _q_gate(_bf16_grid((M, heads, d), -6, 8, gen), gen)
+    q_before = qg.clone()
+    attn = _bf16_grid((M, heads * d + 24), lo, hi, gen)[:, : heads * d]
+    if kind == "denormal":
+        # bf16 denormals of either sign
+        bits = torch.randint(1, 128, (M, heads * d // 2), device="cuda", generator=gen)
+        bits -= 32768 * torch.randint(0, 2, bits.shape, device="cuda", generator=gen)
+        attn[:, ::2] = bits.to(torch.int16).view(torch.bfloat16)
+    ref = _gated_unfused(attn, qg)
+    out = attn_gate_mul(attn, qg)
+    assert out.is_contiguous()
+    _assert_same_bf16_bits(out, ref, f"{kind}, {M} rows of {heads} heads of {d}")
+    assert torch.equal(qg.view(torch.int16), q_before.view(torch.int16)), "the projection was written"
