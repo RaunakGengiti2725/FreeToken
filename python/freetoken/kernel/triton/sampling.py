@@ -15,6 +15,8 @@ Design:
     Every boundary tie is kept, matching flashinfer, then the same kernel renormalizes or
     draws. No candidate buffer, data-dependent shape, or host sync is needed. Results are
     exact up to fp32 atomic summation order.
+  * min-p needs no search: its threshold is min_p times the row maximum, handed to the same
+    thresholded multi-CTA draw sampling_from_probs runs with a zero threshold.
   * If a cooperative launch is unavailable, the same exact kernel is retried with one CTA
     per row; only parallelism changes.
   * deterministic, generator and check_nan exist for flashinfer signature compatibility and are
@@ -288,6 +290,17 @@ def top_p_sampling_from_probs(probs, top_p, indices=None, deterministic=True, ge
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
     out = _topp(src, _topp_target(top_p, src.size(0), src.device), None, True, seed, offset)
+    out = out.to(indices.dtype) if indices is not None else out
+    return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
+
+
+def min_p_sampling_from_probs(probs, min_p, indices=None, deterministic=True, generator=None,
+                              check_nan=False, seed=None, offset=None, return_valid=False):
+    probs = probs.float()
+    src = probs if indices is None else probs[indices].contiguous()
+    # the draw keeps x >= thr and normalizes by the kept mass; the top token passes its own threshold for min_p <= 1
+    thr = src.amax(dim=1) * _topp_target(min_p, src.size(0), src.device)
+    out = _draw(src, thr, seed, offset)
     out = out.to(indices.dtype) if indices is not None else out
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
 
@@ -649,4 +662,5 @@ __all__ = [
     "softmax", "top_k_renorm_probs", "top_p_renorm_probs",
     "sampling_from_probs", "top_k_sampling_from_probs",
     "top_p_sampling_from_probs", "top_k_top_p_sampling_from_probs",
+    "min_p_sampling_from_probs",
 ]

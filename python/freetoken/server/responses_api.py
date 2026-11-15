@@ -98,6 +98,8 @@ class ResponsesRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
+    min_p: float | None = None
+    repetition_penalty: float | None = None
     stream: bool = False
     # llama.cpp's field: every delta event carries the timings block (effective only with
     # --enable-timings-report; extra="allow" used to swallow it).
@@ -267,6 +269,8 @@ def convert_responses_to_genspec(
             ignore_eos=False,
             model_sampling=model_sampling,
             timings_per_token=timings_per_token,
+            min_p=req.min_p,
+            repetition_penalty=req.repetition_penalty,
         ),
         chat_template_kwargs=ctk,
         template_tools=template_tools,

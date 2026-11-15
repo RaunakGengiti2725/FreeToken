@@ -1077,3 +1077,20 @@ def test_image_only_tool_result_keeps_an_empty_tool_message():
         "role": "user",
         "content": [{"type": "image", "freetoken_ref": {"kind": "b64", "data": "aGk="}}],
     }
+
+
+def test_min_p_and_repetition_penalty_are_accepted_and_range_checked():
+    base = {"model": "m", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]}
+    req = AnthropicMessagesRequest.model_validate({**base, "min_p": 0.1, "repetition_penalty": 1.2})
+    sent = A.convert_anthropic_to_genspec(req, {"min_p": 0.3}).sampling_params
+    assert (sent.min_p, sent.repetition_penalty) == (0.1, 1.2)
+    sent = A.convert_anthropic_to_genspec(AnthropicMessagesRequest.model_validate(base), {"min_p": 0.3}).sampling_params
+    assert (sent.min_p, sent.repetition_penalty) == (0.3, 1.0)
+
+    client = _client(FakeState([]))
+    for field, value in (("min_p", 2), ("repetition_penalty", 0)):
+        r = client.post("/v1/messages", json={**base, field: value})
+        assert r.status_code == 400, r.text
+        body = r.json()
+        assert body["type"] == "error" and body["error"]["type"] == "invalid_request_error"
+        assert field in body["error"]["message"]

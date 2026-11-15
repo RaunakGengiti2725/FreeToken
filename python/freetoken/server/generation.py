@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -56,6 +57,14 @@ class GenerationError(ValueError):
     def __init__(self, message: str, code: str | None = None):
         super().__init__(message)
         self.code = code
+
+
+class SamplingParamError(ValueError):
+    """An out-of-range sampling field; ``param`` names it for OpenAI's error ``param``."""
+
+    def __init__(self, param: str, message: str):
+        super().__init__(message)
+        self.param = param
 
 
 # --------------------------------------------------------------------------- #
@@ -224,6 +233,8 @@ def resolve_sampling(
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
     timings_per_token: bool = False,
+    min_p: float | None = None,
+    repetition_penalty: float | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -238,6 +249,14 @@ def resolve_sampling(
     # non-positive value is a client error.
     if max_tokens is not None and max_tokens < 1:
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
+    min_p = pick(min_p, "min_p", 0.0)
+    if not 0.0 <= min_p <= 1.0:
+        raise SamplingParamError("min_p", f"min_p must be between 0 and 1, got {min_p}")
+    repetition_penalty = pick(repetition_penalty, "repetition_penalty", 1.0)
+    if not 0.0 < repetition_penalty < math.inf:
+        raise SamplingParamError(
+            "repetition_penalty", f"repetition_penalty must be a positive number, got {repetition_penalty}"
+        )
     return SamplingParams(
         ignore_eos=ignore_eos,
         max_tokens=default_max_tokens if max_tokens is None else max_tokens,
@@ -248,6 +267,8 @@ def resolve_sampling(
         presence_penalty=presence_penalty,
         frequency_penalty=frequency_penalty,
         timings_per_token=timings_per_token,
+        min_p=min_p,
+        repetition_penalty=repetition_penalty,
     )
 
 
