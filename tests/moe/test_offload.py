@@ -372,6 +372,39 @@ def test_prefill_overlap_prefetch_invalidates_borrowed_unified_cache_slots():
     assert torch.equal(cache.bank_caches["down"][:num_experts], down_source[0])
 
 
+def test_prefill_keeps_the_most_recently_used_experts_out_of_its_staging_slots():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    L, E = 4, 4
+    cache = OffloadMoeCache(num_layers=L, num_experts=E, cache_size=4 * E, device=torch.device("cpu"), prefill_overlap=True, prefill_hit_d2d=True)
+    cache.set_bank_sources({
+        "gate_up": [torch.randn(E, 32, 8) for _ in range(L)],
+        "down": [torch.randn(E, 8, 16) for _ in range(L)],
+    })
+    assert cache._pool_stable_from == [2 * E]
+    # what decode left: the last use of each slot's expert, 0 for the one empty slot; the first 2 * E slots get staged over
+    uses = [15, 3, 12, 1, 9, 14, 2, 6] + [10, 4, 13, 0, 5, 11, 7, 8]
+    owner = {slot: (7 * slot + 3) % (L * E) for slot, use in enumerate(uses) if use}
+    for slot, i in owner.items():
+        cache.id_of_slot[slot], cache.usage[slot], cache.slot_for_id.view(-1)[i] = i, uses[slot], slot
+        for src, bank in cache.banks:
+            bank[slot] = src[i // E][i % E]
+
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    cache.prefetch_prefill_layer(1)
+
+    # the slots outside the staging buffers hold the most recently used experts of the whole pool, each with its own rows
+    kept = {owner[slot]: uses[slot] for slot in sorted(owner, key=uses.__getitem__)[-2 * E :]}
+    resident = {i: slot for i, slot in enumerate(cache.slot_for_id.view(-1).tolist()) if slot >= 0}
+    assert set(resident) == set(kept)
+    assert sorted(cache.id_of_slot.tolist()) == [-1] * (2 * E) + sorted(kept)
+    for i, slot in resident.items():
+        assert slot >= 2 * E and int(cache.id_of_slot[slot]) == i and int(cache.usage[slot]) == kept[i]
+        for src, bank in cache.banks:
+            assert torch.equal(bank[slot], src[i // E][i % E])
+
+
 def test_prefill_overlap_waits_for_previous_prefill_release_after_begin(monkeypatch):
     from freetoken.moe.offload_cache import OffloadMoeCache
 

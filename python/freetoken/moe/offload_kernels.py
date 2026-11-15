@@ -99,8 +99,9 @@ def ensure_experts_hybrid(
     return routes
 
 
-def prefill_hit_compact(cache, layer_id: int) -> None:
+def prefill_hit_compact(cache, layer_id: int, routed: torch.Tensor | None = None) -> None:
     """Compact this layer's cache-resident experts into gather indices, device-side.
+    With ``routed`` (a ``[num_experts]`` bool mask), only the resident experts it marks.
 
     hit = slot_for_id[layer_id][e] >= the pool's staging threshold (the double buffer owns the
     slots below, so those bytes are volatile within a prefill chunk and classify
@@ -109,8 +110,11 @@ def prefill_hit_compact(cache, layer_id: int) -> None:
     current stream, no host sync. Safe against the concurrent buffer invalidation
     on the copy stream: that only rewrites entries already below the threshold."""
     num_experts = cache.num_experts
+    slots = cache.slot_for_id[layer_id]
+    if routed is not None:
+        slots = torch.where(routed, slots, torch.full_like(slots, -1))  # -1 is below every threshold
     _prefill_hit_compact_kernel[(1,)](
-        cache.slot_for_id[layer_id],
+        slots,
         cache._prefill_hit_dst,
         cache._prefill_hit_src,
         cache._prefill_hit_num,
