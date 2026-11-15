@@ -1,4 +1,4 @@
-"""Decode A/B of offload against hybrid through the real serving path.
+"""Decode A/B of offload against hybrid through the real serving path, and the row ``--moe-strategy auto`` reads.
 
 The crossover between the two strategies moves with the machine, the model and the cache size
 (docs/performance/decode.md), so this command measures it where it will be used. The method follows
@@ -46,9 +46,9 @@ ones. With ``--cache-rates`` the whole A/B runs once per rate, which gives the t
     ft bench decode --model /path/to/ckpt
     ft bench decode --model /path/to/ckpt --cache-rates 0.05,0.1,0.2,0.35,0.5 --csv ab.csv
     ft bench decode --model /path/to/ckpt -- --speculative-algorithm mtp --moe-cpu-threads 8
-    ft bench decode --model /path/to/ckpt --arms offload,hybrid:min-wait --cache-rates 0.2 --seeds 3 -- --speculative-algorithm mtp --speculative-num-steps 3
+    ft bench decode --model /path/to/ckpt --arms offload,hybrid:min-wait --cache-rates 0.2 --seeds 3 --no-write -- --speculative-algorithm mtp --speculative-num-steps 3
 
-Everything after ``--`` goes to every ``ft serve`` unchanged, so the comparison is made with the flags you will serve with.
+Everything after ``--`` goes to every ``ft serve`` unchanged, so the row is filed for the flags you will serve with.
 Run ``ft bench bw --model <checkpoint>`` first: hybrid takes its fetch split from that profile.
 """
 
@@ -73,6 +73,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+from datetime import datetime, timezone
 from pathlib import Path
 
 from freetoken.moe import decode_profile
@@ -125,7 +126,8 @@ GUARD_PROMPTS = [
     ),
 ]
 
-# engine.py logs this when it has resolved --moe-strategy auto
+# engine.py logs these while it resolves the config
+KEY_LINE = re.compile(r"MoE decode setup: (?P<key>.+?); (?P<free>\d+) bytes of GPU memory free")
 AUTO_LINE = re.compile(r"Auto-selected MoE strategy: (?P<strategy>\w+)")
 
 THREADS_LINE = re.compile(r"CPU MoE executor ready: threads=(\d+)")   # cpu_executor.py, once the pool is up
@@ -152,7 +154,7 @@ def parse_args(argv: list[str] | None, prog: str) -> tuple[argparse.Namespace, l
     p.add_argument("--model", required=True, help="checkpoint dir, .gguf or .ftw")
     p.add_argument("--arms", default=DEFAULT_ARMS,
                    help=f"comma list (default {DEFAULT_ARMS}); a closing offload start is added to every round. `auto` adds a server "
-                        "started with --moe-strategy auto, to compare what auto resolves to with the explicit strategies")
+                        "started with --moe-strategy auto, to compare what auto resolves to with the explicit strategies (use it with --no-write)")
     p.add_argument("--rounds", type=int, default=3, help="most rounds of server starts per cache rate. A second and third only when the lead is not clear of zero: "
                                                              "each decodes the passes of the round before and --seeds new ones")
     p.add_argument("--min-rounds", type=int, default=1, help="rounds to run even when the first is clear (2 or more shows the timing spread of every arm)")
@@ -180,6 +182,9 @@ def parse_args(argv: list[str] | None, prog: str) -> tuple[argparse.Namespace, l
                         "The concurrent column cycles the lines that are not guards")
     p.add_argument("--greedy", action="store_true", help="temperature 0 instead of the checkpoint's sampling: every pass then decodes the same text")
     p.add_argument("--gpu", default=None, help="GPU for the servers: a UUID or nvidia-smi index (as ft serve --gpu)")
+    p.add_argument("--no-write", action="store_true", help="print the verdict, do not touch the decode profile")
+    p.add_argument("--profile", default=None,
+                   help="decode profile path (default: per GPU under ~/.cache/freetoken/benchdecode; a server reads another path from FREETOKEN_BENCHDECODE_PATH)")
     p.add_argument("--csv", default=None, help="append one line per cache rate, server start and column")
     p.add_argument("--json", default=None, help="write everything that was measured")
     p.add_argument("--server-timeout", type=float, default=1800, help="seconds to wait for a server to become ready")
@@ -317,6 +322,7 @@ def serve_cmd(ns: argparse.Namespace, extra: list[str], arm: str, rate: float | 
     env.pop("FREETOKEN_API_KEY", None)  # a local server on a private port, stopped when the arm is done
     if env.get("LOG_LEVEL", "").strip().upper() not in ("", "INFO", "DEBUG"):
         env["LOG_LEVEL"] = "INFO"  # the bench reads what a server says of its setup from its INFO lines
+    env["FREETOKEN_BENCH_DECODE_KEY"] = "1"  # an offload or hybrid server then logs the setup key auto looks its row up under
     env.pop("FREETOKEN_HYBRID_FETCH_ROUND", None)
     if ":" in arm:
         env["FREETOKEN_HYBRID_FETCH_ROUND"] = arm.split(":", 1)[1].split("#")[0]
@@ -714,16 +720,18 @@ def run_arm(ns, extra, arm: str, rate: float | None, single, together, sampling:
         finally:
             stop_server(proc)
     time.sleep(ns.settle)  # let the driver reclaim VRAM before the next server
-    resolved = threads = None
+    key = free = resolved = threads = None
     capped = False
     for line in Path(log_path).read_text(errors="replace").splitlines():
+        if m := KEY_LINE.search(line):
+            key, free = m["key"].strip(), int(m["free"])
         if m := AUTO_LINE.search(line):
             resolved = m["strategy"]
         if m := THREADS_LINE.search(line):
             threads = int(m[1])
         # a hybrid layer without an `ft bench bw` row fetches at most one expert per step
         capped |= "using a fixed fetch cap of 1" in line
-    return {"arm": arm, "tok_s": [r["tok_s"] for r in results], "results": results,
+    return {"arm": arm, "tok_s": [r["tok_s"] for r in results], "results": results, "key": key, "gpu_free_bytes": free,
             "cache_slots": int(geometry.get("moe_cache_size") or 0),
             "total_slots": int(geometry.get("num_experts") or 0) * int(geometry.get("num_moe_layers") or 0),
             "slot_bytes": int((geometry.get("unit_bytes") or {}).get("moe_per_expert") or 0),
@@ -791,7 +799,9 @@ def run_ab(ns, extra, rate: float | None, single, together, guard: list[str], sa
                 start(f"{h}#{rounds}", ns.seeds * rounds)
         start(f"offload#{rounds + 1}", ns.seeds * rounds)
     verdict = decode_profile.verdict_for(rule_input({a: r for a, r in arms.items() if a != "auto"}, names, guard), None)
-    return {"rate": rate, "arms": arms, "verdict": verdict, "rounds": rounds, "columns": names, "guard": guard, "lost": lost}
+    keys = {r["key"] for r in arms.values()}
+    key = next(iter(keys)) if len(keys) == 1 else None
+    return {"rate": rate, "arms": arms, "verdict": verdict, "key": key, "keys_seen": sorted(k for k in keys if k), "rounds": rounds, "columns": names, "guard": guard, "lost": lost}
 
 
 def machine_line(r: dict) -> str:
@@ -959,6 +969,54 @@ def report_windows(ab: dict) -> None:
                     print(f"  {a:22s}{c['context']:>9d}{_num(c['prompt_tokens'], 'd', 15)}{_num(c['prefill_s'], '.2f', 11)}{_num(c['first_token_s'], '.2f', 15)}{_num(c['tok_s'], '.1f', 14)}")
 
 
+def file_row(ns, ab: dict, sampling_source: str) -> None:
+    """File the row under the key the servers logged, or say why not."""
+    arms = ab["arms"]
+    any_arm = next(iter(arms.values()))
+    slots, complaint = slots_of(arms)
+    free = [r["gpu_free_bytes"] for a, r in arms.items() if a.split("#")[0] == "offload" and r["gpu_free_bytes"]]
+    no_hybrid = not any(a.startswith("hybrid") for a in arms)
+    if no_hybrid:
+        print("  no hybrid server ran with these flags, so there is nothing for auto to take")
+    if ab["key"] is None:
+        print("  not filed: " + ("the servers logged different setups: " + " | ".join(ab["keys_seen"]) if len(ab["keys_seen"]) > 1
+                                 else "the servers logged no `MoE decode setup` line (a build whose auto does not read decode rows)"))
+        return
+    if complaint:
+        print(f"  not filed: {complaint}")
+        return
+    if ns.no_write:
+        print(f"  not filed (--no-write). Setup: {ab['key']}")
+        return
+    stamp = decode_profile.stamp(any_arm["gpu"].get("name"), any_arm["gpu"].get("uuid"))
+    if stamp is None:
+        print("  not filed: decode rows are filed and read on Linux only (this machine's memory cannot be read from /proc)")
+        return
+    row = {
+        **rule_input({a: r for a, r in arms.items() if a != "auto"}, ab["columns"], ab["guard"]),   # tok_s: every pass of every start
+        "slots": slots,
+        "total_slots": any_arm["total_slots"],
+        "slot_bytes": any_arm["slot_bytes"],
+        "gpu_free_bytes": min(free) if free else None,
+        "measured_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "stamp": stamp,
+        "verdict": ab["verdict"],
+        "bench": {"warm": ns.warm, "decode": ns.decode, "seeds": ns.seeds, "rounds": ab["rounds"], "sampling": sampling_source, "notes": notes_for(ab),
+                  "ci95": {a: [x.get("ci95") for x in r["results"]] for a, r in arms.items() if a != "auto"}},
+    }
+    # filed without a hybrid arm too: an earlier row of this setup on which hybrid qualified must not outlive a bench where it did not run
+    dst = decode_profile.store(ab["key"], row, gpu=any_arm["gpu"], path=ns.profile)
+    print(f"  filed for {ab['key']}\n  in {dst}")
+    if no_hybrid:
+        print("  --moe-strategy auto stays on offload for this setup on this GPU and release.")
+        return
+    modes = [m for m in decode_profile.ROUND_MODES if decode_profile.verdict_for(row, m)["strategy"] == "hybrid"]
+    if modes:
+        print(f"  --moe-strategy auto now takes hybrid for this setup on this GPU and release when the server runs {' or '.join(modes)} rounding\n"
+              "  (FREETOKEN_HYBRID_FETCH_ROUND; min-wait without it). Hybrid computes some experts on the CPU: where two tokens are nearly\n"
+              "  tied its output can differ from offload's. --moe-strategy offload keeps offload.")
+
+
 def main(argv: list[str] | None = None, prog: str = "ft bench decode") -> int:
     ns, extra = parse_args(argv, prog)
     single, together, guard = load_prompts(ns)
@@ -974,6 +1032,7 @@ def main(argv: list[str] | None = None, prog: str = "ft bench decode") -> int:
     for rate in ns.cache_rates:
         ab = run_ab(ns, extra, rate, single, together, guard, sampling)
         report(ab)
+        file_row(ns, ab, sampling_source)
         slots, _ = slots_of(ab["arms"])
         if ns.csv:
             new = not os.path.exists(ns.csv)
@@ -1006,7 +1065,7 @@ def main(argv: list[str] | None = None, prog: str = "ft bench decode") -> int:
     if ns.json:
         with open(ns.json, "w") as f:
             json.dump([{"cache_rate": rate, "warm": ns.warms, "decode": ns.decode, "seeds": ns.seeds,
-                        **{k: ab[k] for k in ("columns", "guard", "rounds", "verdict", "arms", "lost")}} for rate, _, ab in summary], f, indent=1)
+                        **{k: ab[k] for k in ("columns", "guard", "rounds", "verdict", "key", "arms", "lost")}} for rate, _, ab in summary], f, indent=1)
     servers = sum(len(ab["arms"]) for _, _, ab in summary)
     print(f"\n[bench] {servers} server starts, {time.monotonic() - t0:.0f} s in all")
     return 0

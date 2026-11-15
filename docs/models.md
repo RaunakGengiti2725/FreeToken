@@ -80,7 +80,9 @@ family's row above.
   CPU, overlapped. Run `ft bench bw --model <checkpoint>` once per machine and
   model to calibrate the split.
 - **auto** — dense models always resolve to `fused`; MoE models resolve to
-  `offload`. Unified-memory GPUs differ, see below.
+  `offload`, or to `hybrid` where [`ft bench decode`](cli.md#ft-bench-decode)
+  measured it faster for the same flags on this machine. Unified-memory GPUs
+  differ, see below.
 
 ### Unified-memory GPUs (GB10 / DGX Spark)
 

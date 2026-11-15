@@ -12,7 +12,7 @@ ft <command> [args]
 | `ft launch` | Configure and launch a coding agent against a server |
 | `ft checkpoint` | Convert an HF checkpoint to the FTW fast-load format |
 | `ft bench bw` | Benchmark CPU vs PCIe bandwidth to calibrate hybrid MoE decode |
-| `ft bench decode` | Decode with `offload` and with `hybrid` on this machine and report the faster |
+| `ft bench decode` | Decode with `offload` and with `hybrid` on this machine, report the faster and file it for `--moe-strategy auto` |
 
 `ft --version` prints the installed version (torch-free; nightly wheels carry a
 `+g<sha>` build stamp, tagged releases a bare version). Every command supports
@@ -86,7 +86,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does, [performa
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload; fused on unified-memory GPUs (GB10), see [models.md](models.md#unified-memory-gpus-gb10--dgx-spark). `--moe-backend` is the deprecated old spelling |
+| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid where [`ft bench decode`](#ft-bench-decode) measured it faster for the same flags; fused on unified-memory GPUs (GB10), see [models.md](models.md#unified-memory-gpus-gb10--dgx-spark). `--moe-backend` is the deprecated old spelling |
 | `--quant-backend` | auto | Kernel per quantized layer type, `layer[.kind]=name` entries: `linear=marlin,moe=b12x` or `moe.nvfp4=triton`. A layer-level entry applies to every kind whose table lists the name |
 | `--nvfp4-backend` | — | Deprecated: stands in for `--quant-backend moe.nvfp4=<marlin\|b12x\|triton>` (`flashinfer` means b12x); cannot be combined with `--quant-backend` |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-mem` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / memory such as `12GiB` / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family strategies) |
@@ -315,3 +315,29 @@ the mean over those passes with its 95% interval.
 - `--greedy`, `--streams`, `--aime`, `--prompts`, `--csv` and `--json` change what is decoded and
   where the numbers go. `--json` keeps the timed text and the finish reason of every request.
   `--server-cmd` starts the servers of another checkout.
+
+The result is filed as one row per setup in `~/.cache/freetoken/benchdecode/<gpu-uuid>.json`
+(`--no-write` only prints it). `ft serve --moe-strategy auto` takes `hybrid` when it finds a row that
+says hybrid qualifies with the fetch rounding mode the server runs, and logs the measurement it used.
+It uses a row only if all of this holds, and logs which part differs when it does not:
+
+- the same checkpoint and the same flags: the cache size, `--moe-cpu-threads` and the CPUs the
+  process may use, speculative decoding, `--max-running-requests`, every other engine setting that
+  is not at its default, and the environment switches (`FREETOKEN_*`, and those of the kernels and
+  libraries underneath, such as `CUDA_LAUNCH_BLOCKING`);
+- the same machine and release: the GPU, the FreeToken version (a new release makes every row
+  stale and the log says so; a commit between two releases does not), torch, triton, the NVIDIA
+  driver (where `/proc/driver/nvidia/version` exists; not under WSL), the CPU model, the amount of
+  RAM, the container's CPU quota and the `ft bench bw` profile;
+- with an automatically sized cache, no more free GPU memory than when the row was measured (5%
+  more slots at most). Hybrid then also runs with no more slots than it was measured with.
+
+A row keeps the tok/s of every pass of every start, and `auto` applies the rule above to them. A
+profile from a build whose rows held one number per column is not read, and the log says so.
+
+Without such a row `auto` stays on `offload`. Rows are Linux only: the machine is read from `/proc`
+and `/sys`, and where that cannot be done no row is filed and `auto` stays on `offload`.
+Tensor-parallel servers are never picked from rows.
+Hybrid computes some experts on the CPU, so where two tokens are nearly tied its output can differ
+from offload's; and on output that barely misses the cache it can be up to the guard limit slower.
+`--moe-strategy offload` keeps offload whatever was measured.

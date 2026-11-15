@@ -94,7 +94,7 @@ def _usable_profile(
             f"{PROFILE_VERSION}; ignoring it, rerun `ft bench bw`"
         )
         return None
-    prof_gpu = (prof.get("gpu") or {}).get("name")
+    prof_gpu = prof["gpu"].get("name") if isinstance(prof.get("gpu"), dict) else None
     if gpu_name and prof_gpu and prof_gpu != gpu_name:
         logger.warning(
             f"benchbw profile {src} was measured on {prof_gpu!r}, not this GPU "

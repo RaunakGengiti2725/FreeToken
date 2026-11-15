@@ -932,6 +932,11 @@ class Engine:
         # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one request's decode step
         pools = self._moe_pools(config.decode_rows_per_req if decode_target == "gpu" else 1)
         size_cap = sum(p.max_num_slots for p in pools)
+        if decode_target == "hybrid" and config.moe_decode_row is not None:
+            from freetoken.moe import decode_profile
+
+            # auto took hybrid on a row measured at one cache size: more slots than that were never compared with offload
+            size_cap = decode_profile.slot_cap(config.moe_decode_row, size_cap)
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
             object.__setattr__(config, "moe_cache_size", size)
@@ -1280,6 +1285,11 @@ class Engine:
                 self.moe_offload_cache.validate_rebuild(moe_cache_size, moe_pool_sizes)
             except ValueError as e:
                 raise CacheRebuildRejected(str(e)) from e
+            if self.moe_offload_cache.decode_target == "hybrid" and config.moe_decode_row is not None:
+                from freetoken.moe import decode_profile
+
+                if note := decode_profile.resize_note(config.moe_decode_row, moe_cache_size):
+                    logger.warning_rank0(f"--moe-strategy auto: {note}")
         if num_pages is not None and num_pages <= 0:
             raise CacheRebuildRejected(f"num_pages must be positive, got {num_pages}")
         if num_mamba_slots is not None:
@@ -1750,6 +1760,81 @@ def _decode_target(config: EngineConfig) -> str:
     return "gpu"
 
 
+# settings the decode-profile key renders itself, or that the row decides
+_DECODE_KEY_OWN = frozenset((
+    "model_path", "tp_info", "moe_strategy", "moe_backend", "moe_cache_size", "moe_cache_rate", "moe_cache_auto", "moe_cache_mem",
+    "memory_ratio", "moe_cpu_threads", "max_running_req", "speculative_algorithm", "speculative_num_steps", "spec_slot_states",
+    "moe_decode_key", "moe_decode_row",
+))
+
+
+def _moe_cache_is_auto(config: EngineConfig) -> bool:
+    # no sizing flag becomes --moe-cache-auto a few lines after auto resolves, so it counts as auto before that too
+    return config.moe_cache_auto or (config.moe_cache_size <= 0 and config.moe_cache_mem is None)
+
+
+def _decode_decision_key(config: EngineConfig) -> str:
+    """This setup's key in the decode profile (moe/decode_profile.py): the checkpoint, the cache, the CPUs, speculative decoding, and every other engine setting that is not at its default."""
+    from freetoken.moe import decode_profile
+
+    spec = f"{config.speculative_algorithm}:{config.speculative_num_steps}" if config.speculative_algorithm is not None else "off"
+    return decode_profile.decision_key(
+        model=decode_profile.model_fingerprint(config.model_path),
+        cache=decode_profile.cache_spec(size=config.moe_cache_size, mem=config.moe_cache_mem, auto=_moe_cache_is_auto(config), memory_ratio=config.memory_ratio),
+        cpu=decode_profile.cpu_spec(config.moe_cpu_threads),
+        spec=spec,
+        tp_size=config.tp_info.size,
+        max_running_req=config.max_running_req,
+        extra=decode_profile.non_default_settings(config, EngineConfig, skip=_DECODE_KEY_OWN),
+        env=decode_profile.perf_env(),
+    )
+
+
+def _gpu_free_bytes() -> int | None:
+    """Free memory of the bound GPU when the decode-profile key is made: before anything is loaded."""
+    if not torch.cuda.is_available():
+        return None
+    return int(torch.cuda.mem_get_info(torch.cuda.current_device())[0])
+
+
+def _measured_decode_strategy(config: EngineConfig) -> tuple[str, dict | None]:
+    """``(strategy, row)`` for --moe-strategy auto on a model that would take offload: hybrid only on a decode row measured for this setup, on this machine and release (moe/decode_profile.py); offload otherwise, as before."""
+    from freetoken.moe import decode_profile
+
+    def offload(reason: str) -> tuple[str, None]:
+        logger.info_rank0(f"--moe-strategy auto: offload ({reason}); `ft bench decode` measures whether hybrid is faster for this setup")
+        return "offload", None
+
+    if config.tp_info.size > 1:
+        # each rank binds its own GPU and would read that GPU's rows: the ranks could disagree
+        return offload("tensor parallel runs are not picked from decode rows")
+    if not _cpu_moe_executor_viable(config.model_config):
+        return offload("the CPU MoE executor cannot serve this model")
+    gpu_name, gpu_uuid = _profile_gpu()
+    row, reason = decode_profile.lookup(
+        config.moe_decode_key, gpu_name=gpu_name, gpu_uuid=gpu_uuid, now=lambda: decode_profile.stamp(gpu_name, gpu_uuid)
+    )
+    floor = config.model_config.num_experts
+    if row is not None and decode_profile.slot_cap(row, floor) < floor:
+        # a hand-edited row below the cache's floor would cap the cache under it and fail the start
+        row, reason = None, f"the decode row's hybrid cache is below this model's floor of {floor} slots"
+    if row is None:
+        return offload(reason)
+    # the rounding mode this server will run (moe/offload_kernels.py reads the same variable)
+    round_mode = (os.getenv("FREETOKEN_HYBRID_FETCH_ROUND") or "min-wait").strip().lower()
+    verdict = decode_profile.verdict_for(row, round_mode)
+    if verdict["strategy"] != "hybrid":
+        other = decode_profile.verdict_for(row, None)
+        also = f"; hybrid with {other['round']} rounding qualifies (FREETOKEN_HYBRID_FETCH_ROUND={other['round']})" if other["strategy"] == "hybrid" else ""
+        logger.info_rank0(f"--moe-strategy auto: {decode_profile.explain(row, verdict)}{also}")
+        return "offload", None
+    if _moe_cache_is_auto(config):
+        if objection := decode_profile.auto_size_objection(row, _gpu_free_bytes(), config.memory_ratio):
+            return offload(objection)
+    logger.info_rank0(f"--moe-strategy auto: {decode_profile.explain(row, verdict)}")
+    return "hybrid", row
+
+
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
     "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
@@ -2123,6 +2208,13 @@ def _adjust_config(config: EngineConfig):
             "and let every layer decode on the GPU offload path instead."
         )
 
+    bench_server = config.moe_strategy in ("offload", "hybrid") and os.getenv("FREETOKEN_BENCH_DECODE_KEY") == "1"
+    if is_moe and (config.moe_strategy == "auto" or bench_server) and isinstance(config, EngineConfig):
+        # the key auto looks its decode row up under; `ft bench decode` asks its offload and hybrid servers for the same key
+        override("moe_decode_key", _decode_decision_key(config))
+        free = _gpu_free_bytes()
+        logger.info_rank0(f"MoE decode setup: {config.moe_decode_key}" + (f"; {free} bytes of GPU memory free" if free is not None else ""))
+
     if is_moe and config.moe_strategy == "auto":
         # A MoE model always defaults to the offload family: experts stream from pinned host
         # banks into an auto-sized GPU slot cache, which is the only default that serves a model
@@ -2157,6 +2249,10 @@ def _adjust_config(config: EngineConfig):
                     "(use --moe-strategy offload to keep the offload flags)"
                 )
                 override("moe_cpu_layers", None)
+        if default_backend == "offload" and getattr(config, "moe_decode_key", None) is not None:
+            # hybrid only on a decode row measured for this setup, on this machine and release; offload without one
+            default_backend, row = _measured_decode_strategy(config)
+            override("moe_decode_row", row)
         override("moe_strategy", default_backend)
         logger.info_rank0(f"Auto-selected MoE strategy: {config.moe_strategy}")
 
