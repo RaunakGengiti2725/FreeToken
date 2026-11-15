@@ -77,6 +77,15 @@ class BankSpec:
     resident: bool = False
 
 
+@dataclass(frozen=True)
+class RoutedExperts:
+    """The layer behind the slot view of a demand prefill chunk: the prefill GEMMs size their tiles by its ``count`` of
+    experts and W4A4 takes its activation scales over their ``alphas``, as the stream of that layer would."""
+
+    count: int
+    alphas: tuple[torch.Tensor, torch.Tensor] | None = None
+
+
 @dataclass
 class ExpertView:
     """The weights an apply() call reads: layout roles -> [E, ...] (resident, materialized layer) or [S, ...] (slot cache)."""
@@ -87,6 +96,7 @@ class ExpertView:
     alphas: tuple[torch.Tensor, torch.Tensor] | None = None
     # False: a decode apply() may return each route's weighted output [M, top_k, hidden], unsummed
     sum_routes: bool = True
+    routed: RoutedExperts | None = None
 
 
 def fused_piece(pieces: dict[str, torch.Tensor], role: str) -> torch.Tensor:
