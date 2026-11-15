@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import copy
 import errno
 import gc
 import math
@@ -816,7 +817,23 @@ class Engine:
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
+        from freetoken.engine.cache_budget import CacheBudgetTooSmall, budget_advice, resolve_moe_cache_auto
+
+        try:
+            return resolve_moe_cache_auto(**self._auto_cache_terms(config, banks, method, max_slots))
+        except CacheBudgetTooSmall as exc:
+            _, kv_fixed, _, min_reserve = self._pool_cls.kv_cost(config)
+            raise ValueError(
+                f"{exc}; budget = {config.memory_ratio} x {mem_GB(self._baseline_free)} free - {mem_GB(self._weights_bytes)} "
+                f"weights - {mem_GB(kv_fixed)} fixed KV - {mem_GB(state_pool_bytes(config))} linear state - "
+                f"{mem_GB(self._spec_budget(config)[0])} speculative buffers; "
+                f"{budget_advice(self._budget_stages(config, banks, method, max_slots), min_reserve)}; "
+                "docs/performance/decode.md (Getting more slots) lists what each flag costs"
+            ) from exc
+
+    def _auto_cache_terms(self, config: EngineConfig, banks, method=None, max_slots=None) -> dict:
+        """resolve_moe_cache_auto's arguments for ``config``."""
+        from freetoken.engine.cache_budget import expert_bytes_per_slot
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
@@ -825,7 +842,7 @@ class Engine:
         cache_per_page += draft_page
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
-        return resolve_moe_cache_auto(
+        return dict(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,
@@ -839,6 +856,34 @@ class Engine:
             page_size=page_tokens,
             max_slots=max_slots if max_slots is not None or method is None else method.slot_limit(),
         )
+
+    def _budget_stages(self, config: EngineConfig, banks, method, max_slots) -> list[tuple[str, dict]]:
+        """What budget_advice tries, as (flags, resolver arguments): the current settings, then each
+        flag that frees budget on top of those before it, least harmful first."""
+        terms = self._auto_cache_terms(config, banks, method, max_slots)
+        stages = [("", terms)]
+
+        def stage(flag: str, **changed) -> None:
+            flags, last = stages[-1]
+            stages.append((f"{flags} {flag}".strip(), {**last, **changed}))
+
+        if config.max_running_req > 1:
+            one = copy.copy(config)
+            object.__setattr__(one, "max_running_req", 1)
+            stage("--max-running-requests 1", **self._auto_cache_terms(one, banks, method, max_slots))
+        if config.embed_weights != "host":
+            host = copy.copy(config)
+            object.__setattr__(host, "embed_weights", "host")
+            try:
+                state = self.model.state_dict()
+                moved = sum(state[key].nbytes for key in _host_embedding_keys(self.model, host))
+            except ValueError:  # the flag is refused for this model
+                moved = 0
+            if moved:
+                stage("--embed-weights host", weights_bytes=terms["weights_bytes"] - moved)
+        if config.memory_ratio < 0.95:
+            stage("--memory-ratio 0.95", memory_ratio=0.95)
+        return stages
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         from freetoken.moe.expert_banks import is_mixed

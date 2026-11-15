@@ -7,7 +7,7 @@ import torch
 
 import os
 
-from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
+from freetoken.engine.cache_budget import budget_advice, expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
 from freetoken.engine.engine import _pin_budget_bytes
 
 
@@ -72,12 +72,39 @@ def test_insufficient_kv_memory_raises():
 def test_budget_too_small_for_min_moe_plus_reserve_raises():
     # Budget cannot fund even the minimum MoE slots + the KV reserve, so the floored plan
     # would exceed budget_bytes. Reject in arithmetic rather than OOM in a later CUDA alloc.
-    with pytest.raises(AssertionError, match="budget too small"):
+    with pytest.raises(ValueError, match="budget too small"):
         plan_cache_budget(
             budget_bytes=300, per_expert_bytes=100, cache_per_page=10,
             num_experts=4, total_experts=4, prefill_overlap=False,
             kv_reserve_pages=10, max_slots=4,
         )  # min moe = 4 slots (400 B) + reserve (10 pages = 100 B) = 500 B > 300 B budget
+
+
+def test_budget_advice_names_flags_the_resolver_accepts():
+    # budget int(0.9 * 1005) - 200 = 704 B; the floor of 4 slots (400 B) leaves 30 of the 64 reserved pages (10 B each)
+    terms = dict(
+        baseline_free=1005, weights_bytes=200, memory_ratio=0.9, cache_per_page=10, fixed_cache_size=0,
+        per_expert_bytes=100, num_experts=4, total_experts=40, prefill_overlap=False,
+        kv_reserve_tokens=256, page_size=4,
+    )
+
+    def plan(tokens):
+        try:
+            return resolve_moe_cache_auto(**{**terms, "kv_reserve_tokens": tokens})
+        except ValueError:
+            return None
+
+    # checked against the resolver itself: the reserve named is the largest one it accepts, with the plan it returns
+    largest = max(tokens for tokens in range(8, 257) if plan(tokens))
+    slots, pages, _ = plan(largest)
+    advice = budget_advice([("", terms)], min_reserve_tokens=0)
+    assert advice.startswith(f"fits with --kv-reserve-tokens {largest}: {slots} expert slots, {pages * 4} KV tokens")
+
+    # weights above the budget: int(0.95 * 1005) - 1200 = -246 B. The pool's own floor of 200 tokens (50 pages, 500 B)
+    # is kept, so the last try is 400 + 500 + 246 = 1146 B short.
+    over = {**terms, "weights_bytes": 1200}
+    advice = budget_advice([("", over), ("--memory-ratio 0.95", {**over, "memory_ratio": 0.95})], min_reserve_tokens=200)
+    assert advice.startswith("no fit") and "--kv-reserve-tokens 200 " in advice and "1146 B" in advice
 
 
 def test_prefill_overlap_false_is_honored():
@@ -336,6 +363,25 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
 
     size, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
     assert size == 5
+
+    # 25 linear states (4 requests) leave less than 4 slots + the 2-page reserve, 9 states (1 request) leave room:
+    # the error names that flag, and the plan it prints is the plan the flag gives.
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(1, 3), num_key_heads=2, num_value_heads=4,
+        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
+    )
+    config = StubConfig()
+    config.model_config.linear_attention_group = lambda: group
+    config.cache_type, config.linear_state_cache_ratio, config.embed_weights = "hybrid_radix", 2.0, "host"
+    config.kv_reserve_tokens, config.moe_prefill_overlap = 32, False
+    engine._baseline_free, engine._weights_bytes = 1_500_000, 962_448
+    with pytest.raises(ValueError, match="budget too small") as refused:
+        engine._resolve_auto_moe_cache_size(config, StubBanks())
+    config.max_running_req = 1
+    size, pages, _ = engine._resolve_auto_moe_cache_size(config, StubBanks())
+    assert f"fits with --max-running-requests 1: {size} expert slots, {pages * 16} KV tokens" in str(refused.value)
 
 
 # ---------------------------------------------------------------------------
