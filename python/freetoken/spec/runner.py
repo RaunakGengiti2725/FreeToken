@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -17,6 +18,36 @@ if TYPE_CHECKING:
     from freetoken.engine.sample import BatchSamplingArgs
     from freetoken.models.blocks import FeatureSink
     from freetoken.models.config import SlotStateSpec
+
+
+@dataclass
+class _PrefillRows:
+    """The request fields the backends read, for one verify step over positions [cached_len, device_len) of a prefill chunk."""
+
+    table_idx: int
+    cached_len: int
+    device_len: int
+    linear_slot_idx: int | None
+    mrope_delta: int = 0
+    mrope_positions_full: torch.Tensor | None = None
+
+    @property
+    def extend_len(self) -> int:
+        return self.device_len - self.cached_len
+
+
+def _mrope_rows(reqs) -> torch.Tensor:
+    """[3, n] rope rows of the requests' [cached_len, device_len): a prompt position's precomputed column, else position + delta."""
+    cols = []
+    for r in reqs:
+        pos = torch.arange(r.cached_len, r.device_len, dtype=torch.int32)
+        col = (pos + r.mrope_delta).unsqueeze(0).expand(3, -1).clone()
+        full = r.mrope_positions_full
+        if full is not None:
+            inside = pos < full.shape[1]
+            col[:, inside] = full[:, pos[inside].long()]
+        cols.append(col)
+    return torch.cat(cols, dim=1)
 
 
 def proposer_class(config) -> type[Proposer]:
@@ -96,6 +127,62 @@ class SpecRunner:
 
     def feature_sink(self, batch: Batch) -> FeatureSink | None:
         return self.proposer.feature_sink(batch)
+
+    @property
+    def can_prefill_as_verify(self) -> bool:
+        return type(self.proposer).adopt_verify_rows is not Proposer.adopt_verify_rows
+
+    def prefill_as_verify(self, batch: Batch) -> torch.Tensor:
+        """Run a short prefill chunk of one request as verify steps and return its last token's logits, ``[1, vocab]``.
+
+        A verify step is a forward of k + 1 consecutive rows of one request on the decode kernels, captured in a
+        CUDA graph; an eager prefill forward of two tokens costs several times one. Here every row is a prompt
+        token, so none is drafted or rejected: each step's rows are committed as accepted (commit_verify), which
+        leaves the K/V and the linear state where a prefill of those tokens leaves them. A last step with fewer
+        tokens than rows repeats its last token in the rows past the chunk and stores them to the padding page;
+        nothing of those rows is kept. The draft then reads the rows' hidden states as it does after a prefill.
+        The logits come from the decode kernels, not the prefill ones: the same weights, not always the same bits.
+        """
+        from freetoken.attention.linear import gdn_slot
+        from freetoken.core import Batch as _Batch
+
+        engine, req, width = self.engine, batch.reqs[0], self.k + 1
+        start, n = req.cached_len, req.extend_len
+        pad_loc = engine.page_table[engine.dummy_req.table_idx, 0]
+        pool = engine.linear_state_pool
+        hidden = []
+        for done in range(0, n, width):
+            m = min(width, n - done)
+            rows = _PrefillRows(
+                req.table_idx, start + done, start + done + width, req.linear_slot_idx,
+                req.mrope_delta, req.mrope_positions_full,
+            )
+            step = _Batch(reqs=[rows], phase="verify", rows_per_req=width)
+            engine.graph_runner.pad_batch(step)
+            ids, out_loc = batch.input_ids[done : done + m], batch.out_loc[done : done + m]
+            if m < width:
+                ids = torch.cat([ids, ids[-1:].expand(width - m)])
+                out_loc = torch.cat([out_loc, pad_loc.expand(width - m).to(out_loc.dtype)])
+            if step.padded_size > 1:
+                # the padding requests' rows, as a verify batch of the scheduler has them
+                pad = (step.padded_size - 1) * width
+                ids = torch.cat([ids, ids.new_zeros(pad)])
+                out_loc = torch.cat([out_loc, pad_loc.expand(pad).to(out_loc.dtype)])
+            step.input_ids, step.out_loc = ids, out_loc
+            positions = [torch.arange(r.cached_len, r.device_len, dtype=torch.int32) for r in step.padded_reqs]
+            step.positions = torch.cat(positions).to(self.device, non_blocking=True)
+            if engine.config.model_config.model_is_mrope:
+                step.mrope_positions = _mrope_rows(step.padded_reqs).to(self.device, non_blocking=True)
+            if engine.linear_backend is not None:
+                engine.linear_backend.prepare_metadata(step)
+            engine.attn_backend.prepare_metadata(step)
+            step.features = self.feature_sink(step)
+            logits = engine.forward_logits(step)
+            if pool is not None and pool.verify_scratch is not None:
+                pool.commit_verify([gdn_slot(req)], [m])
+            hidden.append(self.proposer.adopt_verify_rows(m))
+        self.proposer.prefill_sink_from(batch, torch.cat(hidden))
+        return logits[m - 1 : m]
 
     def on_prefill(self, batch: Batch, next_tokens_gpu: torch.Tensor) -> None:
         self.proposer.on_prefill(batch, next_tokens_gpu)

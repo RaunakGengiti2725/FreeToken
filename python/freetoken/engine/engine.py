@@ -1519,14 +1519,38 @@ class Engine:
             self.cpu_moe_executor.raise_if_unhealthy()
         return logits
 
+    def _prefill_runs_as_verify(self, batch: Batch) -> bool:
+        """Whether this prefill chunk is short enough, and plain enough, to run as captured verify steps.
+
+        One request, text only, continuing a cached prefix (its state slot is live), with no GDN track
+        snapshot due in the chunk, and room in the page table for the rows a last, partly filled step
+        reads past the chunk."""
+        limit, runner = self.config.prefill_graph_tokens, self.graph_runner
+        if limit <= 0 or batch.size != 1 or runner.phase != "verify" or batch.mm_gather_plan:
+            return False
+        if not self.spec.can_prefill_as_verify:
+            return False
+        req, rows = batch.reqs[0], runner.rows_per_req
+        steps = -(-req.extend_len // rows)
+        fla = batch.fla_metadata
+        return (
+            req.cached_len > 0
+            and req.extend_len <= limit
+            and req.cached_len + steps * rows <= self.page_table.shape[1]
+            and (fla is None or fla.track_dst is None)
+        )
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         spec_prefill = self.spec is not None and batch.is_prefill
-        if spec_prefill:
-            batch.features = self.spec.feature_sink(batch)
-        logits = self.forward_logits(batch)
+        if spec_prefill and self._prefill_runs_as_verify(batch):
+            logits = self.spec.prefill_as_verify(batch)
+        else:
+            if spec_prefill:
+                batch.features = self.spec.feature_sink(batch)
+            logits = self.forward_logits(batch)
 
         for req in batch.reqs:
             req.complete_one()

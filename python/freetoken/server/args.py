@@ -987,6 +987,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--prefill-graph-tokens",
+        type=int,
+        dest="prefill_graph_tokens",
+        default=ServerArgs.prefill_graph_tokens,
+        help=(
+            "With speculative decoding, a prefill chunk of at most this many tokens on a cached prefix "
+            "runs as captured verify steps (the CUDA graphs decode already uses) instead of an eager "
+            "forward. 0 = always eager."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-prefill-hit-d2d",
         action="store_true",
         dest="moe_prefill_hit_d2d",
