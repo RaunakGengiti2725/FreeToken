@@ -71,23 +71,26 @@ def chat_request_to_genspec(
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    sampling_params = resolve_sampling(
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+        max_tokens=req.max_tokens,
+        ignore_eos=req.ignore_eos,
+        model_sampling=model_sampling,
+        stop=req.stop,
+        default_max_tokens=default_max_tokens,
+        presence_penalty=req.presence_penalty,
+        frequency_penalty=req.frequency_penalty,
+        timings_per_token=timings_per_token,
+        min_p=req.min_p,
+        repetition_penalty=req.repetition_penalty,
+    )
+    # --reasoning-budget fills it when it stays None (generation.resolve_reasoning_budget)
+    sampling_params.reasoning_budget = req.reasoning_budget
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
-        sampling_params=resolve_sampling(
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            max_tokens=req.max_tokens,
-            ignore_eos=req.ignore_eos,
-            model_sampling=model_sampling,
-            stop=req.stop,
-            default_max_tokens=default_max_tokens,
-            presence_penalty=req.presence_penalty,
-            frequency_penalty=req.frequency_penalty,
-            timings_per_token=timings_per_token,
-            min_p=req.min_p,
-            repetition_penalty=req.repetition_penalty,
-        ),
+        sampling_params=sampling_params,
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
         parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
@@ -252,6 +255,7 @@ async def handle_chat_completion(
             result.prompt_tokens,
             result.completion_tokens,
             _reported_cached(state, result.cached_tokens),
+            result.reasoning_stats,
         ),
     }
     if (timings := timings_block(state, result.timings)) is not None:
@@ -711,10 +715,18 @@ def _reported_cached(state: Any, cached_tokens: int) -> int:
 
 
 def _reported_usage(state: Any, usage: GenUsage) -> dict[str, Any]:
-    return _usage(usage.prompt_tokens, usage.completion_tokens, _reported_cached(state, usage.cached_tokens))
+    return _usage(
+        usage.prompt_tokens, usage.completion_tokens, _reported_cached(state, usage.cached_tokens),
+        usage.reasoning_stats,
+    )
 
 
-def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -> dict[str, Any]:
+def _usage(
+    prompt_tokens: int,
+    completion_tokens: int,
+    cached_tokens: int = 0,
+    reasoning_stats: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     usage: dict[str, Any] = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -724,6 +736,11 @@ def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -
     # disabled report and a 0-token hit serialize identically.
     if cached_tokens > 0:
         usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+    # only a request with a reasoning budget is counted, on its terminal reply
+    if reasoning_stats is not None:
+        usage["completion_tokens_details"] = {"reasoning_tokens": reasoning_stats["reasoning_tokens"]}
+        if reasoning_stats.get("closed_by"):
+            usage["reasoning_closed_by"] = reasoning_stats["closed_by"]
     return usage
 
 

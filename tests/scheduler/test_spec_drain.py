@@ -43,7 +43,7 @@ def _setup():
         cache_manager=cm, table_manager=tm, decode_manager=dm, prefill_manager=pm, spec=None, engine=engine,
         config=SimpleNamespace(decode_rows_per_req=K + 1), device=torch.device("cpu"),
         token_pool=torch.zeros(4, 64, dtype=torch.int32), eos_token_ids=set(), toolcall_anchor_id=None,
-        _match_stop_str=lambda _req: None,
+        _match_stop_str=lambda _req: None, _reasoning={},
     )
 
     def free(req):
@@ -181,3 +181,49 @@ def test_drain_stamps_intermediate_timings_when_requested():
     assert reply[0].timings["draft_n"] == K and reply[0].timings["draft_n_accepted"] == 3
     # the terminal reply of the same drain keeps the unchanged terminal snapshot
     assert reply[1].finished and reply[1].timings["predicted_n"] == 3
+
+
+def test_drain_commits_a_forced_token_as_the_end_of_the_accepted_run():
+    """A request at its reasoning budget inside a verify step: the host plans the close tag for the row where the budget ends, the verify cuts the accepted drafts there, and the drain commits, rolls back and leaves pending exactly that prefix."""
+    from freetoken.scheduler.reasoning import ReasoningTracker, ThinkTokens
+
+    close = 99
+    pool, cm, tm, dm, stub, events = _setup()
+    reqs = [_decoding_req(pool, cm, tm, 1, 16), _decoding_req(pool, cm, tm, 2, 16)]
+    dm.filter_reqs(reqs)
+    tags = ThinkTokens(open=(98,), close=(close,), exits=frozenset(), warning=())
+    # request 1 starts inside thinking with its first output token (7) observed: one more fits the budget of 2
+    tracker = ReasoningTracker(tags, [98], budget=2)
+    tracker.observe([7])
+    stub._reasoning = {1: tracker}
+    stub._think_void = torch.tensor(sorted(tags.void))
+    batch = Batch(reqs=reqs, phase="verify", rows_per_req=K + 1)
+    forced = Scheduler._plan_forced(stub, batch)
+    assert forced.index.tolist() == [1, -1] and forced.token[0] == close
+
+    for req in reqs:
+        req.widen_pending(K)
+    cm.allocate_paged(reqs)
+    free_before = cm.available_size
+    # the verify accepted every draft of both requests
+    out, emitted = forced.cut(torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24]]), torch.tensor([3, 3]))
+    output = SimpleNamespace(next_tokens_gpu=out, next_tokens_cpu=out, emitted_cpu=emitted)
+    reply, finished = [], set()
+    tables = [r.table_idx for r in reqs]
+
+    Scheduler._drain_verify(stub, batch, output, reply, finished)
+
+    assert [m.next_tokens for m in reply] == [[11, close], [21, 22, 23, 24]]
+    # the target state and the page table take two tokens of request 1, and its close tag is the pending token
+    assert events == [("commit", [1, 2], [2, 4])]
+    assert (reqs[0].cached_len, reqs[0].device_len) == (PROMPT + 2, PROMPT + 3)
+    assert int(stub.token_pool[tables[0], PROMPT + 2]) == close
+    assert cm.available_size - free_before == (K + 1 - 2) + (K + 1 - 4)
+    # one accepted draft: the forced token is not one
+    assert reqs[0].stats.draft_n_accepted == 1 and reqs[1].stats.draft_n_accepted == 3
+    assert not tracker.thinking and tracker.usage() == {"reasoning_tokens": 2, "closed_by": "budget"}
+    # the span is closed: the next step forces nothing
+    assert Scheduler._plan_forced(stub, Batch(reqs=reqs, phase="verify", rows_per_req=K + 1)) is None
+    for req in reqs:
+        stub._free_req_resources(req)
+    cm.check_integrity()

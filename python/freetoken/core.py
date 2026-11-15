@@ -33,6 +33,9 @@ class SamplingParams:
     min_p: float = 0.0
     # 1 disables: divides the positive logits and multiplies the negative ones of every token in the prompt or the output so far
     repetition_penalty: float = 1.0
+    # Tokens a response may spend inside its thinking span before the scheduler forces the
+    # close tag; None = unset (the API layer fills the server default), 0 = off.
+    reasoning_budget: int | None = None
 
     @property
     def is_greedy(self) -> bool:

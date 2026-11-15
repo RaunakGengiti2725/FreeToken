@@ -40,6 +40,42 @@ def test_greedy_prefix_match_exact():
         assert out[0, : want_emitted + 1].tolist() == want_tokens
 
 
+def test_a_forced_token_ends_the_accepted_run_at_its_row():
+    """A forced token is committed like the target's own token at a rejected row: the rows before it stay, the drafts after it are dropped, and it is skipped when its row was computed on a rejected draft or a void token precedes it in the step."""
+    from freetoken.engine.sample import BatchSamplingArgs, ForcedTokens
+    from freetoken.spec.rejection import reject
+
+    device = torch.device("cpu")
+    k, forced, void = 3, 7, 6
+    # the target's argmax after the pending token and after each draft
+    target = [3, 1, 2, 0]
+    logits = torch.full((k + 1, VOCAB), -10.0)
+    for pos, t in enumerate(target):
+        logits[pos, t] = 10.0
+    cases = [
+        # drafts, forced index, committed tokens
+        ([3, 1, 2], 0, [forced]),            # every draft right, cut at the first row
+        ([3, 1, 2], 2, [3, 1, forced]),
+        ([3, 1, 2], 3, [3, 1, 2, forced]),   # the bonus row
+        ([3, 5, 2], 1, [3, forced]),         # at the first rejected row: replaces the recovered token
+        ([3, 5, 2], 2, [3, 1]),              # past it: that row read the rejected draft
+        ([3, 1, 2], -1, [3, 1, 2, 0]),       # no forced token
+    ]
+    for drafts, index, want in cases:
+        out, emitted = reject(logits, torch.tensor([drafts]), BatchSamplingArgs(temperatures=None), _sampler(device))
+        plan = ForcedTokens(torch.tensor([index]), torch.tensor([forced]), torch.tensor([void]))
+        out, emitted = plan.cut(out, emitted)
+        assert out[0, : int(emitted) + 1].tolist() == want, (drafts, index)
+
+    # a void token (the model's own close tag) before the forced row keeps the step as sampled
+    logits[1] = -10.0
+    logits[1, void] = 10.0
+    out, emitted = reject(logits, torch.tensor([[3, void, 2]]), BatchSamplingArgs(temperatures=None), _sampler(device))
+    for index, want in ((2, [3, void, 2, 0]), (1, [3, forced])):
+        cut_out, cut_emitted = ForcedTokens(torch.tensor([index]), torch.tensor([forced]), torch.tensor([void])).cut(out, emitted)
+        assert cut_out[0, : int(cut_emitted) + 1].tolist() == want, index
+
+
 @cuda
 def test_each_verify_row_counts_the_drafts_before_it_as_committed():
     """Row j penalizes the committed counts plus drafts d1..dj, frequency per occurrence and presence once per token; the counts stay as they were."""

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 
-from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
+from typing import TYPE_CHECKING, Iterable, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
 from freetoken.core import Batch, Req
@@ -36,11 +36,13 @@ from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .mm import cut_image_spans, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
+from .reasoning import OPEN_TAIL, ReasoningTracker, ThinkTokens
 from .status import SchedulerStatusReporter
 from .table import TableManager
 
 if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
+    from freetoken.engine.sample import ForcedTokens
     from freetoken.engine.spec_protocol import SpecRuntime
 
 
@@ -128,6 +130,11 @@ class Scheduler(SchedulerIOMixin):
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
         # A /v1/cache/flush waiting for the idle safe point, with its time.monotonic() deadline.
         self._pending_flush: Tuple[FlushCacheBackendMsg, float] | None = None
+        # uid -> tracker of each live request with a reasoning budget; empty otherwise
+        self._reasoning: dict[int, ReasoningTracker] = {}
+        # the thinking tags' token ids, or why they cannot be tracked; resolved by the first request that asks
+        self._think_tokens: ThinkTokens | str | None = None
+        self._think_void: torch.Tensor | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -256,7 +263,8 @@ class Scheduler(SchedulerIOMixin):
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
-        forward_input = self._schedule_next_batch()
+        # a forced token is decided from every token before it: a request that may get one sits this launch out
+        forward_input = self._schedule_next_batch(hold=self._awaiting_inflight(last_data))
         ongoing_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
@@ -496,7 +504,54 @@ class Scheduler(SchedulerIOMixin):
             matched_stop=matched_stop,
             stop_strs=params.stop_strs or None,
         )
+        if (tracker := self._reasoning.get(req.uid)) is not None:
+            tracker.observe(committed)
+            if finished:
+                msg.reasoning = tracker.usage()
         return msg, len(committed)
+
+    def _track_reasoning(self, msg: UserMsg) -> str | None:
+        """Start tracking the request's thinking span; returns the reason when this server cannot."""
+        if self._think_tokens is None:
+            from freetoken.server.reasoning_parser import think_tags
+
+            try:
+                self._think_tokens = ThinkTokens.resolve(self.tokenizer, think_tags(self.config.reasoning_parser))
+            except ValueError as exc:
+                self._think_tokens = str(exc)
+        if isinstance(self._think_tokens, str):
+            return self._think_tokens
+        self._reasoning[msg.uid] = ReasoningTracker(
+            self._think_tokens, msg.input_ids[-OPEN_TAIL:].tolist(), msg.sampling_params.reasoning_budget
+        )
+        return None
+
+    def _awaiting_inflight(self, last_data: ForwardData | None) -> List[Req]:
+        """The requests of the undrained batch whose next token may be forced: their next step waits for the drain."""
+        if not self._reasoning or last_data is None:
+            return []
+        return [
+            req for req in last_data[0].batch.reqs
+            if (tracker := self._reasoning.get(req.uid)) is not None and tracker.armed()
+        ]
+
+    def _plan_forced(self, batch: Batch) -> ForcedTokens | None:
+        """The token each tracked request must commit in this step, None when no request has one."""
+        from freetoken.engine.sample import ForcedTokens
+
+        plans = [
+            tracker.plan(batch.rows_per_req) if (tracker := self._reasoning.get(req.uid)) is not None else None
+            for req in batch.reqs
+        ]
+        if not any(plans):
+            return None
+        if self._think_void is None:
+            # made by the first step that forces a token: a budget that never acts puts nothing on the device
+            self._think_void = torch.tensor(sorted(self._think_tokens.void), dtype=torch.int64, device=self.device)
+        index, token = torch.tensor(
+            [plan or (-1, 0) for plan in plans], dtype=torch.int64, pin_memory=self.device.type == "cuda",
+        ).to(self.device, non_blocking=True).unbind(1)
+        return ForcedTokens(index, token, self._think_void)
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -612,6 +667,10 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if msg.sampling_params.reasoning_budget:
+                if (error := self._track_reasoning(msg)) is not None:
+                    self.send_result([ErrorReplyMsg(uid=msg.uid, error=error)])
+                    return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -624,6 +683,7 @@ class Scheduler(SchedulerIOMixin):
             # in-flight concurrency.
             while len(tombstones) > 65_536:
                 tombstones.pop(next(iter(tombstones)))
+            self._reasoning.pop(msg.uid, None)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if (
@@ -704,6 +764,7 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        self._reasoning.pop(req.uid, None)
         if self.spec is not None:
             self.spec.release(req)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
@@ -912,6 +973,8 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
         # before the widening below, so the penalty check reads each request's real remain_len
         sample_args = self.engine.sampler.prepare(batch)
+        if not batch.is_prefill and self._reasoning:
+            sample_args.forced = self._plan_forced(batch)
         # widened after the window free above, whose threshold reads device_len
         if batch.phase == "verify":
             for req in batch.reqs:
@@ -960,11 +1023,12 @@ class Scheduler(SchedulerIOMixin):
                 f"an image of {hi - lo} tokens does not fit one prefill chunk (--max-extend-tokens {self.prefill_budget}, or the sliding-window pool's share of it): its earlier rows attend within the first part only"
             )
 
-    def _schedule_next_batch(self) -> ForwardInput | None:
+    def _schedule_next_batch(self, hold: Iterable[Req] = ()) -> ForwardInput | None:
+        """``hold``: decoding requests this launch leaves out."""
         # TODO: support other policies: e.g. DECODE first
         batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
+            or self.decode_manager.schedule_next_batch(hold)
         )
         if batch is None:
             return None

@@ -50,6 +50,9 @@ class UserReply(BaseFrontendMsg):
     # the terminal reply of a served request, and on every reply when the request asked
     # for per-token timings; None otherwise.
     timings: dict | None = None
+    # Passthrough of DetokenizeMsg.reasoning: the reasoning token count, and that the budget closed
+    # the thinking span when it did, on the terminal reply of a request with a reasoning budget.
+    reasoning: dict | None = None
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would

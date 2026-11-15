@@ -105,6 +105,24 @@ def test_an_explicit_choice_beats_inference():
     assert pinned.reasoning_parser == "qwen3"
 
 
+def test_a_server_reasoning_budget_needs_a_parser_with_think_tags(capsys):
+    """--reasoning-budget on a family whose thinking is not a tag pair would start a server that fails every chat request."""
+
+    def parsed(architecture, *flags):
+        config = _Config({"architectures": [architecture], "torch_dtype": "bfloat16"})
+        with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+            return parse_args(["--model", ANON_PATH, *flags])[0]
+
+    assert parsed("Qwen3_5MoeForConditionalGeneration", "--reasoning-budget", "2048").reasoning_budget == 2048
+    for architecture, flags in (
+        ("LlamaForCausalLM", ["--reasoning-budget", "2048"]),
+        ("Qwen3_5MoeForConditionalGeneration", ["--reasoning-budget", "2048", "--reasoning-parser", "gpt_oss"]),
+    ):
+        with pytest.raises(SystemExit):
+            parsed(architecture, *flags)
+        assert "needs a reasoning parser with think tags" in capsys.readouterr().err
+
+
 def test_flint_uses_optional_reasoning_and_xml_tool_calls():
     assert _inferred("FlintForCausalLM") == ("glm47", "flint")
     assert _inferred("FlintGGUFForCausalLM") == ("glm47", "flint")

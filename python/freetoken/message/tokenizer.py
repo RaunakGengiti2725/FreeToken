@@ -53,6 +53,8 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # plus every intermediate reply when sampling_params.timings_per_token was set;
     # None on other intermediate replies, errors and aborts.
     timings: dict | None = None
+    # ReasoningTracker.usage() on the terminal reply of a request with a reasoning budget; None otherwise.
+    reasoning: dict | None = None
 
 
 @dataclass
