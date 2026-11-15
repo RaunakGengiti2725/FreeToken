@@ -156,6 +156,25 @@ def test_prefill_hit_d2d_pure_extremes(nhit):
 
 
 @CUDA
+@JIT
+@BATCH_API
+def test_prefill_hit_d2d_resident_layer_stays_on_device():
+    cache, sources = _make_cache()
+    for e in range(E):
+        _seed_resident(cache, sources, layer_id=2, expert_id=e, slot=2 * E + e)
+    # the host rows change after the experts were loaded: a buffer equal to the loaded rows did not cross PCIe
+    loaded = {name: per_layer[2].clone() for name, per_layer in sources.items()}
+    for per_layer in sources.values():
+        per_layer[2].add_(1)
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(2)
+    views = cache.wait_prefill_layer(2)
+    torch.cuda.synchronize()
+    for view, name in zip(views, sources):
+        assert torch.equal(view.cpu(), loaded[name]), name
+
+
+@CUDA
 def test_prefill_hit_d2d_noop_without_spare_slots():
     dev = torch.device("cuda")
     sources = {

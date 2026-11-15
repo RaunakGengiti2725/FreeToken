@@ -603,6 +603,9 @@ class OffloadMoeCache:
         self._gather_feat_bytes: list[torch.Tensor | None] = []
         self._gather_stage_ptrs: list[list[torch.Tensor] | None] = []
         self._gather_pool_ptrs: list[torch.Tensor | None] = []
+        self._gather_all_feat_bytes: list[torch.Tensor | None] = []
+        self._gather_all_stage_ptrs: list[list[torch.Tensor] | None] = []
+        self._gather_all_pool_ptrs: list[torch.Tensor | None] = []
         if not _FUSED_COPY or self.device.type != "cuda" or not self.banks:
             return
         from freetoken.kernel.pinned import device_ptr
@@ -643,18 +646,24 @@ class OffloadMoeCache:
         self._copy_feat_bytes = [ptrs(rows) for rows in self._row_bytes]
         self._copy_dst_ptrs_host = dst_ptrs
         self._copy_src_ptrs_host = layer_src_ptrs
-        # hit-D2D gather serves only the big banks; small banks are whole-layer
-        # H2D entries (see _SMALL_BANK_FEAT_BYTES), so their rows never need D2D.
+        # With a miss in the layer, the hit-D2D gather serves only the big banks; small banks are
+        # whole-layer H2D entries (see _SMALL_BANK_FEAT_BYTES), so their rows need no D2D then.
         # The gather copies cache rows of the layer's pool into its staging buffer, row == expert id.
         self._gather_bank_ids = [[k for k, r in enumerate(rows) if r >= _SMALL_BANK_FEAT_BYTES] for rows in self._row_bytes]
-        for g, ids in enumerate(self._gather_bank_ids):
-            self._gather_feat_bytes.append(ptrs([self._row_bytes[g][k] for k in ids]) if ids else None)
-            self._gather_stage_ptrs.append(
-                [ptrs([dst_ptrs[k] + b * self._stage_bytes[k] for k in ids]) for b in range(2)] if ids else None
-            )
-        for p in range(len(self.pool_sizes)):
-            ids = self._gather_bank_ids[self._pool_layout(p)]
-            self._gather_pool_ptrs.append(ptrs([dst_ptrs[k] + self._pool_offsets[k][p] for k in ids]) if ids else None)
+        # A layer with no miss gathers every bank that has rows: its small banks then stay on the device too.
+        every_bank = [[k for k, r in enumerate(rows) if r] for rows in self._row_bytes]
+        for bank_ids, feat_bytes, stage_ptrs, pool_ptrs in (
+            (self._gather_bank_ids, self._gather_feat_bytes, self._gather_stage_ptrs, self._gather_pool_ptrs),
+            (every_bank, self._gather_all_feat_bytes, self._gather_all_stage_ptrs, self._gather_all_pool_ptrs),
+        ):
+            for g, ids in enumerate(bank_ids):
+                feat_bytes.append(ptrs([self._row_bytes[g][k] for k in ids]) if ids else None)
+                stage_ptrs.append(
+                    [ptrs([dst_ptrs[k] + b * self._stage_bytes[k] for k in ids]) for b in range(2)] if ids else None
+                )
+            for p in range(len(self.pool_sizes)):
+                ids = bank_ids[self._pool_layout(p)]
+                pool_ptrs.append(ptrs([dst_ptrs[k] + self._pool_offsets[k][p] for k in ids]) if ids else None)
         self._copy_blocks_per_bank = default_blocks_per_bank(self.device)
         self._copy_fused_ok = True
 
@@ -991,20 +1000,26 @@ class OffloadMoeCache:
         hit_mask = snap >= self._pool_stable_from[pool]
         self.prefill_hit_rows += int(hit_mask.sum())
         self.prefill_total_rows += E
-        if self._gather_feat_bytes[layout] is not None:
+        miss = np.nonzero(~hit_mask)[0]
+        # With every expert of the layer resident, the gather takes the small banks as well and nothing crosses PCIe.
+        all_resident = miss.size == 0 and self._gather_all_feat_bytes[layout] is not None
+        if all_resident:
+            stage_ptrs, pool_ptrs, feat_bytes = self._gather_all_stage_ptrs, self._gather_all_pool_ptrs, self._gather_all_feat_bytes
+        else:
+            stage_ptrs, pool_ptrs, feat_bytes = self._gather_stage_ptrs, self._gather_pool_ptrs, self._gather_feat_bytes
+        if feat_bytes[layout] is not None:
             prefill_hit_compact(self, layer_id)
             # blocks_per_bank=64 vs the PCIe-tuned default of 8: HBM D2D needs the
             # wider grid (~22 GB/s per 1024-thread block on H100).
             fast_index_copy_multi_jit(
-                self._gather_stage_ptrs[layout][buffer_id],
-                self._gather_pool_ptrs[pool],
-                self._gather_feat_bytes[layout],
+                stage_ptrs[layout][buffer_id],
+                pool_ptrs[pool],
+                feat_bytes[layout],
                 self._prefill_hit_dst,
                 self._prefill_hit_src,
                 self._prefill_hit_num,
                 blocks_per_bank=64,
             )
-        miss = np.nonzero(~hit_mask)[0]
         with torch.cuda.stream(self.prefill_copy_stream):
             if self._prefill_buffer_has_release_event[buffer_id]:
                 self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
@@ -1019,9 +1034,11 @@ class OffloadMoeCache:
                 if feat == 0:
                     continue
                 if feat < _SMALL_BANK_FEAT_BYTES:
-                    # Whole layer as one entry, EVEN with zero misses: it keeps every
-                    # batch entry above the driver's async floor and covers the hit
-                    # rows the gather skips for these banks.
+                    if all_resident:
+                        continue  # gathered on the device with the big banks
+                    # Whole layer as one entry whenever the layer has a miss: it keeps
+                    # every batch entry above the driver's async floor and covers the
+                    # hit rows the gather skips for these banks.
                     dst.append(stage)
                     src.append(self._copy_src_ptrs_host[layer_id][b])
                     nbytes.append(E * feat)
