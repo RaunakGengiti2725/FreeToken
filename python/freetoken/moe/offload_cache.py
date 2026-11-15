@@ -344,6 +344,11 @@ class OffloadMoeCache:
         self._prefill_slot_snapshot: torch.Tensor | None = None
         self._prefill_snapshot_np = None
         self._prefill_hit_d2d_active = False
+        # A chunk with fewer routes than a layer has experts cannot route to all of them: its hit gather waits
+        # for the layer's routes (wait_prefill_layer) and copies only the routed residents.
+        # _prefill_gather_pending[b]: whether buffer b's waiting gather takes every bank.
+        self._prefill_gather_routed = False
+        self._prefill_gather_pending: list[bool | None] = [None, None]
         self._hit_d2d_fallback_logged = False
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
@@ -869,7 +874,8 @@ class OffloadMoeCache:
         for tail in self._stage_tails[self.layer_layout[layer_id]][buffer_id]:
             tail.zero_()
 
-    def begin_prefill(self) -> None:
+    def begin_prefill(self, num_routes: int | None = None) -> None:
+        """Start a prefill chunk; ``num_routes`` is its tokens times the routes of each."""
         if not self.prefill_overlap:
             return
         self._prefill_buffer_layer = [None, None]
@@ -884,6 +890,10 @@ class OffloadMoeCache:
             self.prefill_begin_event.record(torch.cuda.current_stream(self.device))
             self.prefill_copy_stream.wait_event(self.prefill_begin_event)
         self._prefill_hit_d2d_active = self.prefill_hit_d2d and self._hit_d2d_usable()
+        self._prefill_gather_routed = (
+            self._prefill_hit_d2d_active and num_routes is not None and num_routes < self.num_experts
+        )
+        self._prefill_gather_pending = [None, None]
         if self._prefill_hit_d2d_active:
             # The copy stream is fenced behind the previous decode, so the snapshot
             # observes its final slot map; one host sync per chunk, then per-layer
@@ -990,9 +1000,6 @@ class OffloadMoeCache:
         """
         import numpy as np
 
-        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
-        from freetoken.moe.offload_kernels import prefill_hit_compact
-
         E = self.num_experts
         layout = self.layer_layout[layer_id]
         pool = self.pool_of_layer[layer_id]
@@ -1003,23 +1010,10 @@ class OffloadMoeCache:
         miss = np.nonzero(~hit_mask)[0]
         # With every expert of the layer resident, the gather takes the small banks as well and nothing crosses PCIe.
         all_resident = miss.size == 0 and self._gather_all_feat_bytes[layout] is not None
-        if all_resident:
-            stage_ptrs, pool_ptrs, feat_bytes = self._gather_all_stage_ptrs, self._gather_all_pool_ptrs, self._gather_all_feat_bytes
+        if self._prefill_gather_routed:
+            self._prefill_gather_pending[buffer_id] = all_resident
         else:
-            stage_ptrs, pool_ptrs, feat_bytes = self._gather_stage_ptrs, self._gather_pool_ptrs, self._gather_feat_bytes
-        if feat_bytes[layout] is not None:
-            prefill_hit_compact(self, layer_id)
-            # blocks_per_bank=64 vs the PCIe-tuned default of 8: HBM D2D needs the
-            # wider grid (~22 GB/s per 1024-thread block on H100).
-            fast_index_copy_multi_jit(
-                stage_ptrs[layout][buffer_id],
-                pool_ptrs[pool],
-                feat_bytes[layout],
-                self._prefill_hit_dst,
-                self._prefill_hit_src,
-                self._prefill_hit_num,
-                blocks_per_bank=64,
-            )
+            self._gather_prefill_hits(layer_id, buffer_id, all_resident)
         with torch.cuda.stream(self.prefill_copy_stream):
             if self._prefill_buffer_has_release_event[buffer_id]:
                 self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
@@ -1055,16 +1049,55 @@ class OffloadMoeCache:
                 )
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
-    def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+    def _gather_prefill_hits(
+        self, layer_id: int, buffer_id: int, all_banks: bool, routed_ids: torch.Tensor | None = None
+    ) -> None:
+        """Copy ``layer_id``'s resident experts cache -> staging buffer on the current stream: every bank
+        with rows when ``all_banks``, else the large ones; only the experts in ``routed_ids`` when given."""
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+        from freetoken.moe.offload_kernels import prefill_hit_compact
+
+        layout = self.layer_layout[layer_id]
+        if all_banks:
+            stage_ptrs, pool_ptrs, feat_bytes = self._gather_all_stage_ptrs, self._gather_all_pool_ptrs, self._gather_all_feat_bytes
+        else:
+            stage_ptrs, pool_ptrs, feat_bytes = self._gather_stage_ptrs, self._gather_pool_ptrs, self._gather_feat_bytes
+        if feat_bytes[layout] is None:
+            return
+        routed = None
+        if routed_ids is not None:
+            routed = torch.zeros(self.num_experts, dtype=torch.bool, device=self.device)
+            routed.index_fill_(0, routed_ids.reshape(-1).long(), True)
+        prefill_hit_compact(self, layer_id, routed)
+        # blocks_per_bank=64 vs the PCIe-tuned default of 8: HBM D2D needs the
+        # wider grid (~22 GB/s per 1024-thread block on H100).
+        fast_index_copy_multi_jit(
+            stage_ptrs[layout][buffer_id],
+            pool_ptrs[self.pool_of_layer[layer_id]],
+            feat_bytes[layout],
+            self._prefill_hit_dst,
+            self._prefill_hit_src,
+            self._prefill_hit_num,
+            blocks_per_bank=64,
+        )
+
+    def wait_prefill_layer(self, layer_id: int, routed_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
         """Full-layer ``[num_experts, ...]`` bank views for ``layer_id``, one per
         registered bank in registration order: bf16 ``(gate_up, down)``; nvfp4
         marlin/b12x ``(gate_up_packed, gate_up_scale, down_packed, down_scale)``;
-        nvfp4 native adds the two global banks after each scale bank."""
+        nvfp4 native adds the two global banks after each scale bank.
+
+        ``routed_ids`` are the expert ids the chunk routes to in this layer. When the chunk's hit gather
+        waited for them (see ``begin_prefill``), the rows of resident experts outside them are not
+        filled: the caller's GEMMs read only routed rows."""
         assert self.prefill_overlap
         assert self._stage_views
         self.prefetch_prefill_layer(layer_id)
         buffer_id = layer_id % 2
         assert self._prefill_buffer_layer[buffer_id] == layer_id
+        if self._prefill_gather_pending[buffer_id] is not None:
+            self._gather_prefill_hits(layer_id, buffer_id, self._prefill_gather_pending[buffer_id], routed_ids)
+            self._prefill_gather_pending[buffer_id] = None
         if self.prefill_ready_events:
             torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
         return self.stage_views(layer_id, buffer_id)

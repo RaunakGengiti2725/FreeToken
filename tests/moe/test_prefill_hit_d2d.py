@@ -175,6 +175,24 @@ def test_prefill_hit_d2d_resident_layer_stays_on_device():
 
 
 @CUDA
+@JIT
+@BATCH_API
+def test_prefill_hit_d2d_short_chunk_gathers_routed_experts_only():
+    cache, sources = _make_cache()
+    for e in range(E):
+        _seed_resident(cache, sources, layer_id=2, expert_id=e, slot=2 * E + e)
+    routed = torch.tensor([[1, 3]], device="cuda")
+    cache.begin_prefill(num_routes=routed.numel())
+    cache.prefetch_prefill_layer(2)
+    views = cache.wait_prefill_layer(2, routed)
+    torch.cuda.synchronize()
+    for view, (name, per_layer) in zip(views, sources.items()):
+        assert torch.equal(view[[1, 3]].cpu(), per_layer[2][[1, 3]]), name
+        # a resident expert outside the routes is not copied
+        assert not torch.equal(view[0].cpu(), per_layer[2][0]), name
+
+
+@CUDA
 def test_prefill_hit_d2d_noop_without_spare_slots():
     dev = torch.device("cuda")
     sources = {
