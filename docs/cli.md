@@ -250,8 +250,10 @@ to split each layer's misses.
 - One profile per GPU, at `~/.cache/freetoken/benchbw/<gpu-uuid>.json`; a profile from other
   hardware or another profile version is ignored.
 - A row's key is the layer's CPU format and options, expert shape, top_k and CPU worker
-  threads; a layer without an exact row keeps a fetch cap of 1. Bench with the same
-  `--cpu-threads` as the server's `--moe-cpu-threads`.
+  threads. A layer without an exact row takes the nearest row of the same format and top_k
+  whose expert size is within 2x and whose thread count is within 25%, and the server logs
+  which; without one it keeps a fetch cap of 1. Bench with the same `--cpu-threads` as the
+  server's `--moe-cpu-threads`.
 - Each run replaces the rows it benched and keeps the others.
 - What to measure: `--model` (checkpoint paths or presets), `--dtype`, `--formats`, `--isa`.
 - `--threshold` (default 2.0) sets each row's `recommended`: hybrid when CPU bandwidth beats
