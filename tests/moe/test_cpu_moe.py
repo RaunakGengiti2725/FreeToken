@@ -17,6 +17,8 @@ import pytest
 import torch
 import torch.nn.functional as Fn
 
+from .test_cpu_moe_fp8_block import _make_fp8_block_cache
+
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
@@ -450,6 +452,98 @@ def test_cpu_decode_dsfp4_matches_gpu(bs):
 
     rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)
     assert rel < 4e-2, f"ds_fp4 bs={bs} rel err {rel.item()}"
+
+
+_GGUF_TYPES = {"gate_up_type": 2, "down_type": 8}  # ggml Q4_0 and Q8_0
+
+
+def _make_gguf_cache(L, E, H, I, seed=0):
+    """GGUF banks as gguf-py packs them: Q4_0 gate_up rows and Q8_0 down rows, so the two passes run different ggml dot products."""
+    import numpy as np
+
+    from freetoken.kernel import ggml_cpu
+    from freetoken.third_party.gguf import GGMLQuantizationType, quants
+
+    if ggml_cpu.select() is None:
+        pytest.skip("this build has no ggml-cpu kernels")
+    rng = np.random.default_rng(seed)
+
+    def rows(OUT, IN, ggml_type):
+        values = rng.normal(0, 0.1, (L * E, OUT, IN)).astype(np.float32)
+        return list(torch.from_numpy(quants.quantize(values, GGMLQuantizationType(ggml_type))).split(E))
+
+    return SimpleNamespace(
+        quant_format="gguf",
+        bank_sources={"gate_up": rows(2 * I, H, _GGUF_TYPES["gate_up_type"]), "down": rows(H, I, _GGUF_TYPES["down_type"])},
+        num_layers=L,
+        num_experts=E,
+        decode_target="cpu",
+        cpu_executor=None,
+    )
+
+
+_GROUPED_FORMATS = {
+    "bf16": (_make_cache, {"activation": "silu"}),
+    "bf16-weight-on-input": (_make_cache, {"activation": "silu", "apply_router_weight_on_input": True}),
+    "nvfp4": (_make_nvfp4_cache, {"activation": "silu"}),
+    "mxfp4": (_make_mxfp4_cache, {"activation": "gpt_oss_swiglu", "swiglu_alpha": 1.702, "swiglu_limit": 7.0}),
+    "ds_fp4": (_make_dsfp4_cache, {"activation": "silu", "swiglu_limit": 7.0, "layer_formats": [("ds_fp4", {"act_block": 128})] * 2}),
+    "fp8_block": (_make_fp8_block_cache, {"activation": "silu"}),
+    "gguf": (_make_gguf_cache, {"activation": "silu", "layer_formats": [("gguf", _GGUF_TYPES)] * 2}),
+}
+
+
+@pytest.mark.parametrize("fmt", list(_GROUPED_FORMATS))
+def test_cpu_moe_rows_sharing_experts_match_single_rows(fmt):
+    """A step whose rows share experts runs grouped by expert; each of its rows equals that row run alone, bit for bit.
+
+    Goes red if the grouped passes hand a route another route's partial, sum a row's routes in another order,
+    drop the per-route rounding, or leave a row without a CPU route stale.
+    """
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    make_cache, kwargs = _GROUPED_FORMATS[fmt]
+    L, E, H, I, top_k, max_bs = 2, 64, 256, 256, 4, 16
+    cache = make_cache(L, E, H, I)
+    kwargs = {"apply_router_weight_on_input": False, **kwargs}
+    ex = CpuMoeExecutor(cache, top_k=top_k, num_threads=4, max_tokens=max_bs, device=torch.device("cuda"), **kwargs)
+    io = ex._io
+
+    def run(x, ids, w):
+        bs = x.shape[0]
+        io["x"][:bs].copy_(x)
+        io["ids"][:bs].copy_(ids)
+        io["w"][:bs].copy_(w)
+        io["y"].fill_(float("nan"))
+        ex._ext.run(1, bs)
+        return io["y"][:bs].clone()
+
+    gen = torch.Generator().manual_seed(55)
+    for bs in (2, 4, 8, 16):
+        t = torch.arange(bs).unsqueeze(1)
+        k = torch.arange(top_k).unsqueeze(0)
+        routings = {
+            # every row names experts 5, 12, 19, 26, each row in another k order
+            "same": torch.tensor([5, 12, 19, 26])[(k + t) % top_k],
+            # k = 0 and 2 name experts 3 and 40 in every row, k = 1 and 3 experts no other row names
+            "some": torch.where(k % 2 == 0, torch.tensor([3, 0, 40, 0])[k].expand(bs, top_k), 8 + 2 * t + k // 2),
+            # no shared expert: the step after a grouped one falls back to one item per route
+            "none": torch.randperm(E, generator=gen)[: bs * top_k].view(bs, top_k),
+        }
+        for name, ids in routings.items():
+            x = torch.randn(bs, H, generator=gen).to(torch.bfloat16)
+            w = torch.rand(bs, top_k, generator=gen)
+            gpu = torch.rand(bs, top_k, generator=gen) < 0.3  # routes the GPU keeps
+            gpu[bs // 2] = True  # a row with no CPU route
+            for label, step_ids in ((name, ids), (f"{name} with gpu routes", ids.masked_fill(gpu, -1))):
+                label = f"bs={bs} {label}"
+                step_ids = step_ids.to(torch.int32)
+                batch = run(x, step_ids, w)
+                alone = torch.cat([run(x[i : i + 1], step_ids[i : i + 1], w[i : i + 1]) for i in range(bs)])
+                assert torch.isfinite(batch.float()).all(), label
+                assert torch.equal(batch.float().ne(0).any(dim=1), (step_ids >= 0).any(dim=1)), label
+                # the bit patterns, so that -0.0 and 0.0 differ
+                assert torch.equal(batch.view(torch.int16), alone.view(torch.int16)), label
 
 
 # --------------------------------------------------------------------------------
