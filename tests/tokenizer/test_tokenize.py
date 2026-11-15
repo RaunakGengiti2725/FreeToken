@@ -833,3 +833,96 @@ def encode_messages(messages, thinking_mode, reasoning_effort=None):
     )
     assert manager.render_prompt(msg) == f"Reasoning Effort: {budget}"
     assert msg.chat_template_kwargs["reasoning_effort"] == budget
+
+
+def _chat_tokenizer():
+    """A small byte-level BPE tokenizer with ChatML tokens and a bos, on the real tokenizers pipeline."""
+    from tokenizers import AddedToken, Tokenizer, models, normalizers, pre_tokenizers, processors, trainers
+    from transformers import PreTrainedTokenizerFast
+
+    tok = Tokenizer(models.BPE())
+    tok.normalizer = normalizers.NFC()
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    corpus = ["the prefix cache keeps the token ids", "prefill prefix café cafè au lait", "hello world, hello tokens"] * 4
+    trainer = trainers.BpeTrainer(vocab_size=320, initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), show_progress=False)
+    tok.train_from_iterator(corpus, trainer)
+    tok.add_special_tokens(["<s>", "<|im_start|>", "<|im_end|>"])
+    # "<b>" lies inside "x<b>y", so a longer match can take its place
+    tok.add_tokens([AddedToken(text, normalized=False) for text in ("<think>", "</think>", "<b>", "x<b>y")])
+    tok.post_processor = processors.TemplateProcessing(single="<s> $A", special_tokens=[("<s>", tok.token_to_id("<s>"))])
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=tok)
+    tokenizer.chat_template = (
+        "{% for m in messages %}<|im_start|>{{ m['role'] }}\n{{ m['content'] }}<|im_end|>\n{% endfor %}"
+        "<|im_start|>assistant\n<think>\n"
+    )
+    return tokenizer
+
+
+@pytest.fixture(scope="module", params=["built", pytest.param("FREETOKEN_INLINE_QWEN_MODEL", marks=pytest.mark.needs_weights)])
+def chat_tokenizer(request):
+    if request.param == "built":
+        return _chat_tokenizer()
+    from transformers import AutoTokenizer
+
+    path = os.environ.get(request.param)
+    if not path:
+        pytest.skip(f"set {request.param} to a local checkpoint")
+    return AutoTokenizer.from_pretrained(path, local_files_only=True)
+
+
+_CHAT = "<|im_start|>system\nthe prefix cache<|im_end|>\n<|im_start|>user\n"
+_SYSTEM = _CHAT[: _CHAT.rindex("<|im_start|>")]
+_TURN = _CHAT + "hello world<|im_end|>\n<|im_start|>assistant\n"
+# name: (cached prompt, new prompt, the start of the new prompt whose ids the cache may reuse)
+_PREFIX_CASES = {
+    "next turn": (
+        _TURN + "<think>\n",
+        _TURN + "<think>\n\n</think>\n\nhello tokens<|im_end|>\n<|im_start|>user\nprefill<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        _TURN,
+    ),
+    "same prompt again": (_TURN + "<think>\n", _TURN + "<think>\n", _TURN),
+    "mid-word": (_CHAT + "prefill the cache<|im_end|>\n", _CHAT + "prefix the cache<|im_end|>\n", _SYSTEM),
+    "before a combining mark": (_CHAT + "cafe", _CHAT + "café au lait", _SYSTEM),
+    "inside a multi-byte character": (_CHAT + "café", _CHAT + "cafè", _SYSTEM),
+    "at a special token": (_CHAT + "hello<|im_end|>\n", _CHAT + "hello world<|im_end|>\n", _SYSTEM),
+    "inside a special token": (_CHAT + "hello<|im_end|>\n<|im_start|>assistant\n", _CHAT + "hello<|im_end|>\n<|im_end|>", _CHAT + "hello"),
+    "a token inside a longer one": (_CHAT + "wx<b>", _CHAT + "wx<b>y z", _SYSTEM),
+    "nothing shared but the first token": (_CHAT + "hello", "<|im_start|>user\nhello", ""),
+}
+
+
+@pytest.mark.parametrize("case", _PREFIX_CASES)
+def test_prefix_cache_ids_equal_a_full_encode_wherever_the_prompts_part(chat_tokenizer, case):
+    from freetoken.tokenizer.prefix_cache import TokenPrefixCache
+
+    cached, new, reusable = _PREFIX_CASES[case]
+
+    def full(text):
+        return chat_tokenizer.encode(text, add_special_tokens=False)
+
+    cache = TokenPrefixCache(chat_tokenizer, entries=2)
+    assert cache.encode(cached).tolist() == full(cached)
+    cache.encode("<|im_start|>user\nanother conversation<|im_end|>\n")
+    ids = cache.encode(new)
+    assert ids.dtype == torch.int32 and ids.tolist() == full(new)
+    assert cache.reused_tokens == len(full(reusable))
+    assert len(cache.prompts) == 2
+
+
+def test_tokenize_manager_takes_the_prefix_cache_for_templated_prompts_only():
+    tokenizer = _chat_tokenizer()
+    manager = TokenizeManager(tokenizer)
+
+    def tokenize(uid, text):
+        msg = TokenizeMsg(uid=uid, text=text, sampling_params=SamplingParams())
+        return msg, manager.tokenize([msg])[0].input_ids
+
+    messages = [{"role": "user", "content": "hello world"}]
+    for turn in range(3):
+        msg, ids = tokenize(turn, list(messages))
+        assert ids.dtype == torch.int32 and ids.tolist() == tokenizer.encode(manager.render_prompt(msg), add_special_tokens=False)
+        messages += [{"role": "assistant", "content": "hello tokens"}, {"role": "user", "content": "prefill the cache"}]
+    assert manager._prefix_cache.reused_tokens > 0
+    # a raw prompt takes its bos from the tokenizer, which a prompt cut in two would get twice or not at all
+    for _ in range(2):
+        assert tokenize(9, "hello world")[1].tolist() == tokenizer.encode("hello world")
