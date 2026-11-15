@@ -46,6 +46,7 @@ class FLAMetadata:
     track_dst: torch.Tensor | None = None        # [nt] int64 dst pool slot per tracked req
     track_src: torch.Tensor | None = None        # [nt] int64 live slot of each tracked req, for states copied whole at the boundary
     track_h_row: torch.Tensor | None = None      # [nt] int64 row into h (boh_i + aligned//CHUNK)
+    track_seq: torch.Tensor | None = None        # [nt] int64 index in this forward of each tracked req; its boundary opens the req's last chunk
     track_conv_src: torch.Tensor | None = None   # [nt, kernel-1] int64 conv-input token positions
     track_boundary_row: torch.Tensor | None = None  # [nt] int64 forward-local row of the track boundary; states with their own left context (qwen4_exp PLE) derive their windows from it
 
@@ -105,7 +106,7 @@ def _build_track_metadata(reqs, cu_host, device, pin, km1: int):
     prefill forward, snapshot its GDN state at the deepest mid-chunk boundary into its current
     ping-pong slot. Returns the ``FLAMetadata`` track kwargs, all None when no request
     tracks (non-hybrid, or all extends < CHUNK+1)."""
-    empty = dict(track_dst=None, track_src=None, track_h_row=None, track_conv_src=None, track_boundary_row=None)
+    empty = dict(track_dst=None, track_src=None, track_h_row=None, track_seq=None, track_conv_src=None, track_boundary_row=None)
     if not any(r.mamba_ping_pong is not None for r in reqs):
         return empty
     from freetoken.kernel.fla.chunk import CHUNK_SIZE
@@ -116,7 +117,7 @@ def _build_track_metadata(reqs, cu_host, device, pin, km1: int):
         "would reach before this forward's first token"
     )
     boh = prepare_chunk_offsets(cu_host, CHUNK_SIZE).tolist()
-    dst, src, h_row, conv_src, boundary_rows = [], [], [], [], []
+    dst, src, h_row, seq, conv_src, boundary_rows = [], [], [], [], [], []
     for i, r in enumerate(reqs):
         if r.mamba_ping_pong is None:
             continue
@@ -130,6 +131,9 @@ def _build_track_metadata(reqs, cu_host, device, pin, km1: int):
         dst.append(r.mamba_ping_pong[r.mamba_next_track_idx])
         src.append(gdn_slot(r))
         h_row.append(boh[i] + c)
+        # chunks are cut from this forward's first token, not from position 0, so chunk c is the request's last one
+        # whatever cached_len is: the state the chunk kernel keeps for request i is the one at this boundary
+        seq.append(i)
         conv_src.append([off + c * CHUNK_SIZE - km1 + j for j in range(km1)])
         boundary_rows.append(off + c * CHUNK_SIZE)
         r.mamba_last_track_seqlen = boundary
@@ -141,6 +145,7 @@ def _build_track_metadata(reqs, cu_host, device, pin, km1: int):
         track_dst=to(dst, dtype=torch.int64),
         track_src=to(src, dtype=torch.int64),
         track_h_row=to(h_row, dtype=torch.int64),
+        track_seq=to(seq, dtype=torch.int64),
         track_conv_src=to(conv_src, dtype=torch.int64),
         track_boundary_row=to(boundary_rows, dtype=torch.int64),
     )

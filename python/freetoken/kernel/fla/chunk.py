@@ -39,6 +39,7 @@ def chunk_gated_delta_rule_fwd(
     initial_state_indices: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
+    track_state: Optional[torch.Tensor] = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -63,6 +64,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        track_state=track_state,
     )
     o = chunk_fwd_o(
         q=q,
@@ -96,6 +98,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         initial_state_indices: torch.Tensor,
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
+        track_state: Optional[torch.Tensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -120,6 +123,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state_indices=initial_state_indices,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            track_state=track_state,
         )
         return o.to(q.dtype), h
 
@@ -137,6 +141,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    track_state: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -165,6 +170,9 @@ def chunk_gated_delta_rule(
         head_first (Optional[bool]):
             Whether the inputs are in the head-first format, which is not supported for variable-length inputs.
             Default: `False`.
+        track_state (Optional[torch.Tensor]):
+            Output of shape `[N, H, V, K]`, filled with each sequence's state entering its last chunk
+            in its own dtype (the per-chunk `h` holds it in the input dtype). Default: `None`.
 
     Returns:
         o (torch.Tensor):
@@ -251,6 +259,7 @@ def chunk_gated_delta_rule(
         initial_state_indices,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        track_state,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
