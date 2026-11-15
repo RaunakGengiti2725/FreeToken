@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import request_ring
-from freetoken.core import SamplingParams
+from freetoken.core import DEFAULT_MAX_OUTPUT_TOKENS, SamplingParams
 from freetoken.message import TokenizeMsg
 from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
@@ -235,12 +235,6 @@ class GenSpec:
 # --------------------------------------------------------------------------- #
 # Wire-neutral builders (shared by every protocol's request->GenSpec converter).
 # --------------------------------------------------------------------------- #
-# Default max output (decode) tokens when a request omits one. Overridable per server via
-# --max-output-tokens (the Responses adapter passes that through); clamped to the remaining
-# context by the scheduler regardless.
-DEFAULT_MAX_OUTPUT_TOKENS = 32768
-
-
 def resolve_sampling(
     *,
     temperature: float | None,

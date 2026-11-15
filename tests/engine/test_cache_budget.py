@@ -9,7 +9,8 @@ import json
 import os
 
 from freetoken.engine.cache_budget import (
-    budget_advice, expert_bytes_per_slot, plan_cache_budget, plan_changes, plan_kv_target, resolve_moe_cache_auto,
+    budget_advice, expert_bytes_per_slot, kv_capacity_warning, plan_cache_budget, plan_changes, plan_kv_target,
+    resolve_moe_cache_auto,
 )
 from freetoken.engine.engine import _pin_budget_bytes
 
@@ -249,6 +250,25 @@ def test_resolve_auto_caps_slots_at_the_kernel_limit():
         kv_reserve_tokens=0, page_size=1, max_slots=992,
     )
     assert size == 992
+
+
+def test_kv_capacity_warning_prices_the_floor_it_names():
+    # budget 1000 B, 50 B a slot, 10 B a one-token page: 30 more KV tokens are 300 B, 6 slots.
+    terms = dict(
+        baseline_free=1000, weights_bytes=0, memory_ratio=1.0,
+        cache_per_page=10, fixed_cache_size=0, per_expert_bytes=50,
+        num_experts=4, total_experts=40, prefill_overlap=False,
+        kv_reserve_tokens=8, page_size=1,
+    )
+    slots, kv_tokens, _ = resolve_moe_cache_auto(**terms)
+    assert (slots, kv_tokens) == (18, 10)
+    assert "--kv-reserve-tokens 40 costs 6 of the 18 expert" in kv_capacity_warning(kv_tokens, 40, slots, terms)
+
+    # a server started with the flag the warning names has exactly that many fewer slots, and no warning
+    at_floor = {**terms, "kv_reserve_tokens": 40}
+    floor_slots, floor_tokens, _ = resolve_moe_cache_auto(**at_floor)
+    assert floor_slots == slots - 6
+    assert kv_capacity_warning(floor_tokens, 40, floor_slots, at_floor) is None
 
 
 def _dsv4_adjust_cfg(**over):

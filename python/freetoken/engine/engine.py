@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.attention.linear import ChunkCaptureLinearBackend, LinearAttnBackend, WideVerifyLinearBackend, gdn_slot
-from freetoken.core import Batch, Context, Req, set_global_ctx
+from freetoken.core import DEFAULT_MAX_OUTPUT_TOKENS, Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
@@ -1152,7 +1152,7 @@ class Engine:
         if probe:
             cpu_layer_ids = probed
             decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=True)
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
+        from freetoken.engine.cache_budget import expert_bytes_per_slot, kv_capacity_warning, layer_slot_bytes
 
         self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
         # hybrid: locked layers keep GPU slots of their own pools and fetch part of their misses through the pinned staging (moe/locked_fetch.py)
@@ -1198,6 +1198,15 @@ class Engine:
                 # slack) and goes negative whenever the expert fill is exact --
                 # a greedy fill leaves no headroom for the measurement delta.
                 object.__setattr__(config, "num_page_override", pages)
+                warning = kv_capacity_warning(
+                    pages * config.page_size,
+                    # a request is capped at the model's context too, so a pool that holds it is enough
+                    min(getattr(config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS, config.max_seq_len),
+                    size,
+                    self._auto_cache_terms(config, banks, method, size_cap),
+                )
+                if warning:
+                    logger.warning_rank0(warning)
             logger.info_rank0(
                 f"--moe-cache-auto resolved moe_cache_size={size} "
                 f"num_pages={pages} (prefill_overlap={overlap})"

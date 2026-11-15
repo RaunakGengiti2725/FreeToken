@@ -274,3 +274,34 @@ def budget_advice(stages: list[tuple[str, dict]], min_reserve_tokens: int) -> st
         if plan is not None:
             return f"fits with {flags}: {plan[0]} expert slots, {plan[1] * page} KV tokens (the longest prompt + output)"
     return f"no fit{' even with ' + flags if flags else ''}: the minimum plan is still {short} B ({mem_GB(short)}) short"
+
+
+def kv_capacity_warning(kv_tokens: int, max_tokens: int, slots: int, terms: dict) -> str | None:
+    """Startup warning for a --moe-cache-auto plan whose KV pool holds fewer than ``max_tokens``
+    tokens, the most a request generates when it sets no max_tokens; None when it holds that many.
+
+    ``terms`` are the resolve_moe_cache_auto arguments the plan (``slots`` expert slots) came from,
+    with prefill_overlap as the plan resolved it. The cost named is that plan with a KV floor of
+    ``max_tokens``.
+    """
+    if kv_tokens >= max_tokens:
+        return None
+    budget = net_cache_budget_bytes(
+        terms["memory_ratio"], terms["baseline_free"], terms["weights_bytes"], terms["fixed_cache_size"]
+    )
+    # plan_cache_budget refuses a floor the budget cannot hold beside its smallest expert cache
+    min_slots = terms["num_experts"] * (2 if terms["prefill_overlap"] else 1)
+    floor_pages = div_ceil(max_tokens, terms["page_size"])
+    if required_bytes(min_slots, floor_pages, terms["per_expert_bytes"], terms["cache_per_page"]) > budget:
+        cost = f"does not fit beside the {min_slots} expert cache slots this plan needs"
+    else:
+        at_floor = resolve_moe_cache_auto(**{**terms, "kv_reserve_tokens": max_tokens})[0]
+        cost = (
+            f"costs {slots - at_floor} of the {slots} expert cache slots and covers prompt plus output up to "
+            f"{max_tokens} tokens; add the prompt length to keep a full-length output"
+        )
+    return (
+        f"KV cache holds {kv_tokens} tokens, fewer than the {max_tokens} a request gets when it sets no "
+        f"max_tokens; prompt and output share the pool, so longer requests end early with finish_reason "
+        f'"length". --kv-reserve-tokens {max_tokens} {cost}'
+    )

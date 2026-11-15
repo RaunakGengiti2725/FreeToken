@@ -13,6 +13,11 @@ if TYPE_CHECKING:
     from freetoken.kvcache.linear_state_pool import LinearStatePool
     from freetoken.models.blocks import FeatureSink
 
+# Default max output (decode) tokens when a request omits one. Overridable per server via
+# --max-output-tokens (the Responses adapter passes that through); clamped to the remaining
+# context by the scheduler regardless.
+DEFAULT_MAX_OUTPUT_TOKENS = 32768
+
 
 @dataclass
 class SamplingParams:
