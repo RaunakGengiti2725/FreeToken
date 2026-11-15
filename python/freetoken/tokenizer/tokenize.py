@@ -24,6 +24,7 @@ from .effort import (
     quantize_effort,
 )
 from .inline_system import has_inline_system, normalize_inline_system, probe_inline_system
+from .prefix_cache import TokenPrefixCache
 
 logger = init_logger(__name__)
 
@@ -50,11 +51,15 @@ def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: An
 
 _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
+# Rendered chat prompts whose token ids a TokenizeManager keeps. A turn replaces the prompt it extends, so one serves a whole conversation.
+_PREFIX_CACHE_PROMPTS = 4
+
 
 class TokenizeManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase, mm_processor: MMProcessor | None = None) -> None:
         self.tokenizer = tokenizer
         self.mm_processor = mm_processor  # None: the model takes no images
+        self._prefix_cache = TokenPrefixCache(tokenizer, _PREFIX_CACHE_PROMPTS)
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
         self._effort_profile: EffortProfile | None = None
         self._thinking_profile: ThinkingProfile | None = None
@@ -74,10 +79,11 @@ class TokenizeManager:
             # the template already rendered one. Raw-string prompts and the dsv4
             # encoder path keep the default.
             templated = isinstance(msg.text, list) and self._dsv4_encoder is None
+            # Only a templated prompt takes the prefix cache: a raw one gets its bos from the tokenizer, which a cut would repeat.
             input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(
-                    prompt, return_tensors="pt", add_special_tokens=not templated
-                )
+                self._prefix_cache.encode(prompt)
+                if templated
+                else self.tokenizer.encode(prompt, return_tensors="pt", add_special_tokens=True)
             )
             input_ids = input_ids.view(-1).to(torch.int32)
             if msg.images:
