@@ -21,8 +21,8 @@ namespace freetoken::cpu_moe {
 // thrashes the spin-barrier. Deferred (not worth it here / for this workload):
 //   - AMX-bf16: a GEMM tile engine; decode is M=1 GEMV so tiles sit idle. It would
 //     only pay off in a grouped/batched (dedup) path.
-//   - expert dedup for bs>1: read each distinct expert once and GEMM its tokens.
-//     Helps locality+bytes when bs is large; decode batches here are tiny (<=4).
+//   - a GEMM over the tokens that share an expert: the grouped passes read the
+//     expert once per step but still run one GEMV per token.
 //   - NUMA: a single node is assumed. Multi-socket machines would split each
 //     expert's K dimension per node (banks are already per-row contiguous).
 constexpr int kRowBlock = 32;
@@ -120,6 +120,7 @@ class MoeFormat {
                        bf16_t* g) const = 0;
   // Pass 2: out[j * kRowBlock + h - h0] for h in [h0, h1) (at most kRowBlock rows) and each of the n routes, before the router weight.
   // Visiting the routes' rows h together keeps n weight streams in flight, which the down GEMV needs to reach DRAM bandwidth.
+  // The routes may belong to several tokens, so n is not bounded by top_k; route j's output depends on routes[j] alone.
   virtual void down(int layer, int h0, int h1, const DownRoute* routes, int n, float* out) const = 0;
   // Round each router-weighted down output to bf16 before the sum over routes.
   virtual bool rounds_routes() const { return false; }

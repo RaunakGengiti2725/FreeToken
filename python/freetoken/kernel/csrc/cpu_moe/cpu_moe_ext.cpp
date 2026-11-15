@@ -135,6 +135,12 @@ struct CpuMoeExecutor {
   // Hybrid hands the CPU a few routes of a step: only these get work items, since a claim that finds nothing still costs a contended atomic.
   std::vector<int64_t> active_routes;  // intermediate rows tok * top_k + k whose route names an expert
   std::vector<int> active_tokens;      // tokens with at least one such route
+  // When rows of a step share an expert, the work is grouped by expert, so the later routes to it find its weight rows in cache.
+  bool grouped = false;                // the current task runs the grouped passes
+  std::vector<DownRoute> exp_routes;   // the active routes ordered by (expert, route)
+  std::vector<int64_t> exp_begin;      // where each distinct expert's routes start in exp_routes, then the end
+  std::vector<int64_t> route_slot;     // [max_tokens * top_k] a route's place in exp_routes, -1 without an expert
+  size_t part_floats = 0;              // a worker's pass 2 partials: kRowBlock per route of the largest task
   std::atomic<int> done_count{0};
   std::atomic<int> bar_count{0};
   std::atomic<int> bar_sense{0};
@@ -179,6 +185,11 @@ struct CpuMoeExecutor {
     g_scratch.assign(static_cast<size_t>(params.max_tokens) * params.top_k * params.I, 0);
     active_routes.reserve(static_cast<size_t>(params.max_tokens) * params.top_k);
     active_tokens.reserve(params.max_tokens);
+    const size_t max_routes = static_cast<size_t>(params.max_tokens) * params.top_k;
+    exp_routes.reserve(max_routes);
+    exp_begin.reserve(max_routes + 1);
+    route_slot.assign(max_routes, int64_t{-1});
+    part_floats = max_routes * kRowBlock;
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
   }
@@ -283,12 +294,93 @@ struct CpuMoeExecutor {
     }
   }
 
+  // Order the task's active routes by expert, ties in route order, and record each distinct expert's span.
+  // False when no two routes share an expert: the per-route passes already read each expert once.
+  bool group_by_expert(int num_tokens) {
+    exp_routes.clear();
+    for (const int64_t r : active_routes)
+      exp_routes.push_back({io_ids[r], r, g_scratch.data() + static_cast<size_t>(r) * params.I});
+    std::sort(exp_routes.begin(), exp_routes.end(),
+              [](const DownRoute& a, const DownRoute& b) { return a.e != b.e ? a.e < b.e : a.r < b.r; });
+    exp_begin.clear();
+    const int64_t n = static_cast<int64_t>(exp_routes.size());
+    for (int64_t q = 0; q < n; ++q)
+      if (q == 0 || exp_routes[q].e != exp_routes[q - 1].e) exp_begin.push_back(q);
+    if (static_cast<int64_t>(exp_begin.size()) == n) return false;
+    exp_begin.push_back(n);
+    std::fill_n(route_slot.begin(), static_cast<size_t>(num_tokens) * params.top_k, int64_t{-1});
+    for (int64_t q = 0; q < n; ++q) route_slot[exp_routes[q].r] = q;
+    return true;
+  }
+
+  // Grouped pass 1 item p = one kRowBlock block of the intermediate row of every route to one expert.
+  // The routes run back to back on one worker, so only the first reads the expert's gate and up rows from DRAM.
+  void do_pass1_grouped(const MoeTask& t, int64_t p) {
+    const int top_k = params.top_k, H = params.H, I = params.I;
+    const int64_t ib = p % n_iblk;
+    const int64_t s = p / n_iblk;
+    const int i0 = static_cast<int>(ib) * kRowBlock;
+    const int i1 = std::min(I, i0 + kRowBlock);
+    const MoeFormat& f = format_of(t);
+    for (int64_t q = exp_begin[s]; q < exp_begin[s + 1]; ++q) {
+      const DownRoute& rt = exp_routes[q];
+      const int tok = static_cast<int>(rt.r / top_k);
+      const float w_in = apply_on_input ? io_w[rt.r] : 1.0f;
+      f.gate_up(static_cast<int>(t.layer), rt.e, tok, i0, i1, io_x + (size_t)tok * H, w_in,
+                g_scratch.data() + (size_t)rt.r * I);
+    }
+  }
+
+  // Grouped pass 2 item hb = one kRowBlock block of every active token's output row.
+  // down takes the routes in expert order, top_k experts per call (the weight streams a full token has in do_pass2), then each token sums its routes as do_pass2 does.
+  void do_pass2_grouped(const MoeTask& t, int64_t hb) {
+    const int top_k = params.top_k, H = params.H;
+    const int h0 = static_cast<int>(hb) * kRowBlock;
+    const int h1 = std::min(H, h0 + kRowBlock);
+    thread_local AlignedVector<float> part_tl;
+    if (part_tl.size() < part_floats) part_tl.resize(part_floats);
+    float* part = part_tl.data();
+    const MoeFormat& f = format_of(t);
+    const int64_t n_exp = static_cast<int64_t>(exp_begin.size()) - 1;
+    for (int64_t s = 0; s < n_exp; s += top_k) {
+      const int64_t q0 = exp_begin[s], q1 = exp_begin[std::min<int64_t>(n_exp, s + top_k)];
+      f.down(static_cast<int>(t.layer), h0, h1, exp_routes.data() + q0, static_cast<int>(q1 - q0), part + q0 * kRowBlock);
+    }
+    const bool rounds_routes = f.rounds_routes();
+    for (const int tok : active_tokens) {
+      const float* col[kMaxTopK];
+      float w_out[kMaxTopK];
+      int n = 0;
+      for (int k = 0; k < top_k; ++k) {
+        const size_t r = (size_t)tok * top_k + k;
+        const int64_t q = route_slot[r];
+        if (q < 0) continue;
+        col[n] = part + q * kRowBlock;
+        w_out[n] = apply_on_input ? 1.0f : io_w[r];
+        ++n;
+      }
+      bf16_t* y_row = io_y + (size_t)tok * H;
+      for (int h = h0; h < h1; ++h) {
+        float acc = 0.0f;
+        for (int j = 0; j < n; ++j) {
+          const float v = col[j][h - h0] * w_out[j];
+          acc += rounds_routes ? bf16_to_f32(f32_to_bf16(v)) : v;
+        }
+        y_row[h] = f32_to_bf16(acc);
+      }
+    }
+  }
+
   void run_task_body(const MoeTask& t) {
     int local_sense = 0;
+    const bool by_expert = grouped;
     for (;;) {
       int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= p1_total) break;
-      do_pass1(t, p);
+      if (by_expert)
+        do_pass1_grouped(t, p);
+      else
+        do_pass1(t, p);
     }
     barrier(local_sense);
     // Prepare the intermediate rows (per token,route) for the down GEMV, see prep_inter.
@@ -306,7 +398,10 @@ struct CpuMoeExecutor {
     for (;;) {
       int64_t p = p2_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= p2_total) break;
-      do_pass2(t, p);
+      if (by_expert)
+        do_pass2_grouped(t, p);
+      else
+        do_pass2(t, p);
     }
   }
 
@@ -363,8 +458,15 @@ struct CpuMoeExecutor {
       else
         std::memset(io_y + static_cast<size_t>(tok) * params.H, 0, sizeof(bf16_t) * params.H);
     }
-    p1_total = static_cast<int64_t>(active_routes.size()) * n_iblk;
-    p2_total = static_cast<int64_t>(active_tokens.size()) * n_hblk;
+    // One row has nothing to share, so it skips the grouping.
+    grouped = num_tokens > 1 && group_by_expert(num_tokens);
+    if (grouped) {
+      p1_total = (static_cast<int64_t>(exp_begin.size()) - 1) * n_iblk;
+      p2_total = n_hblk;
+    } else {
+      p1_total = static_cast<int64_t>(active_routes.size()) * n_iblk;
+      p2_total = static_cast<int64_t>(active_tokens.size()) * n_hblk;
+    }
     prt_total = fmt.preps_inter() ? static_cast<int64_t>(active_routes.size()) : 0;
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
