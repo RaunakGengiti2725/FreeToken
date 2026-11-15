@@ -8,10 +8,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from freetoken.utils import div_ceil
+from freetoken.utils import div_ceil, mem_GB
 
 if TYPE_CHECKING:
     import torch
+
+
+class CacheBudgetTooSmall(ValueError):
+    """The minimum --moe-cache-auto plan (slot floor + KV reserve) is ``short`` bytes over the budget."""
+
+    def __init__(self, message: str, short: int):
+        super().__init__(message)
+        self.short = short
 
 
 def layer_slot_bytes(sources: dict[str, "list[torch.Tensor]"]) -> list[int]:
@@ -93,11 +101,13 @@ def plan_cache_budget(
     # the reserve (or negative), yielding a plan that exceeds budget_bytes. Reject here so
     # --moe-cache-auto fails in arithmetic instead of OOMing in a later CUDA allocation.
     total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
-    assert total <= budget_bytes, (
-        f"cache budget too small: minimum plan (moe={moe_cache_size} slots, "
-        f"kv={num_pages} pages) needs {total} B > budget {budget_bytes} B "
-        "(raise memory_ratio, lower kv_reserve_tokens, or free GPU memory)"
-    )
+    if total > budget_bytes:
+        raise CacheBudgetTooSmall(
+            f"cache budget too small: minimum plan (moe={moe_cache_size} slots, "
+            f"kv={num_pages} pages) needs {total} B ({mem_GB(total)}) > budget {budget_bytes} B "
+            f"({mem_GB(budget_bytes)}), {total - budget_bytes} B ({mem_GB(total - budget_bytes)}) short",
+            total - budget_bytes,
+        )
     assert num_pages > 1, "not enough memory for KV cache after MoE allocation"
     return moe_cache_size, num_pages, overlap
 
@@ -138,3 +148,33 @@ def resolve_moe_cache_auto(
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
     )
+
+
+def _plan_or_short(terms: dict) -> tuple[tuple[int, int, bool] | None, int]:
+    """resolve_moe_cache_auto's plan for ``terms``, or None and the bytes its minimum plan is over the budget."""
+    try:
+        return resolve_moe_cache_auto(**terms), 0
+    except CacheBudgetTooSmall as exc:
+        return None, exc.short
+
+
+def budget_advice(stages: list[tuple[str, dict]], min_reserve_tokens: int) -> str:
+    """The command-line flags that make a refused --moe-cache-auto plan fit, or how far off the last try is.
+
+    ``stages`` are (flags, resolve_moe_cache_auto arguments) pairs, each adding to the one before; the first holds the current settings.
+    A stage that does not fit is tried again at the largest KV reserve that does, and every plan named is the resolver's own.
+    """
+    for flags, terms in stages:
+        page, reserve = terms["page_size"], terms["kv_reserve_tokens"]
+        plan, short = _plan_or_short(terms)
+        if plan is None:
+            # ``short`` bytes over at this reserve: the largest reserve that fits holds that many bytes of pages less.
+            # The planner refuses a KV of one page, so the reserve stays at two or more.
+            fewer = div_ceil(short, terms["cache_per_page"])
+            tokens = max(min_reserve_tokens, 2 * page, (div_ceil(reserve, page) - fewer) * page)
+            if tokens < reserve:
+                flags, terms = f"--kv-reserve-tokens {tokens} {flags}".rstrip(), {**terms, "kv_reserve_tokens": tokens}
+                plan, short = _plan_or_short(terms)
+        if plan is not None:
+            return f"fits with {flags}: {plan[0]} expert slots, {plan[1] * page} KV tokens (the longest prompt + output)"
+    return f"no fit{' even with ' + flags if flags else ''}: the minimum plan is still {short} B ({mem_GB(short)}) short"
