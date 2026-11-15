@@ -12,6 +12,7 @@ ft <command> [args]
 | `ft launch` | Configure and launch a coding agent against a server |
 | `ft checkpoint` | Convert an HF checkpoint to the FTW fast-load format |
 | `ft bench bw` | Benchmark CPU vs PCIe bandwidth to calibrate hybrid MoE decode |
+| `ft bench decode` | Decode with `offload` and with `hybrid` on this machine and report the faster |
 
 `ft --version` prints the installed version (torch-free; nightly wheels carry a
 `+g<sha>` build stamp, tagged releases a bare version). Every command supports
@@ -258,3 +259,59 @@ to split each layer's misses.
 
 On NVLink-C2C hosts, see [models.md](models.md#nvlink-c2c-hosts-gh200--gb200)
 for `FREETOKEN_H2D_BLOCKS_PER_BANK` if `PCIe-gather` sits well below the linear H2D ceiling.
+
+## ft bench decode
+
+```bash
+ft bench decode --model /path/to/model                                # offload against hybrid, with the default flags
+ft bench decode --model /path/to/model --cache-rates 0.05,0.2,0.5     # one comparison per cache rate
+ft bench decode --model /path/to/model -- --moe-cpu-threads 8         # with the flags you serve with, after --
+```
+
+Which of `offload` and `hybrid` decodes faster depends on the machine, the model and the cache size
+([performance/decode.md](performance/decode.md#hybrid-computing-misses-on-the-cpu)). This command measures it
+through the real serving path: it starts `ft serve` once per arm (offload, hybrid with `min-wait`
+rounding, hybrid with `stochastic` rounding, offload again), decodes four prompts one at a time with
+thinking on and the checkpoint's sampling, then several prompts at once, and prints tok/s per arm
+from the server's timings. It does this `--seeds` times per start (5 by default), and a column is
+the mean over those passes with its 95% interval.
+
+- A server seeds its sampler once, at start, so each pass decodes its own text and pass k is the
+  same draws in every start. Without speculative decoding both arms also draw the same number at
+  the same step; with it they share their draws until their texts first differ.
+- Every number is of the timed window alone, `--decode` tokens (2,048) after `--warm` tokens
+  (1,024), cut by token count. Next to tok/s the bench prints decode steps per second and tokens
+  per step (with speculative decoding tok/s moves with the share of accepted drafts, steps per
+  second does not), that share, and the rate and the 95th-percentile gap at which tokens reached
+  the client. `--warm 0,256,1024,4096` also prints tok/s after each of those warm-ups; the verdict
+  reads the longest.
+- `--context 32768,65536,100000` adds, per start, one 300-token turn after a prompt of about that
+  many tokens, and prints prefill seconds, seconds to the first token and decode tok/s. It is off
+  by default and not part of the verdict.
+- The prompts are an AIME-25 problem and a coding task (the workload columns), and two that each make
+  the model repeat a sentence (the guard columns). Repeated output barely misses the cache, so hybrid
+  gains nothing there and still pays its CPU round trip per layer.
+- The verdict treats the passes as its samples, because the speed differs from text to text far
+  more than between two starts. Two starts of one arm decode the same texts, so they are averaged
+  pass by pass. For each workload column the bench prints hybrid's lead over offload and the lower
+  bound of that lead, as `lead (at least bound)`: the bound is one-sided at 95%, from the
+  differences between the passes of both arms (Welch's standard error, Student's t).
+- Hybrid is reported as faster only if that lower bound is above zero on every workload column, the
+  lead is at least 1.5% on its worst workload column, and it is no more than 10% behind on either
+  guard column. With fewer than three passes there is no bound and hybrid cannot qualify. When it
+  does not qualify, the bench prints which of these failed and on which column.
+- If two starts of one arm are more than 5% apart over the same passes, the machine was not steady:
+  nothing is decided and offload stays. When the lead is at least 1.5% but a lower bound is not
+  above zero, the bench adds a round, up to `--rounds`: each hybrid arm and offload again, decoding
+  the earlier passes and `--seeds` new ones. An arm whose server fails to start or stops
+  answering, in any round, counts as not faster. The 1.5%, 5% and 10% are defaults of the tool, not
+  measurements.
+- Run `ft bench bw --model` first: hybrid takes its fetch split from that profile.
+- Each server start loads the model and decodes about 123,000 tokens at the defaults (five passes of
+  four prompts alone and of four at once, 3,072 tokens each), so the first round at one cache rate is
+  four model loads. A lead that is not clear of zero adds up to three more per round, each with
+  `--seeds` more passes than the round before, and `--cache-rates` runs the whole comparison once
+  per rate. `--seeds`, `--warm` and `--decode` shorten a run.
+- `--greedy`, `--streams`, `--aime`, `--prompts`, `--csv` and `--json` change what is decoded and
+  where the numbers go. `--json` keeps the timed text and the finish reason of every request.
+  `--server-cmd` starts the servers of another checkout.

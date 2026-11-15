@@ -99,7 +99,8 @@ formula, round trip included, came out up to 13% faster than the measured
 steps (see [For developers](#for-developers-where-to-look)).
 
 The crossover moves with the CPU-to-PCIe bandwidth ratio and the model, so on
-another machine compare both strategies at your cache size.
+another machine compare both strategies at your cache size:
+`ft bench decode --model <checkpoint>` runs that comparison.
 
 ## Miss rate vs cache rate
 
