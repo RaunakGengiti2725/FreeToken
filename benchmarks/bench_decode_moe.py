@@ -109,6 +109,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="hybrid: max PCIe fetches/layer; -1 = auto (benched pcie/cpu bandwidth fraction)",
     )
     p.add_argument("--mem-ratio", type=float, default=0.9, help="target VRAM utilization")
+    p.add_argument(
+        "--moe-cpu-threads",
+        type=int,
+        default=0,
+        help="cpu/hybrid: passed to ft serve --moe-cpu-threads; 0 = the server's own count",
+    )
     p.add_argument("--gpu", default=None,
                    help="GPU for the serve: a UUID or nvidia-smi index (as ft serve --gpu)")
     p.add_argument("--no-graph", action="store_true", help="eager decode instead of CUDA graph")
@@ -216,6 +222,9 @@ def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
     ]
     if args.gpu:
         cmd += ["--gpu", args.gpu]
+    if args.moe_cpu_threads > 0:
+        # in a container with a CPU quota the server's own count can be throttled: let the caller size the pool
+        cmd += ["--moe-cpu-threads", str(args.moe_cpu_threads)]
     if args.kv_cache_dtype != "auto":
         cmd += ["--kv-cache-dtype", args.kv_cache_dtype]
     if args.attention_backend != "auto":
