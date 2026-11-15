@@ -298,14 +298,12 @@ def convert_anthropic_prompt(
     # Native extended-thinking toggle -> template kwargs, broadcast in every
     # spelling the ecosystem's templates read (a bare enable_thinking bool is
     # inert for templates that read a different knob, e.g. M3's thinking_mode).
-    from .model_meta import thinking_toggle_kwargs
+    from .model_meta import effort_toggle_kwargs
 
-    ctk: dict[str, Any] = {}
-    if req.thinking:
-        if req.thinking.get("type") == "enabled":
-            ctk = thinking_toggle_kwargs(True)
-        elif req.thinking.get("type") == "disabled":
-            ctk = thinking_toggle_kwargs(False)
+    ctk = dict(req.chat_template_kwargs or {})
+    thinking_type = (req.thinking or {}).get("type")
+    if thinking_type in ("enabled", "disabled"):
+        ctk = effort_toggle_kwargs(None, ctk, thinking_type=thinking_type)
 
     return render_messages(messages), template_tools, parser_tools, ctk
 
