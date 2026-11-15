@@ -1,3 +1,4 @@
+import dataclasses
 import os
 from typing import TYPE_CHECKING, Iterator, Tuple
 
@@ -98,9 +99,13 @@ class MoELayer(BaseOP):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        sum_routes: bool = True,
     ) -> torch.Tensor:
+        view = self.quant_method.resident_view(self)
+        if not sum_routes:
+            view = dataclasses.replace(view, sum_routes=False)
         return self.quant_method.apply(
-            hidden_states, topk_weights, topk_ids, self.quant_method.resident_view(self),
+            hidden_states, topk_weights, topk_ids, view,
             layer=self, is_prefill=get_global_ctx().batch.is_prefill,
         )
 
@@ -130,14 +135,21 @@ class MoELayer(BaseOP):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
+        *,
+        sum_routes: bool = True,
     ):
+        """``sum_routes=False`` asks for each route's weighted output [M, top_k, hidden], unsummed.
+        Only a decode kernel that has it gives it; every other path returns the sum [M, hidden]."""
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=self.top_k,
             renormalize=self.renormalize,
         )
-        return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
+        # ranks reduce the summed output
+        sum_routes = sum_routes or self.tp_size > 1
+        out = self._resident_gemm(hidden_states, topk_weights, topk_ids, sum_routes)
+        return self._maybe_all_reduce(out)
 
 
 class OffloadMoELayer(MoELayer):
@@ -192,12 +204,16 @@ class OffloadMoELayer(MoELayer):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
+        *,
+        sum_routes: bool = True,
     ):
         ctx = get_global_ctx()
         if ctx.batch.is_prefill:
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
-            final_hidden_states = self.decode_forward(hidden_states, router_logits)
+            final_hidden_states = self.decode_forward(
+                hidden_states, router_logits, sum_routes or self.tp_size > 1
+            )
         return self._maybe_all_reduce(final_hidden_states)
 
     def routed_forward(
@@ -227,6 +243,7 @@ class OffloadMoELayer(MoELayer):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
+        sum_routes: bool = True,
     ):
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
@@ -234,7 +251,7 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
-        return self._decode_routed(hidden_states, topk_weights, topk_ids)
+        return self._decode_routed(hidden_states, topk_weights, topk_ids, sum_routes)
 
     def prefill_forward(
         self,
@@ -262,6 +279,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        sum_routes: bool = True,
     ) -> torch.Tensor:
         """On-demand load: ``ensure_experts`` rewrites ``topk_ids`` into cache slot
         ids in place (loading missing experts), then the GEMM reads the full slot
@@ -272,7 +290,9 @@ class OffloadMoELayer(MoELayer):
         (high RAM bandwidth) straight from the host banks: ship hidden/routing to
         pinned host memory, run the GEMV on the worker pool via host nodes, ship the
         result back. The GPU slot cache is untouched (topk_ids keep their raw expert
-        ids), so no ``ensure_experts``/``copy_missing`` here."""
+        ids), so no ``ensure_experts``/``copy_missing`` here.
+
+        ``sum_routes=False`` reaches the GPU kernel only: the CPU and hybrid paths return the sum."""
         cache = self.offload_cache
         assert cache is not None
         if cache.is_cpu_layer(self.layer_id):
@@ -292,6 +312,7 @@ class OffloadMoELayer(MoELayer):
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
+            sum_routes=sum_routes,
         )
 
     def _decode_hybrid(
@@ -410,12 +431,13 @@ class OffloadMoELayer(MoELayer):
         n: int | None,
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
+        sum_routes: bool = True,
     ) -> torch.Tensor:
         from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
 
         view = ExpertView(
             {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
-            slots=None if n is not None else topk_ids, n=n, alphas=alphas,
+            slots=None if n is not None else topk_ids, n=n, alphas=alphas, sum_routes=sum_routes,
         )
         return self.quant_method.apply(
             hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill

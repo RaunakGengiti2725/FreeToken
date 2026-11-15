@@ -64,16 +64,20 @@ class Qwen3_5Attention(BaseOP):
             self.qo_attn_dim, config.hidden_size, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.o_proj",
         )
+        from freetoken.kernel.triton.attn_gate import attn_gate_fusable
 
-    def _project(self, x: torch.Tensor):
+        self._fuse_gate = attn_gate_fusable()
+
+    def _project(self, x: torch.Tensor, gate_in_place: bool = False):
         """Returns (q, k, v, gate): q [N, num_q, head_dim] post qk-norm+rope,
-        k [N, num_kv*head_dim] post norm+rope, v [N, num_kv*head_dim], gate [N, num_q*head_dim]."""
+        k [N, num_kv*head_dim] post norm+rope, v [N, num_kv*head_dim], gate [N, num_q*head_dim].
+        ``gate_in_place`` returns the q|gate projection [N, num_q, head_dim*2] as the gate, uncopied."""
         positions = get_global_ctx().batch.get_attn_positions()
         qkv = self.qkv_proj.forward(x)
         qg, k, v = torch.split(qkv, self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
         q = qg[..., : self.head_dim].contiguous()  # [N, num_q, head_dim]
-        gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
+        gate = qg if gate_in_place else qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
         k = k.view(-1, self.num_kv, self.head_dim).contiguous()
         v = v.contiguous()  # split view has the qkv row stride; the KV store needs contiguous
         q = self.q_norm.forward(q).reshape(-1, self.qo_attn_dim)
@@ -88,8 +92,16 @@ class Qwen3_5Attention(BaseOP):
     @nvtx_annotate("MHA")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
-        q, k, v, gate = self._project(x)
+        # a bf16 decode step gates the output in one kernel, bit for bit what _combine gives
+        fuse = self._fuse_gate and x.dtype == torch.bfloat16 and not ctx.batch.is_prefill
+        q, k, v, gate = self._project(x, gate_in_place=fuse)
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
+        if fuse and o.dtype == torch.bfloat16:
+            from freetoken.kernel.triton.attn_gate import attn_gate_mul
+
+            return self.o_proj.forward(attn_gate_mul(o.reshape(-1, self.qo_attn_dim), gate))
+        if fuse:
+            gate = gate[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
         return self._combine(o, gate)
 
 

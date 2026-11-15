@@ -30,10 +30,12 @@ def _fused_experts_decode_nvfp4(
     apply_router_weight_on_input: bool,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    sum_routes: bool = True,
 ) -> torch.Tensor:
     """Shared decode body (gemm1 -> act -> gemm2 -> sum-reduce); ``gemm_fn`` is either
     the marlin-style int32 GEMV (:func:`freetoken.kernel.nvfp4_moe.decode_gemm_marlin`) or the original LUT-gather
-    GEMV (:func:`freetoken.kernel.nvfp4_moe.decode_gemm`), both with the same calling convention."""
+    GEMV (:func:`freetoken.kernel.nvfp4_moe.decode_gemm`), both with the same calling convention.
+    ``sum_routes=False`` skips the sum-reduce and returns each route's weighted output [M, top_k, H]."""
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]
@@ -52,6 +54,8 @@ def _fused_experts_decode_nvfp4(
         ic2, down_packed, down_scale, down_global,
         ic3, topk_weights, topk_ids, not apply_router_weight_on_input, True,
     )
+    if not sum_routes:
+        return ic3
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
     return out
@@ -71,6 +75,7 @@ def fused_experts_decode_nvfp4_marlin(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    sum_routes: bool = True,
 ) -> torch.Tensor:
     """Decode inline-NVFP4 MoE using the Marlin-style int32 wide-load GEMV."""
     return _fused_experts_decode_nvfp4(
@@ -78,7 +83,7 @@ def fused_experts_decode_nvfp4_marlin(
         hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
         down_packed, down_scale, down_global,
         topk_weights, topk_ids, activation, apply_router_weight_on_input,
-        act_alpha, act_limit,
+        act_alpha, act_limit, sum_routes,
     )
 
 

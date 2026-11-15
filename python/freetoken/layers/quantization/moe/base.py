@@ -85,6 +85,8 @@ class ExpertView:
     slots: torch.Tensor | None = None
     n: int | None = None
     alphas: tuple[torch.Tensor, torch.Tensor] | None = None
+    # False: a decode apply() may return each route's weighted output [M, top_k, hidden], unsummed
+    sum_routes: bool = True
 
 
 def fused_piece(pieces: dict[str, torch.Tensor], role: str) -> torch.Tensor:
