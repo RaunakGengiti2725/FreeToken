@@ -694,6 +694,9 @@ class Engine:
             # Prefill runs on the first comma part; warm its autotune cache. With a cache that keeps what a prefill
             # streams, the warmup also loads the experts, whatever the backend.
             self._warmup_prefill()
+        if not self.chunk_runners and self.graph_runner.rows_per_req > 1:
+            # the warmup is what makes every expert resident, which the prefill graphs of an offloaded MoE are captured on
+            self.chunk_runners = self._make_chunk_runners(self.graph_runner, init_free_memory, aligned_max_seq_len)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1516,10 +1519,13 @@ class Engine:
         if config.prefill_graph_tokens <= 0 or not sizes or 1 not in target.graph_map or not self.spec.can_prefill_as_verify:
             return {}
         runners: Dict[int, GraphRunner] = {}
+        resident = cache is not None and cache.all_resident
+        self._chunks_need_resident = resident
         for tokens in sizes:
-            if cache is not None and not cache.loads_prefill_on_demand(tokens):
-                logger.warning_rank0(f"--prefill-graph-chunks {tokens}: not captured, the expert cache stages chunks of that length through host-side steps (--moe-prefill-demand-tokens is below it)")
+            if cache is not None and not resident and not cache.loads_prefill_on_demand(tokens):
+                logger.info_rank0(f"--prefill-graph-chunks {tokens}: not captured yet, the expert cache stages chunks of that length through host-side steps (not every expert is resident and --moe-prefill-demand-tokens is below it)")
                 continue
+            before = get_free_memory(self.device)
             try:
                 dummy = Req(
                     input_ids=torch.zeros(tokens, dtype=torch.int32, device="cpu"),
@@ -1528,6 +1534,7 @@ class Engine:
                 )
                 dummy.linear_slot_idx = self.dummy_req.linear_slot_idx
                 attn = self._capture_attn_backend()
+                attn.capture_prefill = True
                 linear = ChunkCaptureLinearBackend(self.device, pool, tokens) if pool is not None else None
                 sink = self.spec.chunk_rows_sink(tokens)
 
@@ -1537,13 +1544,21 @@ class Engine:
                 runners[tokens] = GraphRunner(
                     stream=self.stream, device=self.device, forward=self.model.forward, attn_backend=attn,
                     cuda_graph_bs=[1], cuda_graph_max_bs=1, free_memory=free_memory, max_seq_len=max_seq_len,
-                    dummy_req=dummy, moe_offload_cache=cache, mrope=config.model_config.model_is_mrope,
+                    # with every expert resident the forward reads the slots and changes nothing in the cache: no reset
+                    dummy_req=dummy, moe_offload_cache=None if resident else cache, mrope=config.model_config.model_is_mrope,
                     rows_per_req=tokens, phase="prefill", ctx_override={"attn_backend": attn}, batch_hook=hook,
                     pool=target.graph_pool, out_dtype=torch.float32, linear_backend=linear,
                 )
+                torch.cuda.synchronize(self.device)
+                logger.info_rank0(f"prefill graph of {tokens} tokens: {(before - get_free_memory(self.device)) / 2**20:.0f} MiB")
             except Exception as exc:  # noqa: BLE001 -- optional graphs: a failure leaves that size to the other steps
                 logger.warning_rank0(f"--prefill-graph-chunks {tokens}: the prefill graph was not captured ({type(exc).__name__}: {exc})")
         return runners
+
+    def chunk_graphs_usable(self) -> bool:
+        """Whether the prefill graphs may run now: those captured on an all-resident expert cache read its slots as they are."""
+        cache = self.moe_offload_cache
+        return cache is None or not self._chunks_need_resident or cache.all_resident
 
     def _make_prefill_runner(self, target: GraphRunner, free_memory: int, max_seq_len: int) -> GraphRunner | None:
         """A verify graph of --prefill-graph-rows rows of one request, for short prefill chunks longer than a decode
@@ -1664,7 +1679,9 @@ class Engine:
             self._run_mm_encoder(batch)
         spec_prefill = self.spec is not None and batch.is_prefill
         if spec_prefill and self._prefill_runs_as_verify(batch):
-            if os.environ.get("FREETOKEN_PREFILL_GRAPH_CHECK"):
+            if os.environ.get("FREETOKEN_PREFILL_GRAPH_CHECK") == "split":
+                logits = self.spec.prefill_as_verify(batch, check=True)
+            elif os.environ.get("FREETOKEN_PREFILL_GRAPH_CHECK"):
                 logits = self._check_prefill_as_verify(batch)
             else:
                 logits = self.spec.prefill_as_verify(batch)

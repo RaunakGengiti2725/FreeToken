@@ -294,7 +294,8 @@ class FlashInferBackend(BaseAttnBackend):
 
         capture = self.capture
         assert capture is not None
-        if self.capture_rows_per_req > 1:
+        # a captured prefill forward keeps the prefill kernel at one row too, so that it is the eager forward's
+        if self.capture_rows_per_req > 1 or getattr(self, "capture_prefill", False):
             wrapper = BatchPrefillWithPagedKVCacheWrapper(
                 self.float_workspace_buffer,
                 kv_layout="NHD",
