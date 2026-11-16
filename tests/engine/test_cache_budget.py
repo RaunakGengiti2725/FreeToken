@@ -1560,8 +1560,10 @@ def test_a_request_and_a_server_end_at_their_deadline_whatever_the_server_does()
             try:
                 self.wfile.write(chunk)
                 self.wfile.flush()
+                began = time.monotonic()
                 while not done.wait(0.05):
-                    if self.path.endswith("trickle"):  # tokens keep coming, forever
+                    # tokens keep coming forever, or for a second and then never again, or never at all
+                    if self.path.endswith("trickle") or (self.path.endswith("then-silent") and time.monotonic() - began < 1.0):
                         self.wfile.write(chunk)
                         self.wfile.flush()
             except OSError:
@@ -1572,14 +1574,16 @@ def test_a_request_and_a_server_end_at_their_deadline_whatever_the_server_does()
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     real = benchdecode.urllib.request.Request
     try:
-        for kind in ("silent", "trickle"):
+        # then-silent: the deadline is 0.3 s after the last token. A timeout that counts from each read ends it a full
+        # 1.3 s after that token, at 2.3 s
+        for kind, after, at_most in (("silent", 0.5, 1.2), ("trickle", 0.5, 1.2), ("then-silent", 1.3, 2.0)):
             with pytest.MonkeyPatch.context() as m:
-                # the bench posts to /v1/chat/completions; this server tells its two failures apart by the path
+                # the bench posts to /v1/chat/completions; this server tells its failures apart by the path
                 m.setattr(benchdecode.urllib.request, "Request", lambda url, **kw: real(f"http://127.0.0.1:{httpd.server_port}/{kind}", **kw))
                 t0 = time.monotonic()
                 with pytest.raises((RuntimeError, OSError)):
-                    benchdecode.stream_chat("http://unused", {"stream": True}, deadline=t0 + 0.5)
-                assert 0.4 < time.monotonic() - t0 < 5.0, kind
+                    benchdecode.stream_chat("http://unused", {"stream": True}, deadline=t0 + after)
+                assert after - 0.1 < time.monotonic() - t0 < at_most, kind
         with pytest.raises(RuntimeError, match="deadline had passed"):
             benchdecode.stream_chat("http://unused", {}, deadline=time.monotonic() - 1.0)
     finally:

@@ -455,14 +455,23 @@ def stream_chat(origin: str, body: dict, floor: float | None = None, deadline: f
     if left <= 0:
         raise RuntimeError("the request was not sent: its deadline had passed")
     try:
-        # the timeout is per read: a silent server ends the request here, a slow one at the check in the loop
         resp = urllib.request.urlopen(req, timeout=left)
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"request failed: HTTP {e.code}: {e.read()[:300]!r}") from e
     with resp:
-        for raw in resp:
-            if deadline is not None and time.monotonic() > deadline:
-                raise RuntimeError("the request ran past its deadline")
+        while True:
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise RuntimeError("the request ran past its deadline")
+                # urlopen's timeout counts from every read, so a server that streams and then goes silent would get
+                # it all over again: what is left of the deadline goes on the socket before each read
+                sock = getattr(getattr(resp.fp, "raw", None), "_sock", None)
+                if sock is not None:
+                    sock.settimeout(left)
+            raw = resp.readline()
+            if not raw:
+                break
             line = raw.strip()
             if not line.startswith(b"data:"):
                 continue
