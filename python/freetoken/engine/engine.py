@@ -1520,14 +1520,29 @@ class Engine:
         chunk into replays of them). Each has its own attention capture and linear capture; one that cannot be
         captured is left out, with a warning."""
         config, pool, cache = self.config, self.linear_state_pool, self.moe_offload_cache
+        from freetoken.kernel.fla.chunk import CHUNK_SIZE as CHUNK
+
         sizes = set()
         for part in config.prefill_graph_chunks.split(","):
-            # a count, a range "1-64", or a range with a step "128-512:64"
+            # a count, a range "1-64", or a range with a step "128-448:64"
             span, _, step = part.strip().partition(":")
             low, _, high = span.partition("-")
-            if low:
-                sizes.update(range(int(low), int(high or low) + 1, int(step or 1)))
-        sizes = sorted(sizes, reverse=True)
+            if not part.strip():
+                continue
+            try:
+                low, high, step = int(low), int(high or low), int(step or 1)
+            except ValueError:
+                low = 0
+            if not (1 <= low <= high and step >= 1):
+                raise ValueError(f"--prefill-graph-chunks: '{part.strip()}' is not a token count, a range a-b or a range a-b:step of positive counts")
+            sizes.update(range(low, high + 1, step))
+        # the plan replays a tail of 1 to 64 tokens and a head that is a multiple of 64 within the limit; nothing else
+        usable = {t for t in sizes if t <= CHUNK or (t % CHUNK == 0 and t <= (config.prefill_graph_tokens - 1) // CHUNK * CHUNK)}
+        if sizes - usable:
+            logger.info_rank0(f"--prefill-graph-chunks: not captured, no plan replays them: {sorted(sizes - usable)}")
+        if len(usable) > 256:
+            raise ValueError(f"--prefill-graph-chunks names {len(usable)} sizes; at most 256")
+        sizes = sorted(usable, reverse=True)
         if config.prefill_graph_tokens <= 0 or not sizes or 1 not in target.graph_map or not self.spec.can_prefill_as_verify:
             return {}
         runners: Dict[int, GraphRunner] = {}
@@ -1540,6 +1555,9 @@ class Engine:
                 logger.info_rank0(f"--prefill-graph-chunks {tokens}: not captured yet, the expert cache stages chunks of that length through host-side steps (not every expert is resident and --moe-prefill-demand-tokens is below it)")
                 continue
             before = get_free_memory(self.device)
+            if before < 1 << 30:
+                logger.warning_rank0(f"--prefill-graph-chunks {tokens}: not captured, {before / 2**20:.0f} MiB of GPU memory are free; chunks that need it run eagerly")
+                continue
             try:
                 dummy = Req(
                     input_ids=torch.zeros(tokens, dtype=torch.int32, device="cpu"),
@@ -1572,38 +1590,67 @@ class Engine:
     @torch.inference_mode()
     def _selftest_chunk_graphs(self) -> None:
         """Diagnostic (FREETOKEN_PREFILL_GRAPH_CHECK=selftest): every captured prefill forward against an eager prefill
-        forward of the same tokens, once from an empty state and once after a 96-token prefix, on the padding request's
-        row with seeded token ids; SpecRunner.prefill_as_verify prints one PREFILL_SPLIT_CHECK line each."""
+        forward of the same tokens, once from an empty state and once after a 96-token prefix, then three two-replay
+        plans with their snapshot, on the padding request's row with seeded token ids. SpecRunner.prefill_as_verify
+        prints one PREFILL_SPLIT_CHECK line a captured step; a line here says whether each snapshot is the state at its cut."""
         from types import SimpleNamespace
 
-        row = self.page_table[self.dummy_req.table_idx]
+        from freetoken.kernel.fla.chunk import CHUNK_SIZE as CHUNK
+
+        if not self.chunk_runners or not self.chunk_graphs_usable():
+            return
+        row, pool = self.page_table[self.dummy_req.table_idx], self.linear_state_pool
         saved, prefix = row.clone(), 96
         generator = torch.Generator().manual_seed(0)
         vocab = min(self.config.model_config.vocab_size, 100_000)
+        live = self.dummy_req.linear_slot_idx
 
-        def run(ids: torch.Tensor, start: int, plan: list) -> None:
+        def run(ids: torch.Tensor, start: int, plan: list, track: int | None = None) -> None:
             req = SimpleNamespace(
                 table_idx=self.dummy_req.table_idx, cached_len=start, device_len=ids.numel(), extend_len=ids.numel() - start,
-                linear_slot_idx=self.dummy_req.linear_slot_idx, mrope_delta=0, mrope_positions_full=None,
+                linear_slot_idx=live, mrope_delta=0, mrope_positions_full=None,
             )
             batch = SimpleNamespace(reqs=[req], input_ids=ids[start:].to(self.device), out_loc=row[start : ids.numel()], prefill_plan=plan)
+            if track is not None:
+                batch.prefill_track_dst = torch.tensor([track], dtype=torch.int64, device=self.device)
             self.spec.prefill_as_verify(batch, check=True)
+
+        def tokens(n: int) -> torch.Tensor:
+            return torch.randint(1000, vocab, (n,), generator=generator, dtype=torch.int32)
 
         try:
             for size in sorted(self.chunk_runners):
-                if prefix + size > row.numel():
+                if prefix + size > self.max_seq_len:
                     continue
                 # free pages, as the warmup takes them
                 row[: prefix + size] = torch.arange(prefix + size, dtype=row.dtype, device=row.device)
-                ids = torch.randint(1000, vocab, (prefix + size,), generator=generator, dtype=torch.int32)
+                ids = tokens(prefix + size)
                 run(ids[:size], 0, [("chunk", size)])
                 run(ids[:prefix], 0, [("eager", prefix)])
                 run(ids, prefix, [("chunk", size)])
+            # the plans as requests run them: a head, the snapshot, a tail over what the head's replay stored
+            spare = pool.alloc(1)[0] if pool is not None and pool.num_free_slots > 0 else None
+            for head, tail in ((64, 64), (128, 37), (max((s for s in self.chunk_runners if s % CHUNK == 0), default=CHUNK), 1)):
+                if spare is None or head not in self.chunk_runners or tail not in self.chunk_runners or prefix + head + tail > self.max_seq_len:
+                    continue
+                row[: prefix + head + tail] = torch.arange(prefix + head + tail, dtype=row.dtype, device=row.device)
+                ids = tokens(prefix + head + tail)
+                run(ids[:prefix], 0, [("eager", prefix)])
+                run(ids[: prefix + head], prefix, [("eager", head)])
+                at_cut = [pool.recurrent_states[:, live].clone(), pool.conv_states[:, live].clone()]
+                run(ids[:prefix], 0, [("eager", prefix)])
+                run(ids, prefix, [("chunk", head), ("track", 0), ("chunk", tail)], track=spare)
+                same = torch.equal(pool.recurrent_states[:, spare], at_cut[0]) and torch.equal(pool.conv_states[:, spare], at_cut[1])
+                print(f"PREFILL_SPLIT_CHECK plan={head}+{tail} start={prefix} snapshot_is_the_eager_state_at_the_cut={same}", flush=True)
+            if spare is not None:
+                pool.free([spare])
         finally:
             row.copy_(saved)
             self.spec.proposer._prefill_sink = None
+            if self.moe_offload_cache is not None:
+                self.moe_offload_cache.reset_stats()
         torch.cuda.synchronize(self.device)
-        logger.info_rank0(f"prefill graph self-test done for {len(self.chunk_runners)} sizes")
+        logger.info_rank0(f"prefill graph self-test done for {len(self.chunk_runners)} sizes; {get_free_memory(self.device) / 2**20:.0f} MiB of GPU memory free")
 
     def chunk_graphs_usable(self) -> bool:
         """Whether the prefill graphs may run now: those captured on an all-resident expert cache read its slots as they are."""
@@ -1731,7 +1778,7 @@ class Engine:
         if spec_prefill and self._prefill_runs_as_verify(batch):
             if os.environ.get("FREETOKEN_PREFILL_GRAPH_CHECK") == "split":
                 logits = self.spec.prefill_as_verify(batch, check=True)
-            elif os.environ.get("FREETOKEN_PREFILL_GRAPH_CHECK", "selftest") != "selftest":
+            elif os.environ.get("FREETOKEN_PREFILL_GRAPH_CHECK") not in (None, "", "selftest"):
                 logits = self._check_prefill_as_verify(batch)
             else:
                 logits = self.spec.prefill_as_verify(batch)

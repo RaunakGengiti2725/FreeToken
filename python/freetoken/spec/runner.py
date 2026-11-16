@@ -174,8 +174,8 @@ class SpecRunner:
     def prefill_plan(self, batch: Batch) -> List[tuple[str, int]] | None:
         """How a short prefill chunk of one request is cut into steps, or None when it must run as one eager forward.
 
-        ("chunk", b): a replay of the prefill graph of b tokens. ("eager", m): an eager prefill forward of m tokens.
-        ("verify", w): a verify step of w rows, whose rows past the chunk are padding. ("track", 0): the linear state
+        ("chunk", b): a replay of the prefill graph of b tokens. ("eager", m): an eager prefill forward of m tokens (no
+        plan made here has one; the self-test builds a prefix with it). ("verify", w): a verify step of w rows, whose rows past the chunk are padding. ("track", 0): the linear state
         as it is there is the chunk's snapshot.
 
         With prefill graphs (--prefill-graph-chunks) a chunk of at most --prefill-graph-tokens tokens runs as one or
@@ -295,6 +295,15 @@ class SpecRunner:
                     continue
             return rows
 
+        def kv_wipe(done: int, size: int) -> None:
+            loc = batch.out_loc[done : done + size].long()
+            for layer in range(engine.config.model_config.num_layers):
+                try:
+                    engine.kv_cache.k_cache(layer)[loc] = 0
+                    engine.kv_cache.v_cache(layer)[loc] = 0
+                except (KeyError, IndexError):
+                    continue
+
         hidden, done, logits = [], 0, None
         for kind, size in batch.prefill_plan:
             if _STEP_SYNC:
@@ -320,6 +329,8 @@ class SpecRunner:
                 want = [want_logits.clone(), want_hidden.clone(), *kv_rows(done, size), *[state[:, slot].clone() for state in states]]
                 for state, saved in zip(states, before):
                     state[:, slot] = saved
+                # the eager forward's K/V rows are wiped, so that a replay that stored nothing, or elsewhere, shows
+                kv_wipe(done, size)
             step, ids, out_loc = make(kind, size, done, m)
             runner.pad_batch(step)
             place(step, ids, out_loc)
