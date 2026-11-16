@@ -71,6 +71,8 @@ def _usable(row: dict) -> bool:
     if not isinstance(tok, dict) or not tok or not isinstance(row.get("failed", {}), dict):
         return False
     width = len(PROMPTS)
+    if not all(row.get(k) is None or (isinstance(row[k], int) and not isinstance(row[k], bool)) for k in ("cache_slots", "total_slots", "slot_bytes", "gpu_free_bytes")):
+        return False
     return all(
         isinstance(cols, list) and len(cols) == width
         and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0 for v in cols)
@@ -185,9 +187,28 @@ def _stale(row: dict, names: list[str], free: int | None, args) -> str | None:
         return f"it has no timing of {names[0]}"
     if missing := [n for n in names if n not in row["tok_s"] and n not in row.get("failed", {})]:
         return f"it has no timing of {', '.join(missing)}"
-    if _moe_cache_is_auto(args) and free and all(row.get(k) for k in ("cache_slots", "slot_bytes", "gpu_free_bytes")):
-        # the same check auto makes of a decode row: more free memory now means a larger cache than the one timed
-        return decode_profile.auto_size_objection({**row, "slots": {"offload": row["cache_slots"]}}, free, args.memory_ratio)
+    if _moe_cache_is_auto(args):
+        return _memory_objection(row, free, args.memory_ratio)
+    return None
+
+
+def _memory_objection(row: dict, free: int | None, memory_ratio: float) -> str | None:
+    """Why timings taken with an automatically sized cache do not answer at ``free`` bytes of GPU memory, or None.
+
+    A decode row is accepted at less memory than it was measured with (decode_profile.auto_size_objection). These
+    timings are not: they also chose the draft depth, whose buffers and the cache share that memory. The tolerance
+    is the same SLOT_GROWTH of the timed cache, in both directions."""
+    then, slots, slot_bytes = row.get("gpu_free_bytes"), row.get("cache_slots"), row.get("slot_bytes")
+    if not then or not free:
+        return "it does not say how much GPU memory was free when it was timed"
+    if slots and slot_bytes:
+        if free > then and row.get("total_slots") and slots >= row["total_slots"]:
+            return None  # every expert was cached already: more memory cannot grow the cache
+        moved = abs(free - then) * memory_ratio / slot_bytes > decode_profile.SLOT_GROWTH * slots
+    else:
+        moved = abs(free - then) > decode_profile.SLOT_GROWTH * then
+    if moved:
+        return f"{abs(free - then) / 2**30:.1f} GiB {'more' if free > then else 'less'} GPU memory is free than when it was timed ({slots or 'unknown'} cache slots)"
     return None
 
 
@@ -236,7 +257,8 @@ def measured_choice(args, argv: list[str]) -> dict:
             row, reason = None, f"the stored calibration does not apply: {stale}"
         if row is None:
             logger.info(f"--preset {PRESET}: calibrating, {len(todo)} server starts of {WARM} + {DECODE} tokens on {len(PROMPTS)} prompts ({reason})")
-            row = {**measure(args, argv, todo), "stamp": stamp}
+            # the launcher's own reading of the free memory: a later start compares its reading with this one
+            row = {**measure(args, argv, todo), "stamp": stamp, "gpu_free_bytes": free}
             decode_profile.store(key, row, gpu={"name": gpu_name, "uuid": gpu_uuid})
             took = f"calibration took {row['seconds']:.0f} s"
         else:

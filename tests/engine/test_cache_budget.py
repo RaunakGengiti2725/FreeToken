@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import json
 import os
 
 from freetoken.engine.cache_budget import (
@@ -806,41 +807,55 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
         return {"tok_s": speeds[strategy, depth], "drafts": 100 * (depth or 0), "early": speeds[strategy, depth], "cache_slots": 40,
                 "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": _ROW_FREE, "ready_s": 1.0}
 
+    def starts(args, argv):
+        before = len(started)
+        return calibrate.measured_choice(args, argv), len(started) - before
+
+    def free_now(free):
+        monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (*_ROW_GPU, free))
+
     monkeypatch.setattr(calibrate, "_time_candidate", time_candidate)
-    monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (*_ROW_GPU, _ROW_FREE))
+    free_now(_ROW_FREE)
     args, argv = parsed()
     hybrid_3 = {"moe_strategy": "hybrid", "moe_cache_auto": True, "speculative_num_steps": 3}
-    assert calibrate.measured_choice(args, argv) == hybrid_3 and len(started) == 6
+    assert starts(args, argv) == (hybrid_3, 6)
     # the same checkpoint, flags, machine and release: the stored timings answer and no server is started
-    assert calibrate.measured_choice(args, argv) == hybrid_3 and len(started) == 6
+    assert starts(args, argv) == (hybrid_3, 0)
     # a strategy from the command line is not a candidate: the three depths of that strategy are another setup
-    assert calibrate.measured_choice(*parsed("--moe-strategy", "offload")) == {"speculative_num_steps": 3} and len(started) == 9
+    assert starts(*parsed("--moe-strategy", "offload")) == ({"speculative_num_steps": 3}, 3)
     # a cache rate or size from the command line is its own setup, not the automatic size: each is timed for itself
     for flags in (("--moe-cache-rate", "0.2"), ("--moe-cache-rate", "0.05"), ("--moe-cache-size", "512")):
-        del started[9:]
         sized = {"moe_strategy": "hybrid", "speculative_num_steps": 3}
-        assert calibrate.measured_choice(*parsed(*flags)) == sized and len(started) == 15, flags
-        assert calibrate.measured_choice(*parsed(*flags)) == sized and len(started) == 15
-    del started[9:]
-    # another release, or more free memory than the cache was timed with: timed again
-    monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (*_ROW_GPU, _ROW_FREE + (8 << 30)))
-    assert calibrate.measured_choice(args, argv) == hybrid_3 and len(started) == 15
+        assert starts(*parsed(*flags)) == (sized, 6), flags
+        assert starts(*parsed(*flags)) == (sized, 0)
+    # an automatically sized cache follows the free memory (40 slots of 1 MiB were timed): two slots more or less are the
+    # same setup; clearly more, clearly less, or a row that does not say how much was free, is timed again
+    for free, timed in ((_ROW_FREE - (1 << 20), 0), (_ROW_FREE + (1 << 20), 0), (_ROW_FREE - (8 << 30), 6), (_ROW_FREE - (8 << 30) + (1 << 20), 0),
+                        (_ROW_FREE + (8 << 30), 6)):
+        free_now(free)
+        assert starts(args, argv) == (hybrid_3, timed), free
+    profile = decode_rows.tmp / "benchdecode.json"
+    kept = json.loads(profile.read_text())
+    assert all(row.pop("gpu_free_bytes") for row in kept["decisions"].values())
+    profile.write_text(json.dumps(kept))
+    assert starts(args, argv) == (hybrid_3, 6) and starts(args, argv) == (hybrid_3, 0)
+    assert starts(*parsed("--moe-cache-rate", "0.2")) == (sized, 0)  # a cache of a fixed size is the same at any free memory
+    # another release: timed again
     monkeypatch.setattr("freetoken.version.__version__", "9.9.10")
-    assert calibrate.measured_choice(args, argv) == hybrid_3 and len(started) == 21
+    assert starts(args, argv) == (hybrid_3, 6)
     # a checkpoint that drafts nothing: the depths are one server, so only the strategies are timed
     speeds.update({("offload", 3): [60.0, 90.0], ("hybrid", 3): [80.0, 120.0]})
     monkeypatch.setattr(calibrate, "_time_candidate", lambda args, argv, s, d, floors=None: {**time_candidate(args, argv, s, d), "drafts": 0})
-    other, other_argv = parsed("--memory-ratio", "0.9")
-    assert calibrate.measured_choice(other, other_argv) == hybrid_3 and len(started) == 23
+    assert starts(*parsed("--memory-ratio", "0.9")) == (hybrid_3, 2)
     # the static choice cannot be timed, or the GPU cannot be read: the static preset, and nothing is kept
     monkeypatch.setattr(calibrate, "_time_candidate", time_candidate)
     del speeds["offload", 3]
     third, third_argv = parsed("--memory-ratio", "0.8")
-    assert calibrate.measured_choice(third, third_argv) == {} and len(started) == 24
+    assert starts(third, third_argv) == ({}, 1)
     speeds["offload", 3] = [100.0, 200.0]   # hybrid with 3 drafts is now the slower one: the static choice, measured
-    assert calibrate.measured_choice(third, third_argv) == {**hybrid_3, "moe_strategy": "offload"} and len(started) == 30
+    assert starts(third, third_argv) == ({**hybrid_3, "moe_strategy": "offload"}, 6)
     monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (_ for _ in ()).throw(RuntimeError("the GPU could not be read")))
-    assert calibrate.measured_choice(third, third_argv) == {} and len(started) == 30
+    assert starts(third, third_argv) == ({}, 0)
 
 
 def test_auto_does_not_take_a_row_whose_hybrid_cache_is_below_the_models_floor(decode_rows):
