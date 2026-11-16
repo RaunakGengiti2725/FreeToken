@@ -171,6 +171,38 @@ def test_prefill_head_norm_is_the_per_head_norm_bit_for_bit(activation, dtype):
         assert torch.equal(norm.forward_heads(x, z, heads), per_head), rows
 
 
+@pytest.mark.parametrize("lengths", [[1], [2], [63], [64, 1, 200], [1000, 37, 128]])
+def test_prefill_values_read_in_place_are_the_copied_values_bit_for_bit(monkeypatch, lengths):
+    """A prefill's chunk kernel reads the values out of the conv output where they lie; with the switch off it reads a
+    token-major copy of them. Fresh requests, then each continued from its state: the outputs and both states are equal."""
+    import freetoken.layers.linear_attn.gdn as gdn
+
+    op, _ = _make_layer(3, "sigmoid", seed=7)
+    more = [n // 2 + 1 for n in lengths]
+    slots = slice(1, len(lengths) + 1)
+    runs = []
+    for in_place in (True, False):
+        monkeypatch.setattr(gdn, "_VALUES_IN_PLACE", in_place)
+        ctx = _ctx(monkeypatch, 3)
+        pool = ctx.linear_state_pool
+        _, _, first = _prefill(op, ctx, lengths, seed=21)
+        fresh_state = pool.recurrent_states[0, slots].clone()
+        reqs = [
+            Req(input_ids=torch.zeros(n + m, dtype=torch.int32), table_idx=i + 1, cached_len=n,
+                output_len=1, uid=i, sampling_params=SamplingParams(), cache_handle=None)
+            for i, (n, m) in enumerate(zip(lengths, more))
+        ]
+        batch = Batch(reqs=reqs, phase="prefill")
+        batch.padded_reqs = reqs
+        torch.manual_seed(22)
+        with ctx.forward_batch(batch):
+            second = op.forward(torch.randn(sum(more), HIDDEN, device=DEV, dtype=torch.bfloat16))
+        runs.append((first, fresh_state, second, pool.recurrent_states[0, slots].clone(), pool.conv_states[0, slots].clone()))
+    assert float(runs[0][3].float().norm()) > 0
+    for what, in_place, copied in zip(("output", "state", "continued output", "continued state", "conv state"), *runs):
+        assert torch.equal(in_place, copied), what
+
+
 def _track_snapshot_and_recomputed(monkeypatch, cached_len: int):
     """A 150-token prefill after ``cached_len`` cached tokens that snapshots its state at its last chunk boundary (128 tokens in), and the state of a request that prefills exactly those 128 tokens from the same cached state.
 

@@ -19,7 +19,7 @@ from freetoken.kernel.fla.index import prepare_chunk_indices
 #     ],
 #     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
 # )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "stride_v"])
 def recompute_w_u_fwd_kernel(
     k,
     v,
@@ -31,6 +31,7 @@ def recompute_w_u_fwd_kernel(
     cu_seqlens,
     chunk_indices,
     T,
+    stride_v,
     H: tl.constexpr,
     Hg: tl.constexpr,
     K: tl.constexpr,
@@ -39,6 +40,7 @@ def recompute_w_u_fwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    V_ROWS: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -64,14 +66,25 @@ def recompute_w_u_fwd_kernel(
     b_g = tl.exp(tl.load(p_g, boundary_check=(0,)))
 
     for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(
-            v + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
+        if V_ROWS:
+            # v is [H * V, tokens], a row a value dim: the same [BT, BV] tile, a token one element on and a dim one row on
+            p_v = tl.make_block_ptr(
+                v + (i_h * V).to(tl.int64) * stride_v + bos,
+                (T, V),
+                (1, stride_v),
+                (i_t * BT, i_v * BV),
+                (BT, BV),
+                (0, 1),
+            )
+        else:
+            p_v = tl.make_block_ptr(
+                v + (bos * H + i_h) * V,
+                (T, V),
+                (H * V, 1),
+                (i_t * BT, i_v * BV),
+                (BT, BV),
+                (1, 0),
+            )
         p_u = tl.make_block_ptr(
             u + (bos * H + i_h) * V,
             (T, V),
@@ -116,9 +129,19 @@ def recompute_w_u_fwd(
     A: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor],
     chunk_indices: torch.LongTensor | None = None,
+    value_rows: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    B, T, Hg, K, V = *k.shape, v.shape[-1]
-    H = v.shape[-2]
+    """``value_rows`` [H * V, B * T] contiguous, when given, holds the values a row a value dim (the layout the
+    GDN conv writes) and is read in place of ``v``: the tiles and every operation on them are those of ``v``."""
+    B, T, Hg, K = k.shape
+    if value_rows is None:
+        H, V = v.shape[-2:]
+        u = torch.empty_like(v)
+    else:
+        assert v is None and value_rows.is_contiguous() and value_rows.shape[1] == B * T
+        H = beta.shape[-1]
+        V = value_rows.shape[0] // H
+        u = value_rows.new_empty(B, T, H, V)
     BT = A.shape[-1]
 
     if chunk_indices is None and cu_seqlens is not None:
@@ -126,11 +149,10 @@ def recompute_w_u_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = 64
-    u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
         k=k,
-        v=v,
+        v=v if value_rows is None else value_rows,
         beta=beta,
         w=w,
         u=u,
@@ -139,6 +161,7 @@ def recompute_w_u_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
+        stride_v=0 if value_rows is None else value_rows.stride(0),
         H=H,
         Hg=Hg,
         K=K,
@@ -147,6 +170,7 @@ def recompute_w_u_fwd(
         BK=BK,
         BV=BV,
         IS_VARLEN=cu_seqlens is not None,
+        V_ROWS=value_rows is not None,
         num_warps=4,
         num_stages=3,
     )
