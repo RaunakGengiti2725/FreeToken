@@ -56,7 +56,13 @@ def gdn_slot(req) -> int:
     return req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
 
 
-def build_fla_metadata(batch: "Batch", device: torch.device, pool: LinearStatePool) -> FLAMetadata:
+def _slot_indices(slots: List[int], device: torch.device) -> torch.Tensor:
+    return torch.tensor(slots, dtype=torch.int32, pin_memory=torch.cuda.is_available()).to(device, non_blocking=True)
+
+
+def build_fla_metadata(
+    batch: "Batch", device: torch.device, pool: LinearStatePool, cache_indices: torch.Tensor | None = None
+) -> FLAMetadata:
     """Build the per-forward GDN metadata. Uses pinned host staging + non_blocking H2D
     (the input_ids/attn-metadata pattern), so the copies overlap the forward instead of
     stalling it.
@@ -64,6 +70,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device, pool: LinearStatePo
     Decode and verify run ``rows_per_req`` rows per request, so ``cu_seqlens`` is
     ``arange(bs+1) * rows_per_req``. Under CUDA graph ``LinearAttnBackend`` copies this
     metadata into its persistent buffers (stable addresses) before each replay.
+    ``cache_indices``: a decode batch's slots already on the device, when the caller holds them.
     """
     reqs = batch.padded_reqs
     pin = {"device": "cpu", "pin_memory": torch.cuda.is_available()}
@@ -71,10 +78,11 @@ def build_fla_metadata(batch: "Batch", device: torch.device, pool: LinearStatePo
     if not batch.is_prefill:
         # every request continues its live state
         bs = len(reqs)
-        idx_host = torch.tensor([gdn_slot(r) for r in reqs], dtype=torch.int32, **pin)
+        if cache_indices is None:
+            cache_indices = _slot_indices([gdn_slot(r) for r in reqs], device)
         metadata = FLAMetadata(
             cu_seqlens=torch.arange(0, (bs + 1) * batch.rows_per_req, batch.rows_per_req, dtype=torch.int32, device=device),
-            cache_indices=idx_host.to(device, non_blocking=True),
+            cache_indices=cache_indices,
         )
         if batch.phase == "verify":
             metadata.verify_scratch = pool.verify_scratch
@@ -178,6 +186,8 @@ class LinearAttnBackend(BaseAttnBackend):
         self.pool = pool
         self.capture: FLACaptureData | None = None
         self.capture_bs: List[int] = []
+        # the last decode batch's slots and their device copy: steps over the same requests repeat them, so only a change is copied again
+        self._sent_slots: tuple[List[int], torch.Tensor] | None = None
 
     def forward(
         self,
@@ -192,7 +202,13 @@ class LinearAttnBackend(BaseAttnBackend):
         raise NotImplementedError("linear-attention layers run their own kernels")
 
     def prepare_metadata(self, batch: "Batch") -> None:
-        batch.fla_metadata = build_fla_metadata(batch, self.device, self.pool)
+        cache_indices = None
+        if not batch.is_prefill:
+            slots = [gdn_slot(r) for r in batch.padded_reqs]
+            if self._sent_slots is None or self._sent_slots[0] != slots:
+                self._sent_slots = (slots, _slot_indices(slots, self.device))
+            cache_indices = self._sent_slots[1]
+        batch.fla_metadata = build_fla_metadata(batch, self.device, self.pool, cache_indices)
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
         assert self.capture is None, "Capture already initialized."
