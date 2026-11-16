@@ -318,8 +318,12 @@ def measured_choice(args, argv: list[str]) -> dict:
             )
             # the launcher's own reading of the free memory: a later start compares its reading with this one
             row = {**measure(args, argv, todo), "stamp": stamp, "gpu_free_bytes": free}
-            decode_profile.store(key, row, gpu={"name": gpu_name, "uuid": gpu_uuid})
             took = f"calibration took {row['seconds']:.0f} s"
+            try:
+                decode_profile.store(key, row, gpu={"name": gpu_name, "uuid": gpu_uuid})
+            except (OSError, ValueError, TypeError) as exc:
+                # the timings are in hand: serve their choice, and the next start times again
+                logger.warning(f"--preset {PRESET}: the calibration could not be kept ({type(exc).__name__}: {exc}); the next start times again")
         else:
             took = f"read the calibration of {row.get('measured_at')}, which took {row.get('seconds')} s"
         name, lead = choose(row["tok_s"], names)

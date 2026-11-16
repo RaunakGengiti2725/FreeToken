@@ -975,6 +975,13 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     # left it (auto), so that auto still resolves it as it does for --preset single
     speeds["offload", 3] = [100.0, 200.0]
     assert third.moe_strategy == "auto" and starts(third, third_argv) == ({"speculative_num_steps": 3}, 6)
+    # the timings cannot be written (a full or read-only disk): their choice is served all the same, and the next start times again
+    free_now(_ROW_FREE)
+    fourth, fourth_argv = parsed("--memory-ratio", "0.7")
+    with monkeypatch.context() as m:
+        m.setattr(calibrate.decode_profile, "store", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left on device")))
+        assert starts(fourth, fourth_argv) == ({"speculative_num_steps": 3}, 6)
+    assert starts(fourth, fourth_argv) == ({"speculative_num_steps": 3}, 6) and starts(fourth, fourth_argv) == ({"speculative_num_steps": 3}, 0)
     monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (_ for _ in ()).throw(RuntimeError("the GPU could not be read")))
     assert starts(third, third_argv) == ({}, 0)
 
