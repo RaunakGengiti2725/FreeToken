@@ -561,6 +561,46 @@ def test_expert_activation_scales_flag_binds_w4a4_and_keeps_the_stored_input_sca
     assert torch.equal(banks.down_alpha, stored["down"].reshape(-1))
 
 
+@pytest.mark.parametrize(
+    "algo, flag, engage, tokens, a4",
+    [
+        ("W4A16_NVFP4", True, None, 2047, False),
+        ("W4A16_NVFP4", True, None, 2048, True),
+        ("W4A16_NVFP4", True, 1024, 1023, False),  # FREETOKEN_NVFP4_ACT_SCALES_MIN_TOKENS=1024
+        ("W4A16_NVFP4", True, 1024, 1024, True),
+        ("W4A16_NVFP4", True, 0, 4, True),  # 0 leaves the W4A4 kernel's own floor, as before the engage length
+        ("NVFP4", False, None, 4, True),  # a checkpoint that declares the scales has no engage length, with the flag or not
+        ("NVFP4", True, None, 4, True),
+    ],
+)
+def test_expert_activation_scales_take_w4a4_only_for_prefill_forwards_of_the_engage_length(monkeypatch, algo, flag, engage, tokens, a4):
+    """Under --moe-expert-activation-scales a prefill forward shorter than ACT_SCALES_MIN_TOKENS keeps the W4A16 GEMMs its
+    checkpoint declares (W4A4 measured slower there), and decode always does. The startup line names the same length."""
+    from freetoken.kernel import nvfp4_moe
+    from freetoken.layers.quantization import ExpertView
+    from freetoken.layers.quantization.moe import nvfp4
+    from freetoken.moe import fused_nvfp4
+
+    monkeypatch.setattr(nvfp4.W4a4Nvfp4MoEKernel, "worth_it", lambda self, cfg: True)  # sm_120 with Gluon
+    if engage is not None:
+        monkeypatch.setattr(nvfp4, "ACT_SCALES_MIN_TOKENS", engage)
+    layer = _bound_layer("auto", algo=algo, expert_activation_scales=flag)
+    method = layer.quant_method
+    assert method.kernel.name == "w4a4"
+    floor = nvfp4_moe.w4a4_min_tokens(E, TOPK)
+    assert method.kernel.a4_min_tokens(method.cfg) == (max(floor, nvfp4.ACT_SCALES_MIN_TOKENS) if algo == "W4A16_NVFP4" else floor)
+
+    calls = []
+    monkeypatch.setattr(fused_nvfp4, "fused_experts_nvfp4_w4a4", lambda *args, **kwargs: calls.append("a4"))
+    monkeypatch.setattr(fused_nvfp4, "fused_experts_nvfp4", lambda *args, **kwargs: calls.append("a16"))
+    monkeypatch.setattr(fused_nvfp4, "fused_experts_decode_nvfp4_marlin", lambda *args, **kwargs: calls.append("decode"))
+    banks = {role: torch.zeros(E, 1) for role in ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")}
+    view = ExpertView(banks, n=E, alphas=(torch.ones(E), torch.ones(E)))
+    for is_prefill in (True, False):
+        method.apply(torch.zeros(tokens, H), torch.ones(tokens, TOPK), torch.zeros(tokens, TOPK, dtype=torch.int32), view, layer=layer, is_prefill=is_prefill)
+    assert calls == ["a4" if a4 else "a16", "decode"]
+
+
 def test_w4a4_prefill_over_cache_slots_takes_the_routed_layers_scales_and_tiles(monkeypatch):
     """A demand prefill chunk's W4A4 GEMMs read cache slots, but the stream quantizes its activations under the max of
     the layer's own input scales and sizes its tiles by the layer's experts: other layers' slots carry scales this
@@ -579,7 +619,7 @@ def test_w4a4_prefill_over_cache_slots_takes_the_routed_layers_scales_and_tiles(
     banks = {role: torch.zeros(slots, 1) for role in ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")}
     view = ExpertView(banks, n=slots, alphas=slot_scales, routed=RoutedExperts(E, layer_scales))
     W4a4Nvfp4MoEKernel().apply(
-        SimpleNamespace(activation="silu", alpha=1.702, limit=7.0),
+        SimpleNamespace(activation="silu", alpha=1.702, limit=7.0, quant_method=SimpleNamespace(cfg=SimpleNamespace(expert_activation_scales=False))),
         torch.zeros(4, H), torch.ones(4, TOPK), torch.zeros(4, TOPK, dtype=torch.int32), view, is_prefill=True,
     )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -105,13 +106,16 @@ class QuantConfig(ABC):
         scheme = self.scheme_for(prefix)
         layer_kind = layer.quant_layer_kind
         kind = scheme.kind if scheme else QuantKind.NONE
-        if self.expert_activation_scales and layer_kind is LayerKind.MOE and kind is QuantKind.NVFP4:
+        flagged = self.expert_activation_scales and layer_kind is LayerKind.MOE and kind is QuantKind.NVFP4 and not scheme.has("input_scale")
+        if flagged:
             # only the kernel selection reads this scheme: the expert reader takes the stored input_scale tensors under any scheme
             scheme = nvfp4_scheme(input_scale=True)
         if layer_kind is LayerKind.EMBEDDING and kind not in methods_for(layer_kind):
             # a checkpoint that quantizes its linears stores the vocab table dense
             scheme, kind = None, QuantKind.NONE
         cfg = self.layer_config(layer, layer_kind, scheme)
+        if flagged:
+            cfg = dataclasses.replace(cfg, expert_activation_scales=True)
         if kind is QuantKind.NONE and (method := self._online_method(layer, layer_kind, prefix, cfg)) is not None:
             return method
         cls = method_class(kind, layer_kind)

@@ -3395,12 +3395,22 @@ def offload_expert_method(config: EngineConfig):
 
 
 def _log_expert_activation_scales(model) -> None:
-    """Say whether --moe-expert-activation-scales changed what serves the experts: it does only where the W4A4 kernel was bound."""
-    kernels = sorted({layer.quant_method.kernel.name for layer in iter_moe_layers(model) if getattr(layer, "quant_method", None) is not None})
-    if kernels == ["w4a4"]:
+    """Say what --moe-expert-activation-scales changed: the prefill forwards from the engage length on, and only where the
+    W4A4 kernel was bound for experts whose checkpoint declares 16-bit activations."""
+    methods = [layer.quant_method for layer in iter_moe_layers(model) if getattr(layer, "quant_method", None) is not None]
+    kernels = sorted({method.kernel.name for method in methods})
+    tokens = sorted({method.kernel.a4_min_tokens(method.cfg) for method in methods if method.cfg.expert_activation_scales} if kernels == ["w4a4"] else ())
+    if tokens:
         logger.info_rank0(
-            "--moe-expert-activation-scales: prefill runs the experts on NVFP4 activations under the checkpoint's stored "
-            "input_scale (w4a4 kernel); the output differs from the W4A16 path this checkpoint declares"
+            f"--moe-expert-activation-scales: prefill forwards of at least {' to '.join(str(t) for t in sorted({tokens[0], tokens[-1]}))} "
+            "tokens run the experts on 4-bit activations (w4a4 kernel, under the checkpoint's stored input_scale; "
+            "FREETOKEN_NVFP4_ACT_SCALES_MIN_TOKENS sets the length). Shorter prefill forwards, every decode step and the "
+            "dense layers are unchanged"
+        )
+    elif kernels == ["w4a4"]:
+        logger.warning_rank0(
+            "--moe-expert-activation-scales changes nothing here: the checkpoint declares its experts' activation scales, "
+            "and the w4a4 kernel serves them without the flag"
         )
     else:
         logger.warning_rank0(

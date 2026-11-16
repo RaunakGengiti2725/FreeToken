@@ -108,7 +108,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does, [performa
 | `--moe-prefill-demand-tokens` | 0 | Prefill: a chunk of at most this many tokens loads only the experts it routes to, through the expert cache as decode does (GPU decode only); 0 streams whole layers |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
-| `--moe-expert-activation-scales` | off | Research arm, changes the output: serve NVFP4 experts under the `input_scale` tensors the checkpoint stores for them even where its config declares W4A16, so prefill chunks of at least 4 routes per expert run the W4A4 expert kernel (sm_120). Decode keeps the W4A16 kernels. The W4A4 down kernel sums with atomics, so last bits vary from run to run; refused with `--reproducible-seeds` |
+| `--moe-expert-activation-scales` | off | Research arm, changes the output: serve NVFP4 experts under the `input_scale` tensors the checkpoint stores for them even where its config declares W4A16, so prefill forwards of at least 2048 tokens run the W4A4 expert kernel (sm_120; `FREETOKEN_NVFP4_ACT_SCALES_MIN_TOKENS` sets the length). Shorter prefill forwards and decode keep the W4A16 kernels. The W4A4 down kernel sums with atomics, so last bits vary from run to run; refused with `--reproducible-seeds` |
 
 ### Speculative decoding
 

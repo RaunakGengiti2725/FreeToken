@@ -82,6 +82,9 @@ class EnvClassSingleton:
     WARM_FIRST_REQUEST = EnvBool(True)
     # An identical resend samples the first send's stored logits and state without a forward (scheduler/full_hit.py).
     FULL_HIT = EnvBool(False)
+    # --moe-expert-activation-scales: a prefill forward of fewer tokens keeps the experts on 16-bit activations.
+    # With the flag, prefill measured 30% faster at 4,096 and 8,192 tokens and 6% slower at 1,024, 12% at 128.
+    NVFP4_ACT_SCALES_MIN_TOKENS = EnvInt(2048)
 
     def __new__(cls):
         # single instance
