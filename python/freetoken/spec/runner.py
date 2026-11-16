@@ -65,6 +65,11 @@ class _RowsSink:
         pass
 
 
+import os as _os
+
+_STEP_SYNC = bool(_os.environ.get("FREETOKEN_PREFILL_GRAPH_SYNC"))  # diagnosis only: a sync and a line around every step
+
+
 def proposer_class(config) -> type[Proposer]:
     from freetoken.models.register import _load_attr
     from freetoken.spec import DRAFT_PROPOSERS, PROPOSERS
@@ -234,6 +239,9 @@ class SpecRunner:
                 state[:, slot].zero_()
         hidden, done, logits = [], 0, None
         for kind, size in batch.prefill_plan:
+            if _STEP_SYNC:
+                torch.cuda.synchronize()
+                print(f"PREFILL_STEP begin {kind} {size} done={done}/{n} start={start}", flush=True)
             if kind == "track":
                 # the live slot holds the state at the tracked boundary: that is the snapshot an eager chunk writes
                 src = slice(slot, slot + 1)
@@ -284,6 +292,9 @@ class SpecRunner:
                         runner.linear_backend.scratch.commit(pool, [slot], [m])
                     hidden.append(self._wide_hidden[:m].clone())
             done += m
+            if _STEP_SYNC:
+                torch.cuda.synchronize()
+                print(f"PREFILL_STEP ok {kind} {size} m={m} done={done}/{n} start={start}", flush=True)
         self.proposer.prefill_sink_from(batch, torch.cat(hidden))
         return logits
 
