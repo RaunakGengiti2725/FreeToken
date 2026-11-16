@@ -76,7 +76,10 @@ PASSES = 2                # per prompt, in one server start
 # seconds a calibration may take; a candidate is started only while SLACK times the longest one so far still fits
 BUDGET_S, SLACK = 300, 1.1
 OUT_OF_TIME = f"not timed: the {BUDGET_S} s of a calibration were used"
-SETTLE_S = 3.0            # after a server that was stopped before it answered, for the driver to give its memory back
+SETTLE_S = 3.0            # the wait after a stopped server where the GPU's free memory cannot be read
+# unmeasured: after a candidate's server is gone, the longest wait for the driver to give its memory back, and how
+# much may still be missing of what was free before the candidates
+SETTLE_WAIT_S, SETTLE_MARGIN = 20.0, 64 << 20
 GRACE_S = 30.0            # a candidate's server is gone this long after the budget's end at the latest (benchdecode.run_arm)
 # unmeasured: about twice the noise of a lead between two single passes, whose tok/s had an SD of up to 3.8% (decode_profile.py); asked of a prompt's mean over its passes
 MARGIN = 0.10
@@ -269,7 +272,7 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
         # the rounding mode the real server will run (moe/offload_kernels.py reads the same variable)
         arm = f"hybrid:{(os.getenv('FREETOKEN_HYBRID_FETCH_ROUND') or 'min-wait').strip().lower()}"
     bench_argv = ["--model", args.model_path, "--seeds", str(PASSES), "--warm", str(WARM), "--decode", str(DECODE), "--streams", "1",
-                  "--no-write", "--server-timeout", str(int(ready_s)), "--", *child_flags(argv, depth, token_map)]
+                  "--no-write", "--server-timeout", str(int(ready_s)), "--settle", "0", "--", *child_flags(argv, depth, token_map)]
     try:
         ns, extra = benchdecode.parse_args(bench_argv, "ft serve --preset " + PRESET)
     except SystemExit as exc:
@@ -329,11 +332,47 @@ def _stopping_on_signals():
             signal.signal(sig, signal.SIG_DFL if handler is None else handler)
 
 
-def measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str | None]], known: dict | None = None) -> dict:
+def _await_memory(args, before: int | None, name: str, final: bool) -> None:
+    """After the server of candidate ``name`` was stopped or killed: wait until the GPU has again what was free before
+    the candidates (``before`` bytes, within SETTLE_MARGIN), SETTLE_WAIT_S at most. Memory the driver gives back late
+    leaves the next server's plan fewer expert slots, or none."""
+    if not before:
+        _sleep(SETTLE_S)
+        return
+    began = _now()
+    while True:
+        try:
+            free = _probe_gpu(args)[2]
+        except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
+            free = None
+        if not free:
+            _sleep(SETTLE_S)
+            return
+        if before - free <= SETTLE_MARGIN:
+            return
+        if _now() - began >= SETTLE_WAIT_S:
+            break
+        _sleep(1.0)
+    when = "before the server starts, outside the calibration's time" if final else "before the next candidate, inside the calibration's time"
+    logger.warning(
+        f"--preset {PRESET}: {before - free} bytes of GPU memory are still not free {SETTLE_WAIT_S:.0f} s after the server of "
+        f"{name} was stopped ({when}); going on, and the next plan may be smaller for it"
+    )
+
+
+def measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str | None]], known: dict | None = None,
+            free: int | None = None) -> dict:
     """Time ``todo`` (the static choice first) and return the row. ``known``: a stored row whose timings are kept, so
-    that only the candidates it had no time for are timed. Raises RuntimeError when the static choice cannot be timed."""
+    that only the candidates it had no time for are timed. ``free``: the GPU's free bytes before any candidate, which
+    every stopped server is waited for to give back. Raises RuntimeError when the static choice cannot be timed."""
+    stopped: list[str] = []  # the candidate whose server was stopped last and has not been waited for
     with _stopping_on_signals():
-        return _measure(args, argv, todo, known)
+        try:
+            return _measure(args, argv, todo, known, free, stopped)
+        finally:
+            # also where the static choice was cut: the server that starts next must not find the memory still held
+            if stopped and not _signalled:
+                _await_memory(args, free, stopped[0], final=True)
 
 
 def _resident(static: tuple, first: dict) -> bool:
@@ -341,7 +380,8 @@ def _resident(static: tuple, first: dict) -> bool:
     return static[1] == "fused" or (bool(first.get("total_slots")) and (first.get("cache_slots") or 0) >= first["total_slots"])
 
 
-def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str | None]], known: dict | None = None) -> dict:
+def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str | None]], known: dict | None, free: int | None,
+             stopped: list[str]) -> dict:
     t0 = _now()
     static, names = todo[0], [c[0] for c in todo]
     # failed: did not start or answer, timed again on the next start. skipped: left out for a reason that holds then too
@@ -390,10 +430,14 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
             # choice itself, and its rule already says the other depths of this strategy lose here
             skipped[name] = "the static preset serves this cache size without drafts"
             continue
-        began = _now()
-        if first is not None and began - t0 + SLACK * max(wall.values()) > BUDGET_S:
+        if first is not None and _now() - t0 + SLACK * max(wall.values()) > BUDGET_S:
             skipped[name] = OUT_OF_TIME
             continue
+        if stopped:
+            _await_memory(args, free, stopped[0], final=False)
+            del stopped[:]
+        began = _now()
+        stopped[:] = [name]
         logger.info(f"--preset {PRESET}: timing {name} ({len(tok_s) + len(failed) + len(skipped) + 1} of {len(todo)}) ...")
         try:
             # a candidate that starts at under half the static choice's speed is stopped after its first tokens
@@ -412,7 +456,6 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
                 skipped[name] = OUT_OF_TIME  # still loading when its time was up: not a server that cannot start
             else:
                 (skipped if isinstance(exc, _Slower) else failed)[name] = str(exc).splitlines()[0][:300]
-            _sleep(SETTLE_S)  # the bench waits this long only after a server that answered
             continue
         wall[name] = _now() - began
         tail = max(tail, wall[name] - float(r.get("ready_s") or 0.0))
@@ -542,7 +585,7 @@ def measured_choice(args, argv: list[str]) -> dict:
                 f"{len(PROMPTS)} prompts of {DECODE} timed tokens after {WARM} warm-up tokens, {WARM_AGAIN} from the second pass on ({reason})"
             )
             # the launcher's own reading of the free memory: a later start compares its reading with this one
-            row = {**measure(args, argv, todo, known), "stamp": stamp, "gpu_free_bytes": free}
+            row = {**measure(args, argv, todo, known, free), "stamp": stamp, "gpu_free_bytes": free}
             if any(c[3] for c in todo):
                 row["token_map"] = {"path": token_map, "sha256": map_sha}
             for again in failed_before & set(row["failed"]):

@@ -1454,6 +1454,44 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     assert starts(stuck, stuck_argv) == ({}, 1) and clock[0] - before == calibrate.BUDGET_S
     monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0))
     assert starts(stuck, stuck_argv)[1] == 2
+    # a stopped server's memory is waited for before the next start: here the driver reads 1 GiB short twice, then whole
+    short, probes, warned, naps = [0], [0], [], []
+    speeds["hybrid", 3] = [130.0, 250.0]
+
+    def probe(args):
+        probes[0] += 1
+        if probes[0] > 1 and short[0] > 0:  # the first reading is the one before any candidate
+            short[0] -= 1
+            return (*_ROW_GPU, _ROW_FREE - (1 << 30))
+        return (*_ROW_GPU, _ROW_FREE)
+
+    def nap(seconds):
+        naps.append(seconds)
+        clock[0] += seconds
+
+    def waited(ratio, shorts, *flags):
+        short[0], probes[0] = shorts, 0
+        del warned[:], naps[:]
+        before = clock[0]
+        return starts(*parsed("--memory-ratio", ratio, *flags)), clock[0] - before
+
+    monkeypatch.setattr(calibrate, "_probe_gpu", probe)
+    monkeypatch.setattr(calibrate, "_sleep", nap)
+    monkeypatch.setattr(calibrate.logger, "warning", warned.append)
+    assert waited("0.81", 2) == ((hybrid_3, 2), 202.0) and naps == [1.0, 1.0] and not warned
+    # it never comes back: 20 s after each stop the calibration goes on and says how much is missing, between two
+    # candidates inside its time and before the server that serves outside it
+    result, took = waited("0.82", 10**6)
+    assert result == (hybrid_3, 2) and took == 240.0 and len(warned) == 2
+    assert all(f"{1 << 30} bytes of GPU memory are still not free" in line for line in warned)
+    assert "inside the calibration's time" in warned[0] and "outside the calibration's time" in warned[1]
+    # a static choice that was cut is waited for too, before the static preset's own server starts
+    monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0, hung={("offload", 3)}))
+    result, took = waited("0.801", 3)
+    assert result == ({}, 1) and took == calibrate.BUDGET_S + 3.0 and naps == [1.0, 1.0, 1.0]
+    monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0))
+    monkeypatch.setattr(calibrate, "_sleep", lambda seconds: None)
+    free_now(_ROW_FREE)
     monkeypatch.setattr(calibrate, "_now", time.monotonic)
     monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (_ for _ in ()).throw(RuntimeError("the GPU could not be read")))
     assert starts(third, third_argv) == ({}, 0)
@@ -1663,6 +1701,7 @@ def test_a_signal_during_calibration_stops_the_candidates_server_and_ends_the_la
     before = signal.signal(signal.SIGHUP, signal.SIG_IGN)
     try:
         with pytest.MonkeyPatch.context() as m:
+            m.setattr(calibrate, "_sleep", lambda seconds: None)
             m.setattr(calibrate, "_time_candidate", lambda *a, **k: (signal.raise_signal(signal.SIGHUP), row)[1])
             assert set(calibrate.measure(SimpleNamespace(), [], todo)["tok_s"]) == {"offload@3", "hybrid@3"}
         assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
