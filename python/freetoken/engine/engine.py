@@ -2354,6 +2354,13 @@ class Engine:
         warmup_lens = sorted({length for length in warmup_lens if length >= 2})
         if not warmup_lens:
             return
+        # A preset's demand-loaded chunks would take these lengths: the warmup streams them all the same, so that the
+        # stream is compiled and fills the cache as without them, and then runs the demand path at a resend's length
+        # and at the first of these.
+        cache = self.moe_offload_cache
+        demand = cache.prefill_demand_tokens if cache is not None and "moe_prefill_demand_tokens" in self.config.preset_fields else 0
+        runs = [(length, 0) for length in warmup_lens]
+        runs += [(length, demand) for length in sorted({2, warmup_lens[0]}) if length <= demand]
 
         dummy_row = self.page_table[self.dummy_req.table_idx]
         dummy_slot = int(dummy_row[0].item())
@@ -2361,7 +2368,9 @@ class Engine:
         ended = torch.cuda.Event(enable_timing=True)
         started.record(self.stream)
         try:
-            for length in warmup_lens:
+            for length, demand_tokens in runs:
+                if demand:
+                    cache.prefill_demand_tokens = demand_tokens
                 dummy_row[:length] = torch.arange(
                     length, dtype=torch.int32, device=self.device
                 )
@@ -2389,6 +2398,8 @@ class Engine:
                     self.model.forward()
         finally:
             dummy_row.fill_(dummy_slot)
+            if demand:
+                cache.prefill_demand_tokens = demand
             if self.moe_offload_cache is not None:
                 if keeps:
                     # the warmup streamed every expert once and the cache kept what it had room for: the first request
@@ -2400,7 +2411,7 @@ class Engine:
         ended.record(self.stream)
         torch.cuda.synchronize(self.device)
         logger.info_rank0(
-            f"Prefill warmup complete for lengths {warmup_lens} "
+            f"Prefill warmup complete for lengths {[length for length, _ in runs]} "
             f"in {started.elapsed_time(ended) / 1000.0:.3f} s"
         )
 
