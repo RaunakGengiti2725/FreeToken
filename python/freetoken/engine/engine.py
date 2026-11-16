@@ -970,6 +970,8 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        if config.moe_expert_activation_scales:
+            _log_expert_activation_scales(self.model)
         self._load_weights(config)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
@@ -3392,6 +3394,21 @@ def offload_expert_method(config: EngineConfig):
     return offload_expert_methods(config)[0]
 
 
+def _log_expert_activation_scales(model) -> None:
+    """Say whether --moe-expert-activation-scales changed what serves the experts: it does only where the W4A4 kernel was bound."""
+    kernels = sorted({layer.quant_method.kernel.name for layer in iter_moe_layers(model) if getattr(layer, "quant_method", None) is not None})
+    if kernels == ["w4a4"]:
+        logger.info_rank0(
+            "--moe-expert-activation-scales: prefill runs the experts on NVFP4 activations under the checkpoint's stored "
+            "input_scale (w4a4 kernel); the output differs from the W4A16 path this checkpoint declares"
+        )
+    else:
+        logger.warning_rank0(
+            f"--moe-expert-activation-scales changes nothing here: the experts are served by {', '.join(kernels) or 'no quantized kernel'} "
+            "(the w4a4 kernel takes NVFP4 experts on sm_120)"
+        )
+
+
 def _check_reproducible_seeds(config: EngineConfig, is_moe: bool) -> None:
     """Refuse the settings under which a seeded request's logits follow what the server did before it.
 
@@ -3414,6 +3431,11 @@ def _check_reproducible_seeds(config: EngineConfig, is_moe: bool) -> None:
             "--reproducible-seeds needs every expert computed on the GPU (--moe-strategy offload or fused, without "
             "--moe-cpu-layers): hybrid computes on the CPU the experts that are not resident, which follows earlier "
             "requests, and the CPU kernels round differently from the GPU's"
+        )
+    if is_moe and getattr(config, "moe_expert_activation_scales", False):
+        raise ValueError(
+            "--reproducible-seeds does not work with --moe-expert-activation-scales: the W4A4 expert kernel adds its "
+            "routes with atomics, so the last bits of a prefill change from run to run"
         )
 
 
@@ -3777,6 +3799,8 @@ def _adjust_config(config: EngineConfig):
         resolved.insert(0, f"moe_strategy={config.moe_strategy!r}")
     if getattr(config, "reproducible_seeds", False):
         resolved.append("reproducible_seeds=True")
+    if is_moe and getattr(config, "moe_expert_activation_scales", False):
+        resolved.append("moe_expert_activation_scales=True")
     logger.info_rank0(f"Resolved config: {', '.join(resolved)}")
     if parsed is not None:
         _serve_as_timed(config, parsed, calibrated)

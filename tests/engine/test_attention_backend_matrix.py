@@ -496,6 +496,8 @@ def test_dflash_keeps_the_windowed_refusal():
         ({"max_running_req": 1, "moe_strategy": "hybrid"}, True, "on the GPU"),
         ({"max_running_req": 1, "moe_strategy": "cpu"}, True, "on the GPU"),
         ({"max_running_req": 1, "moe_cpu_layers": "4"}, True, "on the GPU"),
+        ({"max_running_req": 1, "moe_expert_activation_scales": True}, True, "atomics"),
+        ({"max_running_req": 1, "moe_expert_activation_scales": True}, False, None),  # a dense model has no expert kernel
         ({"max_running_req": 1, "moe_strategy": "hybrid"}, False, None),  # a dense model has no experts to place
     ],
 )

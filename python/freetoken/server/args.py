@@ -1157,6 +1157,22 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-expert-activation-scales",
+        action="store_true",
+        dest="moe_expert_activation_scales",
+        default=ServerArgs.moe_expert_activation_scales,
+        help=(
+            "Research arm, changes the output text. Serve NVFP4 experts under the static activation scales "
+            "(input_scale) the checkpoint stores for them even where its quantization config declares 16-bit "
+            "activations (W4A16). On sm_120 a prefill chunk with at least 4 routes per expert on average (128 tokens "
+            "for 8 of 256 experts) then runs the W4A4 expert kernel; shorter chunks and every decode step keep the "
+            "W4A16 kernels. The reference runtime serves such a checkpoint as W4A16, and the W4A4 down kernel adds "
+            "its routes with atomics, so the last bits of a prefill can differ from run to run. Refused with "
+            "--reproducible-seeds."
+        ),
+    )
+
+    parser.add_argument(
         "--speculative-algorithm",
         "--spec-algo",
         type=str,
