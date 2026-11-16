@@ -880,6 +880,51 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     assert starts(third, third_argv) == ({}, 0)
 
 
+def test_a_signal_during_calibration_stops_the_candidates_server_and_ends_the_launcher():
+    import signal
+    import subprocess
+
+    from freetoken.moe import benchdecode, calibrate
+
+    servers, outer = [], []
+
+    def time_candidate(args, argv, strategy, depth, floors=None):
+        # as benchdecode.run_arm runs a candidate: a session of its own, which a signal to the launcher does not reach
+        proc = subprocess.Popen(["sleep", "600"], start_new_session=True)
+        servers.append(proc)
+        try:
+            signal.raise_signal(sig)
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            signal.raise_signal(sig)  # a second one must not cut the stop short
+            benchdecode.stop_server(proc)
+        return {"tok_s": [[100.0, 100.0], [200.0, 200.0]], "drafts": 300, "early": [100.0, 200.0], "cache_slots": 40, "total_slots": 80,
+                "slot_bytes": 1 << 20, "gpu_free_bytes": _ROW_FREE, "ready_s": 1.0}
+
+    def theirs(signum, frame):
+        outer.append(signum)
+
+    todo = [("offload@3", "offload", 3), ("hybrid@3", "hybrid", 3)]
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        del servers[:]
+        before = signal.signal(sig, theirs)  # what the launcher had: it is back afterwards, and pytest outlives a launcher without the fix
+        try:
+            with pytest.MonkeyPatch.context() as m:
+                m.setattr(calibrate, "_time_candidate", time_candidate)
+                with pytest.raises(SystemExit) as stopped:
+                    calibrate.measure(SimpleNamespace(), [], todo)
+            assert stopped.value.code == 128 + sig
+            assert len(servers) == 1 and servers[0].poll() is not None  # the candidate is gone, and the next one was not started
+            assert signal.getsignal(sig) is theirs and not outer
+        finally:
+            signal.signal(sig, before)
+            for proc in servers:
+                if proc.poll() is None:
+                    proc.kill()
+
+
 def test_auto_does_not_take_a_row_whose_hybrid_cache_is_below_the_models_floor(decode_rows):
     # the fake model has 8 experts a layer: a row edited to 4 slots would cap the cache under the floor and fail the start
     _file_row(decode_rows, _HYBRID_FASTER, slots=4)

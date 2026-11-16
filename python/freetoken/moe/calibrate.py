@@ -16,11 +16,14 @@ runs and one log line says why. The servers are started and timed by `ft bench d
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -157,8 +160,40 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
     }
 
 
+@contextlib.contextmanager
+def _stopping_on_signals():
+    """While candidates are timed, SIGTERM, SIGHUP and SIGINT end the launcher with exit code 128 + the signal.
+
+    A candidate's server runs in a session of its own, so a signal to the launcher does not reach it, and the default
+    action would end the launcher with the server still holding the GPU. The exit raised here passes through the
+    bench's ``finally``, which stops that server's process group. The handlers found are put back afterwards."""
+    if threading.current_thread() is not threading.main_thread():
+        yield  # handlers can only be set from the main thread
+        return
+    seen: list[int] = []
+
+    def stop(signum, _frame):
+        if seen:
+            return  # a second signal must not cut short the stop of the candidate's server
+        seen.append(signum)
+        logger.info(f"--preset {PRESET}: {signal.Signals(signum).name} during the calibration, stopping")
+        raise SystemExit(128 + signum)
+
+    found = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    try:
+        yield
+    finally:
+        for sig, handler in found.items():
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+
+
 def measure(args, argv: list[str], todo: list[tuple[str, str, int | None]]) -> dict:
     """Time ``todo`` (the static choice first) and return the row. Raises RuntimeError when the static choice cannot be timed."""
+    with _stopping_on_signals():
+        return _measure(args, argv, todo)
+
+
+def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None]]) -> dict:
     t0 = time.monotonic()
     tok_s, failed = {}, {}
     first = None
