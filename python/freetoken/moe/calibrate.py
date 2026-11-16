@@ -255,12 +255,14 @@ def _memory_objection(row: dict, free: int | None, memory_ratio: float) -> str |
     return None
 
 
-def _overrides(args, strategy: str, depth: int | None) -> dict:
-    """The fields of ``args`` that make it run the candidate."""
+def _overrides(args, strategy: str, depth: int | None, static: bool = False) -> dict:
+    """The fields of ``args`` that make it run the candidate. The ``static`` choice leaves the strategy as the
+    command line did: --moe-strategy auto then resolves as it does for --preset single (a filed decode row, a
+    unified-memory GPU), which an explicit offload would bypass."""
     from freetoken.moe import is_offload_moe_strategy
 
     out: dict = {}
-    if "moe_strategy" in args.preset_fields:
+    if "moe_strategy" in args.preset_fields and not static:
         out["moe_strategy"] = strategy
         sized = args.moe_cache_size or args.moe_cache_auto or args.moe_cache_mem is not None or args.moe_cache_rate
         if is_offload_moe_strategy(strategy) and not sized:
@@ -318,5 +320,7 @@ def measured_choice(args, argv: list[str]) -> dict:
         why = f"its smallest lead over {names[0]} across the prompts and passes is {lead:+.1%}"
     else:
         why = f"no candidate leads it by more than {MARGIN:.0%} on every prompt and pass"
+        if "moe_strategy" in args.preset_fields:
+            why += f"; --moe-strategy stays {args.moe_strategy}"
     logger.info(f"--preset {PRESET}: {took}; mean tok/s on {'/'.join(PROMPTS)}: {timed}; taking {name}: {why}")
-    return _overrides(args, strategy, depth)
+    return _overrides(args, strategy, depth, static=name == names[0])

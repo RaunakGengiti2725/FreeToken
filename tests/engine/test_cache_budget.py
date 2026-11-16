@@ -874,8 +874,10 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     del speeds["offload", 3]
     third, third_argv = parsed("--memory-ratio", "0.8")
     assert starts(third, third_argv) == ({}, 1)
-    speeds["offload", 3] = [100.0, 200.0]   # hybrid with 3 drafts is now the slower one: the static choice, measured
-    assert starts(third, third_argv) == ({**hybrid_3, "moe_strategy": "offload"}, 6)
+    # hybrid with 3 drafts is now the slower one: the static choice, measured. The strategy stays as the command line
+    # left it (auto), so that auto still resolves it as it does for --preset single
+    speeds["offload", 3] = [100.0, 200.0]
+    assert third.moe_strategy == "auto" and starts(third, third_argv) == ({"speculative_num_steps": 3}, 6)
     monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (_ for _ in ()).throw(RuntimeError("the GPU could not be read")))
     assert starts(third, third_argv) == ({}, 0)
 
