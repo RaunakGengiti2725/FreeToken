@@ -251,6 +251,24 @@ def _preset_kv_target(config) -> int:
     return max(min(config.kv_reserve_tokens, config.max_seq_len), EngineConfig.kv_reserve_tokens)
 
 
+def _prefill_working_bytes(config, tokens: int) -> tuple[int, int] | None:
+    """cache_budget.prefill_working_bytes for a prefill of ``tokens`` tokens on ``config``'s model, or None where the
+    temporaries of its prefill are not accounted for there (a model without GatedDeltaNet layers)."""
+    from freetoken.engine.cache_budget import prefill_working_bytes
+
+    model = config.model_config
+    group = model.linear_attention_group()
+    if group is None or group.variant != "gdn" or group.key_head_dim != group.value_head_dim:
+        return None
+    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+    return prefill_working_bytes(
+        tokens, hidden=model.hidden_size, key_dim=group.num_key_heads * group.key_head_dim,
+        value_dim=group.num_value_heads * group.value_head_dim, value_heads=group.num_value_heads,
+        head_dim=group.value_head_dim, chunk=CHUNK_SIZE, itemsize=config.dtype.itemsize,
+    )
+
+
 def _adjust_preset_spec_config(config, override, windowed_kv: bool) -> None:
     """Speculative decoding a preset turned on: kept where an explicit start's checks pass and the draft's source is
     on disk to be checked, dropped with one log line elsewhere."""
@@ -609,6 +627,7 @@ class Engine:
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
+        self._settle_preset_memory_ratio(config)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -640,7 +659,7 @@ class Engine:
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
-        available_memory -= state_pool_bytes(config)
+        available_memory -= state_pool_bytes(config) + self._preset_prefill_reserve(config)
         if self.spec is not None:
             # the pool solves pages from its own cost; hand it the share its pages get next to the draft's
             spec_fixed, draft_page = self._spec_budget(config)
@@ -865,7 +884,8 @@ class Engine:
             raise ValueError(
                 f"{exc}; budget = {config.memory_ratio} x {mem_GB(self._baseline_free)} free - {mem_GB(self._weights_bytes)} "
                 f"weights - {mem_GB(kv_fixed)} fixed KV - {mem_GB(state_pool_bytes(config))} linear state - "
-                f"{mem_GB(self._spec_budget(config)[0])} speculative buffers; "
+                f"{mem_GB(self._spec_budget(config)[0])} speculative buffers"
+                + (f" - {mem_GB(reserve)} prefill working memory; " if (reserve := self._preset_prefill_reserve(config)) else "; ") +
                 f"{budget_advice(self._budget_stages(config, banks, method, max_slots), min_reserve)}; "
                 "docs/performance/decode.md (Getting more slots) lists what each flag costs"
             ) from exc
@@ -877,7 +897,7 @@ class Engine:
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         spec_fixed, draft_page = self._spec_budget(config)
-        fixed_cache_size += spec_fixed
+        fixed_cache_size += spec_fixed + self._preset_prefill_reserve(config)
         cache_per_page += draft_page
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
@@ -923,6 +943,27 @@ class Engine:
         if config.memory_ratio < 0.95:
             stage("--memory-ratio 0.95", memory_ratio=0.95)
         return stages
+
+    def _settle_preset_memory_ratio(self, config: EngineConfig) -> None:
+        """A preset's memory ratio stands only where the working memory of a prefill is known, so that the caches can leave
+        it free (_preset_prefill_reserve): for any other model the default ratio is back, with one log line."""
+        if "memory_ratio" not in config.preset_fields or _prefill_working_bytes(config, config.max_forward_len) is not None:
+            return
+        logger.info_rank0(
+            f"--preset {config.preset}: the memory ratio stays {EngineConfig.memory_ratio}, not {config.memory_ratio}: "
+            "the working memory of this model's prefill is not known, and the default headroom is what it has run in"
+        )
+        object.__setattr__(config, "memory_ratio", EngineConfig.memory_ratio)
+        _drop_preset_fields(config, "memory_ratio")
+
+    def _preset_prefill_reserve(self, config: EngineConfig) -> int:
+        """GPU bytes the caches leave free under a preset's memory ratio, on top of its headroom: the working memory of
+        one prefill chunk of the longest length (--max-prefill-length). The ratio's headroom alone is smaller than that
+        on a 16 GB card, and a prompt it does not hold ends the server with a CUDA out-of-memory error."""
+        if "memory_ratio" not in getattr(config, "preset_fields", ()):  # duck-typed test configs omit it
+            return 0
+        need = _prefill_working_bytes(config, config.max_forward_len)
+        return need[0] if need is not None else 0
 
     def _settle_preset_kv_reserve(self, config: EngineConfig, banks, method, max_slots) -> None:
         """A preset's KV reserve is at most the model's context, and stays only while the plan keeps the expert slots
@@ -985,6 +1026,10 @@ class Engine:
             steps.append((label, ("speculative_algorithm", "spec_slot_states")))
         if "kv_reserve_tokens" in filled:
             steps.append((f"--kv-reserve-tokens {config.kv_reserve_tokens}", ("kv_reserve_tokens",)))
+        if reserve := self._preset_prefill_reserve(config):
+            # the reserve is on wherever the staged config says the ratio is the preset's: right after the ratio's own step
+            at = next(i for i, (_, names) in enumerate(steps) if names == ("memory_ratio",)) + 1
+            steps.insert(at, (f"{mem_GB(reserve)} left free for a prefill chunk of {config.max_forward_len} tokens", ("preset_fields",)))
         staged = copy.copy(config)
         for _, names in steps:
             for name in names:
@@ -1014,6 +1059,8 @@ class Engine:
             total = config.model_config.num_moe_layers * config.model_config.num_experts
             parts.append(f"{config.moe_cache_size} of {total} expert slots ({config.moe_strategy})")
         parts.append(f"{num_tokens} KV tokens")
+        if reserve := self._preset_prefill_reserve(config):
+            parts.append(f"{mem_GB(reserve)} left free for a prefill chunk of {config.max_forward_len} tokens")
         parts.append(f"{config.max_running_req} running request" + ("s" if config.max_running_req != 1 else ""))
         if config.speculative_algorithm is not None:
             parts.append(f"{config.speculative_algorithm} speculative decoding with {config.speculative_num_steps} draft tokens")
@@ -1541,12 +1588,13 @@ class Engine:
             else (self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
         )
         spec_fixed, draft_page = self._spec_budget(config)
+        prefill_reserve = self._preset_prefill_reserve(config)
         self.kv_cache.validate_rebuild(
             config, num_pages=num_pages,
             num_swa_pages=num_swa_pages, target_moe=target_moe,
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
-            extra_fixed_bytes=(state_pool_bytes(config, target_mamba) if target_mamba is not None else 0) + spec_fixed,
+            extra_fixed_bytes=(state_pool_bytes(config, target_mamba) if target_mamba is not None else 0) + spec_fixed + prefill_reserve,
             extra_page_bytes=draft_page,
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""

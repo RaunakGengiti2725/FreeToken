@@ -177,6 +177,38 @@ def test_preset_kv_reserve_is_the_largest_that_keeps_the_expert_slots_of_a_serve
         assert slots >= plain > resolve_moe_cache_auto(**terms(0.95, gain, got + 16))[0]  # one page more is under the plain plan
 
 
+@pytest.mark.parametrize("free", [8, 12, 16])
+def test_preset_plan_leaves_a_prefill_chunk_of_working_memory_free_and_the_plain_plan_alone(free):
+    from freetoken.engine.cache_budget import prefill_working_bytes, required_bytes
+
+    # Qwen3.6-35B-A3B in bf16: hidden 2048, 16 key and 32 value heads of 128, the chunk kernel's 64-token chunks
+    shapes = dict(hidden=2048, key_dim=2048, value_dim=4096, value_heads=32, head_dim=128, chunk=64, itemsize=2)
+    need, largest = prefill_working_bytes(8192, **shapes)
+    # 116 KB of temporaries a token and 1 MiB of state per kernel chunk: 0.46 GiB free did not hold 3785 tokens, 1.20 GiB held 8192
+    assert (need, largest) == (8192 * 118_784 + 128 * 2**20, 8192 * 24_576)
+    assert 0.46 * 2**30 < prefill_working_bytes(3785, **shapes)[0] and need < 1.20 * 2**30
+    slot, weights = 1_780_000, int(4.44 * 2**30)
+
+    def terms(ratio, gain_slots, reserve):
+        return dict(
+            baseline_free=free << 30, weights_bytes=weights - gain_slots * slot, memory_ratio=ratio, cache_per_page=16 * 20_000,
+            fixed_cache_size=reserve, per_expert_bytes=slot, num_experts=256, total_experts=10240, prefill_overlap=True,
+            kv_reserve_tokens=8192, page_size=16,
+        )
+
+    def left_free(plan, t):
+        return t["baseline_free"] - t["weights_bytes"] - required_bytes(plan[0], plan[1], slot, t["cache_per_page"])
+
+    plain, preset = terms(0.9, 0, 0), terms(0.95, 575, need)
+    assert resolve_moe_cache_auto(**plain) == resolve_moe_cache_auto(**{**plain, "fixed_cache_size": 0})  # no reserve without the preset
+    plan = resolve_moe_cache_auto(**preset)
+    # the ratio's own headroom and the whole chunk on top of it; without the reserve the same ratio leaves less than the chunk needs
+    assert left_free(plan, preset) >= need + int(0.05 * (free << 30))
+    unreserved = terms(0.95, 575, 0)
+    assert left_free(resolve_moe_cache_auto(**unreserved), unreserved) < need
+    assert plan[0] >= resolve_moe_cache_auto(**plain)[0]  # host embeddings and one request pay for the reserve
+
+
 def test_prefill_overlap_false_is_honored():
     # Even when the cache could fit 2*num_experts, an explicit False stays False.
     size, pages, overlap = plan_cache_budget(
@@ -482,6 +514,26 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     assert stages[-1][1] == engine._auto_cache_terms(config, StubBanks())
     assert stages[0][1]["kv_reserve_tokens"] == stages[1][1]["kv_reserve_tokens"] == default
     assert stages[0][1]["fixed_cache_size"] > stages[1][1]["fixed_cache_size"]  # the linear states of 4 requests, then of 1
+    # a preset's memory ratio comes with the working memory of one prefill chunk left free, as a step of its own in the account;
+    # a typed ratio gets no reserve, and a model whose prefill is not accounted for keeps the default ratio
+    from freetoken.engine.cache_budget import prefill_working_bytes
+
+    config.dtype, config.max_forward_len, config.model_config.hidden_size, config.memory_ratio = torch.bfloat16, 256, 64, 0.95
+    need = prefill_working_bytes(256, hidden=64, key_dim=32, value_dim=64, value_heads=4, head_dim=16, chunk=64, itemsize=2)[0]
+    typed = engine._auto_cache_terms(config, StubBanks())
+    assert engine._preset_prefill_reserve(config) == 0
+    config.preset_fields = ("max_running_req", "memory_ratio", "kv_reserve_tokens")
+    assert engine._preset_prefill_reserve(config) == need > 0
+    assert engine._auto_cache_terms(config, StubBanks()) == {**typed, "fixed_cache_size": typed["fixed_cache_size"] + need}
+    stages = engine._preset_stages(config, StubBanks(), None, None)
+    assert [label.split(" left free")[0] for label, _ in stages[2:4]] == ["--memory-ratio 0.95", f"{need / 2**30:.2f} GiB"]
+    assert stages[3][1]["fixed_cache_size"] - stages[2][1]["fixed_cache_size"] == need and stages[0][1]["memory_ratio"] == 0.9
+    assert stages[-1][1] == engine._auto_cache_terms(config, StubBanks())
+    engine._settle_preset_memory_ratio(config)
+    assert config.memory_ratio == 0.95
+    config.model_config.linear_attention_group = lambda: None
+    engine._settle_preset_memory_ratio(config)
+    assert config.memory_ratio == 0.9 and "memory_ratio" not in config.preset_fields and engine._preset_prefill_reserve(config) == 0
 
 
 # ---------------------------------------------------------------------------

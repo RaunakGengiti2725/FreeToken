@@ -53,6 +53,29 @@ def net_cache_budget_bytes(
     return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
 
 
+def prefill_working_bytes(
+    tokens: int, *, hidden: int, key_dim: int, value_dim: int, value_heads: int, head_dim: int, chunk: int, itemsize: int
+) -> tuple[int, int]:
+    """GPU bytes the temporaries of a prefill of ``tokens`` tokens hold at their peak, and the largest one of them.
+
+    The peak of a model with GatedDeltaNet layers is in one of those, where the chunk kernel allocates its output
+    (layers/linear_attn/gdn.py, kernel/fla/chunk.py): every term below is a tensor alive there, in elements per token.
+    """
+    conv = 2 * key_dim + value_dim
+    per_token = (
+        4 * hidden  # the layer's input and residual, and the normed input and summed residual made from them
+        + conv + value_dim  # in_proj: q, k, v before the conv, and the output gate z
+        + conv  # the conv's output
+        + conv  # q, k, v copied out of it head by head
+        + 2 * key_dim  # q and k l2-normalised
+        + value_heads * chunk  # A, the solved chunk-local matrix
+        + value_heads * head_dim + value_dim  # w and u
+        + 2 * value_dim  # v_new and the output o
+    )
+    states = div_ceil(tokens, chunk) * value_heads * head_dim * head_dim  # h: the recurrent state entering each kernel chunk
+    return (tokens * per_token + states) * itemsize, tokens * (conv + value_dim) * itemsize
+
+
 def required_bytes(
     moe_cache_size: int, num_pages: int, per_expert_bytes: int, cache_per_page: int
 ) -> int:

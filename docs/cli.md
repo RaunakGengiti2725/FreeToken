@@ -132,7 +132,12 @@ an explicit `--speculative-algorithm mtp` would be refused), host embeddings whe
 to the LM head, and the KV reserve where the expert cache's minimum does not fit beside it (the
 warning names the largest `--kv-reserve-tokens` that does). The KV reserve is never more than the
 model's context, and it is lowered, to the default at the least, where it would leave fewer expert
-slots than a server without the preset plans. The startup log lists what the preset set,
+slots than a server without the preset plans. The preset's memory ratio comes with the working memory
+of one prefill chunk of `--max-prefill-length` tokens left free on top of its headroom (1.03 GiB for
+8192 tokens on Qwen3.6-35B-A3B, counted from the GatedDeltaNet layer's tensor shapes): `--memory-ratio
+0.95` alone leaves less than that on a 16 GB card, and a long prompt then ends the server with a CUDA
+out-of-memory error. For a model without GatedDeltaNet layers the preset keeps the default ratio. A
+typed `--memory-ratio` gets no such reserve. The startup log lists what the preset set,
 what each setting did to the `--moe-cache-auto` plan, and the resulting expert slots and KV tokens.
 
 `--preset single` measures nothing: it serves with `offload` (or what `--moe-strategy auto` takes
