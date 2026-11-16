@@ -138,6 +138,40 @@ def test_prefill_chunk_ends_on_a_page_boundary():
     assert adder.try_add_one(pending).extend_len == 40
 
 
+def test_a_final_chunk_commits_the_snapshot_of_the_chunk_before_it():
+    """A prompt longer than one chunk whose last chunk crosses no boundary: the snapshot the chunk before wrote is
+    committed with the final chunk, so the same prompt sent again has a prefix to reuse."""
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    pool = _pool()
+    pt = torch.zeros(4, 512, dtype=torch.int32)
+    cm = CacheManager(512, 1, pt, "hybrid_radix", linear_state_pool=pool)
+    pm = PrefillManager(cm, TableManager(max_running_reqs=3, page_table=pt), DecodeManager(page_size=1))
+    prompt = torch.arange(1, 131, dtype=torch.int32)  # 128 tokens in the first chunk, 2 in the last
+    pm.pending_list = [PendingReq(0, prompt, SamplingParams(max_tokens=1))]
+
+    first = pm.schedule_next_batch(128).reqs[0]
+    assert isinstance(first, ChunkedReq) and first.extend_len == 128
+    cm.allocate_paged([first])
+    # what the chunk's forward does (attention/linear.py: _build_track_metadata): a snapshot at the deepest boundary
+    # strictly inside the chunk, written to the ping-pong slot it then flips away from
+    frozen = first.mamba_ping_pong[first.mamba_next_track_idx]
+    first.mamba_last_track_seqlen, first.mamba_next_track_idx = 64, 1 - first.mamba_next_track_idx
+    first.complete_one()
+
+    last = pm.schedule_next_batch(128).reqs[0]
+    assert not isinstance(last, ChunkedReq) and last.extend_len == 2
+    cm.allocate_paged([last])
+    last.complete_one()
+    cm.cache_req(last, finished=False)
+
+    again = cm.match_req(_pend(prompt.tolist()))
+    assert again.cuda_handle.cached_len == 64 and again.mamba_value == frozen
+
+
 def test_naive_cache_does_not_align_prefill_chunks():
     """The alignment hook is hybrid-only; every other cache keeps the raw budget chunk."""
     from freetoken.scheduler.prefill import PrefillAdder

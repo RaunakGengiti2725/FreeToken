@@ -351,6 +351,10 @@ class OffloadMoeCache:
         self._prefill_slot_snapshot: torch.Tensor | None = None
         self._prefill_snapshot_np = None
         self._prefill_hit_d2d_active = False
+        # every expert of every layer has a slot outside the staging buffers: begin_prefill sees it in its snapshot.
+        # Nothing evicts from then on (decode and prefill only hit), so it holds until the cache is reset or rebuilt,
+        # and a prefill reads the slots as decode does, with no staging, gather or host sync.
+        self.all_resident = False
         # A chunk with fewer routes than a layer has experts cannot route to all of them: its hit gather waits
         # for the layer's routes (wait_prefill_layer) and copies only the routed residents.
         # _prefill_gather_pending[b]: whether buffer b's waiting gather takes every bank.
@@ -749,6 +753,7 @@ class OffloadMoeCache:
         self._alloc_banks()
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).
         self.slot_for_id.fill_(-1)
+        self.all_resident = False
         self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
         self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
         self._slice_pools()
@@ -935,7 +940,7 @@ class OffloadMoeCache:
 
     def begin_prefill(self, num_routes: int | None = None) -> None:
         """Start a prefill chunk; ``num_routes`` is its tokens times the routes of each."""
-        if not self.prefill_overlap:
+        if not self.prefill_overlap or self.all_resident:
             return
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
@@ -972,6 +977,19 @@ class OffloadMoeCache:
                 for base, size, stable in zip(self.pool_bases, self.pool_sizes, self._pool_stable_from)
             ]
             self._prefill_streamed = [None, None]
+            self.all_resident = self._snapshot_all_resident(ids)
+
+    def _snapshot_all_resident(self, ids) -> bool:
+        """Whether begin_prefill's snapshot has every expert in a slot and none in a staging buffer (GPU decode only: hybrid and CPU layers leave experts off the device by design)."""
+        if not self.keeps_streamed_experts or self.cpu_layer_ids or self._unpinned_layers:
+            return False
+        if (self._prefill_snapshot_np < 0).any():
+            return False
+        return all((ids[base : base + stable] < 0).all() for base, stable in zip(self.pool_bases, self._pool_stable_from))
+
+    def resident_slots(self, layer_id: int, topk_ids: torch.Tensor) -> torch.Tensor:
+        """``topk_ids`` as slot ids of ``layer_id``'s pool; only while ``all_resident``."""
+        return self.slot_for_id[layer_id][topk_ids.long()]
 
     def prefetch_prefill_layer(self, layer_id: int) -> None:
         if not self.prefill_overlap or layer_id >= self.num_layers:
@@ -1315,6 +1333,7 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import reset_cache
 
         reset_cache(self)
+        self.all_resident = False
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)

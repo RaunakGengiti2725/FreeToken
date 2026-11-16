@@ -371,14 +371,19 @@ class OffloadMoELayer(MoELayer):
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Prefill movement. A chunk within ``prefill_demand_tokens`` loads its routed experts
-        into the slot cache as decode does and runs the same grouped GEMM over the slots. A
-        longer one streams whole layers -- double-buffered behind the previous layer's GEMMs
-        when ``prefill_overlap`` is on, else a synchronous ``materialize_layer`` -- where
-        position == expert id, so the routing ids pass through unmapped."""
+        into the slot cache as decode does and runs the same grouped GEMM over the slots; so does
+        any chunk once every expert is resident, with nothing to load. Otherwise a chunk streams
+        whole layers -- double-buffered behind the previous layer's GEMMs when ``prefill_overlap``
+        is on, else a synchronous ``materialize_layer`` -- where position == expert id, so the
+        routing ids pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
-        if cache.loads_prefill_on_demand(hidden_states.shape[0]):
-            slots = cache.load_prefill_experts(self.layer_id, topk_ids)
+        demand = cache.loads_prefill_on_demand(hidden_states.shape[0])
+        if self.layer_id == 0 and not demand:
+            cache.begin_prefill(num_routes=topk_ids.numel())
+        if cache.all_resident or demand:
+            # every expert has a slot (the host knows it from a prefill's snapshot): the slots are read as they are
+            slots = cache.resident_slots(self.layer_id, topk_ids) if cache.all_resident else cache.load_prefill_experts(self.layer_id, topk_ids)
             return self._expert_gemm(
                 cache,
                 hidden_states,
@@ -425,8 +430,6 @@ class OffloadMoELayer(MoELayer):
         bank registration order; buffer position == expert id, so routing ids pass
         through unmapped). The caller runs ``release_prefill_layer`` after its GEMMs.
         """
-        if self.layer_id == 0:
-            cache.begin_prefill(num_routes=topk_ids.numel())
         cache.prefetch_prefill_layer(self.layer_id)
         cache.prefetch_prefill_layer(self.layer_id + 1)
         return cache.wait_prefill_layer(self.layer_id, topk_ids)
