@@ -878,13 +878,11 @@ class Engine:
 
         # ======================= Graph capture initialization ========================
         self.graph_runner = self._make_graph_runner(config.cuda_graph_bs, init_free_memory, aligned_max_seq_len)
-        backend = config.attention_backend.split(",")[0]
-        # the warmup addresses K/V through the page table row alone, which these backends do too
-        keeps = backend in ("triton", "fi", "fa", "trtllm") and self.moe_offload_cache is not None and self.moe_offload_cache.warm_prefill_keeps()
-        if backend == "triton" or keeps:
-            # Prefill runs on the first comma part; warm its autotune cache. With a cache that keeps what a prefill
-            # streams, the warmup also loads the experts.
-            self._warmup_prefill(autotune=backend == "triton", keeps=keeps)
+        # without an expert cache every MoE layer holds its experts as weights ('fused')
+        resident = self.moe_offload_cache is None and next(iter_moe_layers(self.model), None) is not None
+        warm = _prefill_warmup_args(config.attention_backend.split(",")[0], self.moe_offload_cache, resident)
+        if warm is not None:
+            self._warmup_prefill(**warm)
         if self.graph_runner.rows_per_req > 1:
             # the warmup is what makes every expert resident, which the prefill graphs of an offloaded MoE are captured
             # on: the sizes the first pass had to leave are captured now
@@ -2419,6 +2417,19 @@ class Engine:
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
+
+
+def _prefill_warmup_args(backend: str, cache, resident_experts: bool) -> Dict[str, bool] | None:
+    """Arguments of the startup warmup prefill for the prefill attention ``backend`` (the first comma part), or None
+    where none runs. Triton gets it for its autotune cache. With an expert cache that keeps what a prefill streams it
+    also loads the experts. Experts that are resident weights have nothing to load, but the decode graph capture does
+    not reach their prefill kernels, and the first request would pay that setup."""
+    # the warmup addresses K/V through the page table row alone, which these backends do too
+    by_row = backend in ("triton", "fi", "fa", "trtllm")
+    keeps = by_row and cache is not None and cache.warm_prefill_keeps()
+    if backend == "triton" or keeps or (by_row and resident_experts):
+        return dict(autotune=backend == "triton", keeps=keeps)
+    return None
 
 
 def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
