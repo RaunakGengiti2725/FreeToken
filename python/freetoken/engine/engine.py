@@ -1260,10 +1260,20 @@ class Engine:
                 terms = self._auto_cache_terms(config, banks, method, max_slots)
         self._preset_reserve_kept = kept = reserve_kept(terms)
         if kept < need:
+            longest = self._prefill_tokens_within(config, kept)
+            if longest > 0:
+                risk = (
+                    f"a prompt longer than {longest} tokens can end the server with a CUDA out-of-memory error. "
+                    f"--max-prefill-length {longest} or less keeps a chunk inside it"
+                )
+            else:
+                risk = (
+                    "no prefill chunk fits in that, so a prompt of any length can end the server with a CUDA out-of-memory "
+                    "error. Both caches are at their minimum: only more free GPU memory helps"
+                )
             logger.warning_rank0(
                 f"--preset {config.preset}: the plan leaves {mem_GB(kept)} free for a prefill, and a chunk of {chunk} tokens works in "
-                f"about {mem_GB(need)}: a prompt longer than {self._prefill_tokens_within(config, kept)} tokens can end the server "
-                "with a CUDA out-of-memory error. Lower --max-prefill-length to that, or free GPU memory"
+                f"about {mem_GB(need)}: {risk}"
             )
 
     def _preset_left_free(self, config: EngineConfig) -> str:

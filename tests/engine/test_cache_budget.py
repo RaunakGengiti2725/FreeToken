@@ -614,7 +614,10 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     assert reserve == 9216 and need // 2 <= kept < need // 2 + page_bytes and len(warned) == 1
     longest = int(warned[0].split("a prompt longer than ")[1].split(" tokens")[0])
     assert prefill_working_bytes(longest, **shapes) <= kept < prefill_working_bytes(longest + 1, **shapes) and 0 < longest < 8192
-    assert " of the " in engine._preset_left_free(config)
+    assert " of the " in engine._preset_left_free(config) and f"--max-prefill-length {longest} or less" in warned[0]
+    # nothing kept at all: the advice is not a chunk length of 0
+    reserve, kept, warned = settled(576, 0)
+    assert reserve == 9216 and kept < prefill_working_bytes(1, **shapes) and "no prefill chunk fits" in warned[0] and "length 0" not in warned[0]
     # a typed --kv-reserve-tokens is not the preset's to lower: the chunk is shorted and the warning says so
     reserve, kept, warned = settled(1024, need // 2, preset=("max_running_req", "memory_ratio"))
     assert reserve == 16384 and kept < need and len(warned) == 1
