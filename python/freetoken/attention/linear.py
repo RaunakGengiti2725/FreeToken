@@ -215,4 +215,22 @@ class LinearAttnBackend(BaseAttnBackend):
         self.capture.cache_indices[:bs].copy_(metadata.cache_indices)
 
 
-__all__ = ["FLACaptureData", "FLAMetadata", "LinearAttnBackend", "build_fla_metadata"]
+class WideVerifyLinearBackend(LinearAttnBackend):
+    """A second capture, for verify steps of one request with another row count: the rows park in a scratch of their own."""
+
+    def __init__(self, device: torch.device, pool: LinearStatePool, rows_per_req: int) -> None:
+        from freetoken.kvcache.linear_state_pool import LinearVerifyScratch
+
+        super().__init__(device, pool)
+        self.scratch = LinearVerifyScratch(pool, 1, rows_per_req)
+
+    def prepare_metadata(self, batch: "Batch") -> None:
+        super().prepare_metadata(batch)
+        batch.fla_metadata.verify_scratch = self.scratch
+
+    def prepare_for_capture(self, batch: "Batch") -> None:
+        super().prepare_for_capture(batch)
+        batch.fla_metadata.verify_scratch = self.scratch
+
+
+__all__ = ["FLACaptureData", "FLAMetadata", "LinearAttnBackend", "WideVerifyLinearBackend", "build_fla_metadata"]

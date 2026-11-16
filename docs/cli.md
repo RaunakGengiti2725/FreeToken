@@ -100,6 +100,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does, [performa
 | `--moe-locked-max-fetch` | 8 | Most experts a locked layer fetches per step; sizes the staging (that many rows of the widest expert, per bank) |
 | `--moe-collect-stats` | off | Log decode MoE stats with each decode log line: hit rate, and per layer-step the misses, experts fetched and experts computed on CPU, for pinned, locked and CPU-only layers |
 | `--prefill-graph-tokens` | 0 | Prefill: with speculative decoding, a chunk of at most this many tokens on a cached prefix runs as captured verify steps instead of an eager forward; 0 = always eager |
+| `--prefill-graph-rows` | 0 | Prefill: rows of a wider verify step captured for `--prefill-graph-tokens` chunks longer than a decode step; 0 = only the decode step's rows |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 

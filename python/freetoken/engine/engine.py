@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
-from freetoken.attention.linear import LinearAttnBackend, gdn_slot
+from freetoken.attention.linear import LinearAttnBackend, WideVerifyLinearBackend, gdn_slot
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
@@ -1418,6 +1418,9 @@ class Engine:
         if self.linear_backend is not None:
             self.linear_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
+        if self.prefill_runner is not None:
+            self.prefill_runner.destroy_cuda_graphs()
+            self.prefill_runner = None
         if self.spec is not None:
             # the draft KV is keyed by the target's slots, so it can stay only when the target KV pool does
             self.spec.detach(keep_kv=num_pages is None and num_swa_pages is None)
@@ -1486,7 +1489,43 @@ class Engine:
         )
         if self.spec is not None:
             self.spec.capture_graphs(runner.graph_bs_list, runner.graph_pool)
+        self.prefill_runner = self._make_prefill_runner(runner, free_memory, max_seq_len) if rows > 1 else None
         return runner
+
+    def _make_prefill_runner(self, target: GraphRunner, free_memory: int, max_seq_len: int) -> GraphRunner | None:
+        """A verify graph of --prefill-graph-rows rows of one request, for short prefill chunks longer than a decode
+        step (SpecRunner.prefill_as_verify). The attention and linear captures are tied to one row count, so it has
+        its own of each, its own verify scratch and its own padding request; None when it is not asked for or cannot
+        be captured, and the chunks then take the decode step's graph."""
+        config, rows, pool = self.config, self.config.prefill_graph_rows, self.linear_state_pool
+        if config.prefill_graph_tokens <= 0 or rows <= target.rows_per_req or 1 not in target.graph_map:
+            return None
+        if not self.spec.can_prefill_as_verify or (pool is not None and pool._verify_handlers):
+            return None
+        try:
+            dummy = Req(
+                input_ids=torch.zeros(rows, dtype=torch.int32, device="cpu"),
+                table_idx=self.dummy_req.table_idx, cached_len=0, output_len=1, uid=-1,
+                sampling_params=None, cache_handle=None,  # type: ignore[arg-type]
+            )
+            dummy.linear_slot_idx = self.dummy_req.linear_slot_idx
+            attn = create_attention_backend(config.attention_backend, config.model_config)
+            linear = WideVerifyLinearBackend(self.device, pool, rows) if pool is not None else None
+            sink = self.spec.prefill_rows_sink(rows)
+
+            def hook(batch: Batch) -> None:
+                batch.features = sink
+
+            return GraphRunner(
+                stream=self.stream, device=self.device, forward=self.model.forward, attn_backend=attn,
+                cuda_graph_bs=[1], cuda_graph_max_bs=1, free_memory=free_memory, max_seq_len=max_seq_len,
+                dummy_req=dummy, moe_offload_cache=self.moe_offload_cache, mrope=config.model_config.model_is_mrope,
+                rows_per_req=rows, phase="verify", ctx_override={"attn_backend": attn}, batch_hook=hook,
+                pool=target.graph_pool, out_dtype=torch.float32, linear_backend=linear,
+            )
+        except Exception as exc:  # noqa: BLE001 -- an optional graph: any failure leaves the decode step's graph in use
+            logger.warning_rank0(f"--prefill-graph-rows {rows}: the wider verify graph was not captured ({type(exc).__name__}: {exc}); short prefill chunks use the decode step's graph")
+            return None
 
     def _prepare_verify_batch(self, batch: Batch) -> None:
         batch.features = self.spec.feature_sink(batch)
@@ -1530,7 +1569,8 @@ class Engine:
             return False
         if not self.spec.can_prefill_as_verify:
             return False
-        req, rows = batch.reqs[0], runner.rows_per_req
+        req = batch.reqs[0]
+        rows = self.spec.prefill_step_rows(req.extend_len)
         steps = -(-req.extend_len // rows)
         fla = batch.fla_metadata
         return (

@@ -50,6 +50,21 @@ def _mrope_rows(reqs) -> torch.Tensor:
     return torch.cat(cols, dim=1)
 
 
+class _RowsSink:
+    """Copies a verify forward's final hidden rows into a buffer the runner owns, so a captured graph writes it too."""
+
+    wanted_layers = frozenset()
+
+    def __init__(self, buffer: torch.Tensor) -> None:
+        self.buffer = buffer
+
+    def final_hidden(self, x: torch.Tensor) -> None:
+        self.buffer[: x.shape[0]].copy_(x)
+
+    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
+        pass
+
+
 def proposer_class(config) -> type[Proposer]:
     from freetoken.models.register import _load_attr
     from freetoken.spec import DRAFT_PROPOSERS, PROPOSERS
@@ -132,6 +147,17 @@ class SpecRunner:
     def can_prefill_as_verify(self) -> bool:
         return type(self.proposer).adopt_verify_rows is not Proposer.adopt_verify_rows
 
+    def prefill_rows_sink(self, rows: int) -> _RowsSink:
+        """The sink of the wider verify graph: its rows' final hidden, in a buffer shaped like the proposer's."""
+        like = self.proposer.adopt_verify_rows(1)
+        self._wide_hidden = torch.zeros(rows, like.shape[1], dtype=like.dtype, device=like.device)
+        return _RowsSink(self._wide_hidden)
+
+    def prefill_step_rows(self, n: int) -> int:
+        """Rows of the verify step a prefill chunk of ``n`` tokens runs in: the decode step's, or the wider graph's when the chunk is longer than one decode step."""
+        wide = self.engine.prefill_runner
+        return wide.rows_per_req if wide is not None and n > self.k + 1 else self.k + 1
+
     def prefill_as_verify(self, batch: Batch) -> torch.Tensor:
         """Run a short prefill chunk of one request as verify steps and return its last token's logits, ``[1, vocab]``.
 
@@ -146,8 +172,11 @@ class SpecRunner:
         from freetoken.attention.linear import gdn_slot
         from freetoken.core import Batch as _Batch
 
-        engine, req, width = self.engine, batch.reqs[0], self.k + 1
+        engine, req = self.engine, batch.reqs[0]
         start, n = req.cached_len, req.extend_len
+        width = self.prefill_step_rows(n)
+        wide = engine.prefill_runner if width != self.k + 1 else None
+        runner = wide or engine.graph_runner
         pad_loc = engine.page_table[engine.dummy_req.table_idx, 0]
         pool = engine.linear_state_pool
         hidden = []
@@ -158,7 +187,7 @@ class SpecRunner:
                 req.mrope_delta, req.mrope_positions_full,
             )
             step = _Batch(reqs=[rows], phase="verify", rows_per_req=width)
-            engine.graph_runner.pad_batch(step)
+            runner.pad_batch(step)
             ids, out_loc = batch.input_ids[done : done + m], batch.out_loc[done : done + m]
             if m < width:
                 ids = torch.cat([ids, ids[-1:].expand(width - m)])
@@ -173,14 +202,21 @@ class SpecRunner:
             step.positions = torch.cat(positions).to(self.device, non_blocking=True)
             if engine.config.model_config.model_is_mrope:
                 step.mrope_positions = _mrope_rows(step.padded_reqs).to(self.device, non_blocking=True)
-            if engine.linear_backend is not None:
-                engine.linear_backend.prepare_metadata(step)
-            engine.attn_backend.prepare_metadata(step)
-            step.features = self.feature_sink(step)
-            logits = engine.forward_logits(step)
-            if pool is not None and pool.verify_scratch is not None:
-                pool.commit_verify([gdn_slot(req)], [m])
-            hidden.append(self.proposer.adopt_verify_rows(m))
+            if runner.linear_backend is not None:
+                runner.linear_backend.prepare_metadata(step)
+            runner.attn_backend.prepare_metadata(step)
+            if wide is None:
+                step.features = self.feature_sink(step)
+                logits = engine.forward_logits(step)
+                if pool is not None and pool.verify_scratch is not None:
+                    pool.commit_verify([gdn_slot(req)], [m])
+                hidden.append(self.proposer.adopt_verify_rows(m))
+            else:
+                with engine.ctx.forward_batch(step, **wide.ctx_override), engine.model.forward_host_ctx(step, True):
+                    logits = wide.replay(step)
+                if wide.linear_backend is not None:
+                    wide.linear_backend.scratch.commit(pool, [gdn_slot(req)], [m])
+                hidden.append(self._wide_hidden[:m].clone())
         self.proposer.prefill_sink_from(batch, torch.cat(hidden))
         return logits[m - 1 : m]
 
