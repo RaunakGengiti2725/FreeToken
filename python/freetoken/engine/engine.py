@@ -246,6 +246,11 @@ def _drop_preset_fields(config, *names: str) -> None:
     object.__setattr__(config, "preset_fields", tuple(name for name in config.preset_fields if name not in names))
 
 
+def _preset_kv_target(config) -> int:
+    """The KV reserve a preset asks for, at most the model's context (no request holds more) and at least the default reserve."""
+    return max(min(config.kv_reserve_tokens, config.max_seq_len), EngineConfig.kv_reserve_tokens)
+
+
 def _adjust_preset_spec_config(config, override, windowed_kv: bool) -> None:
     """Speculative decoding a preset turned on: kept where an explicit start's checks pass and the draft's source is
     on disk to be checked, dropped with one log line elsewhere."""
@@ -920,16 +925,36 @@ class Engine:
         return stages
 
     def _settle_preset_kv_reserve(self, config: EngineConfig, banks, method, max_slots) -> None:
-        """A preset's KV reserve stays where the expert cache's minimum fits beside it. Elsewhere the default reserve
-        comes back, with one warning that names the largest reserve that fits."""
-        from freetoken.engine.cache_budget import plan_kv_target
+        """A preset's KV reserve is at most the model's context, and stays only while the plan keeps the expert slots
+        of a server without the preset: where it would not, the reserve is the largest that does, the default reserve
+        at the least, with one log line. Where a server without the preset has no plan at all, the reserve stays where
+        the expert cache's minimum fits beside it, and elsewhere the default comes back with one warning."""
+        from freetoken.engine.cache_budget import _plan_or_short, plan_kv_reserve, plan_kv_target
 
-        target, default = config.kv_reserve_tokens, EngineConfig.kv_reserve_tokens
+        asked, default = config.kv_reserve_tokens, EngineConfig.kv_reserve_tokens
+        target = _preset_kv_target(config)
+        plain, _ = _plan_or_short(self._preset_stages(config, banks, method, max_slots)[0][1])
         object.__setattr__(config, "kv_reserve_tokens", default)
         terms = self._auto_cache_terms(config, banks, method, max_slots)
+        if plain is not None:
+            reserve, plan = plan_kv_reserve(terms, target, plain[0])
+            object.__setattr__(config, "kv_reserve_tokens", reserve)
+            if reserve <= default:
+                _drop_preset_fields(config, "kv_reserve_tokens")
+            what = f"--preset {config.preset}: the KV reserve is {reserve} tokens, not {asked}" + (f", at {plan[0]} expert slots" if plan is not None else "")
+            if reserve < target:
+                logger.warning_rank0(
+                    f"{what}: a larger one leaves fewer expert slots than the {plain[0]} a server without the preset plans. "
+                    "A longer prompt and answer end with finish_reason length"
+                )
+            elif reserve < asked:
+                logger.info_rank0(f"{what}: the model's context is {config.max_seq_len} tokens")
+            return
         plan, kept, most = plan_kv_target(terms, target)
         if plan is not None:
             object.__setattr__(config, "kv_reserve_tokens", target)
+            if target < asked:
+                logger.info_rank0(f"--preset {config.preset}: the KV reserve is {target} tokens, not {asked}: the model's context is {config.max_seq_len} tokens")
             return
         _drop_preset_fields(config, "kv_reserve_tokens")
         if kept is None:
@@ -995,10 +1020,10 @@ class Engine:
         else:
             parts.append("no speculative decoding")
         line = f"--preset {config.preset} plan: " + ", ".join(parts)
-        if "kv_reserve_tokens" in config.preset_fields and num_tokens < config.kv_reserve_tokens:
+        if "kv_reserve_tokens" in config.preset_fields and num_tokens < _preset_kv_target(config):
             # only where the expert cache was not sized by --moe-cache-auto, which keeps the reserve
             logger.warning_rank0(
-                f"{line}; fewer KV tokens than the default max output tokens and a prompt ({config.kv_reserve_tokens}): "
+                f"{line}; fewer KV tokens than the default max output tokens and a prompt ({_preset_kv_target(config)}): "
                 "a longer prompt and answer end with finish_reason length"
             )
         else:

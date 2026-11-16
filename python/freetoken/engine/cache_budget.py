@@ -179,6 +179,37 @@ def plan_kv_target(terms: dict, target_tokens: int) -> tuple[tuple[int, int, boo
     return None, kept, (most, at_most[0])
 
 
+def plan_kv_reserve(terms: dict, target_tokens: int, min_slots: int) -> tuple[int, tuple[int, int, bool] | None]:
+    """The largest KV reserve, from that of ``terms`` up to ``target_tokens``, whose plan has ``min_slots`` expert slots or more:
+    (the reserve, its plan).
+
+    Where no reserve in that range has, the reserve of ``terms`` comes back with its own plan (None where its minimum is over
+    the budget). A larger reserve never plans more slots, so the search is a bisection over whole pages.
+    """
+    page, low = terms["page_size"], terms["kv_reserve_tokens"]
+
+    def plan(tokens: int) -> tuple[int, int, bool] | None:
+        return _plan_or_short({**terms, "kv_reserve_tokens": tokens})[0]
+
+    def enough(tokens: int) -> bool:
+        at = plan(tokens)
+        return at is not None and at[0] >= min_slots
+
+    high = max(target_tokens, low)
+    if enough(high) or not enough(low):
+        tokens = high if enough(high) else low
+        return tokens, plan(tokens)
+    fits, over = div_ceil(low, page), div_ceil(high, page)
+    while over - fits > 1:
+        mid = (fits + over) // 2
+        if enough(mid * page):
+            fits = mid
+        else:
+            over = mid
+    tokens = max(fits * page, low)
+    return tokens, plan(tokens)
+
+
 def plan_changes(stages: list[tuple[str, dict]]) -> list[str]:
     """What each stage after the first did to the --moe-cache-auto plan, e.g. ``--memory-ratio 0.95: +140 expert slots``.
 

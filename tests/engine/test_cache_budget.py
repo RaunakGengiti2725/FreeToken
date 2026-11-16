@@ -142,6 +142,41 @@ def test_kv_target_is_planned_only_where_the_slot_floor_fits_beside_it():
     assert plan_changes([("", terms(900)), ("less memory", terms(500))])[0].startswith("less memory: the minimum plan is ")
 
 
+@pytest.mark.parametrize(
+    "kv_token, gain, free, plain, reserve, slots",
+    [
+        # 20 KB of KV a token; one request and host embeddings give back more than the MTP head takes (+170 slots): the target stays
+        (20_000, 170, 8, 1572, 36864, 1661),
+        (20_000, 170, 16, 5916, 36864, 6246),
+        # tied embeddings stay on the GPU (-405 slots): under the plain plan already, so the default reserve
+        (20_000, -405, 8, 1572, 8192, 1409),
+        (20_000, -405, 16, 5916, 15104, 5916),
+        # 100 KB of KV a token, +575 slots: the target costs more slots than the preset gave, or does not fit at all
+        (100_000, 575, 12, 3376, 24864, 3376),
+        (100_000, 575, 8, 1204, 22720, 1204),
+        (100_000, 575, 24, 9891, 31312, 9891),
+    ],
+)
+def test_preset_kv_reserve_is_the_largest_that_keeps_the_expert_slots_of_a_server_without_the_preset(kv_token, gain, free, plain, reserve, slots):
+    from freetoken.engine.cache_budget import plan_kv_reserve
+
+    slot, weights = 1_780_000, int(4.44 * 2**30)  # docs/performance/decode.md: Qwen3.6-35B-A3B NVFP4 slots; 5589 default slots at 15.4 GiB free
+
+    def terms(ratio, gain_slots, tokens=8192):
+        return dict(
+            baseline_free=free << 30, weights_bytes=weights - gain_slots * slot, memory_ratio=ratio, cache_per_page=16 * kv_token,
+            fixed_cache_size=0, per_expert_bytes=slot, num_experts=256, total_experts=10240, prefill_overlap=True,
+            kv_reserve_tokens=tokens, page_size=16,
+        )
+
+    assert resolve_moe_cache_auto(**terms(0.9, 0))[0] == plain
+    preset = terms(0.95, gain)
+    got, plan = plan_kv_reserve(preset, 36864, plain)
+    assert (got, plan[0]) == (reserve, slots) and plan == resolve_moe_cache_auto(**terms(0.95, gain, got))
+    if 8192 < got < 36864:
+        assert slots >= plain > resolve_moe_cache_auto(**terms(0.95, gain, got + 16))[0]  # one page more is under the plain plan
+
+
 def test_prefill_overlap_false_is_honored():
     # Even when the cache could fit 2*num_experts, an explicit False stays False.
     size, pages, overlap = plan_cache_budget(
@@ -423,13 +458,23 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     from freetoken.engine.config import EngineConfig
 
     default = EngineConfig.kv_reserve_tokens
-    for free, kept in ((200 << 20, 16384), (70 << 20, default)):
-        engine._baseline_free, engine._weights_bytes = free, 0
+    for free, context, kept in ((200 << 20, 1 << 20, 16384), (200 << 20, 12288, 12288), (200 << 20, 4096, default), (70 << 20, 1 << 20, None)):
+        engine._baseline_free, engine._weights_bytes, config.max_seq_len = free, 0, context
         config.preset, config.preset_fields, config.kv_reserve_tokens = "single", ("max_running_req", "kv_reserve_tokens"), 16384
+        plain = resolve_moe_cache_auto(**engine._preset_stages(config, StubBanks(), None, None)[0][1])  # a server without the preset
         engine._settle_preset_kv_reserve(config, StubBanks(), None, None)
-        assert config.kv_reserve_tokens == kept
-        assert ("kv_reserve_tokens" in config.preset_fields) == (kept != default)
-        assert engine._resolve_auto_moe_cache_size(config, StubBanks())[1] * 16 >= kept
+        size, pages, _ = engine._resolve_auto_moe_cache_size(config, StubBanks())
+        if kept is None:
+            # 16384 tokens do not fit in 70 MiB: the largest reserve that keeps the slots of a server without the preset
+            assert default < config.kv_reserve_tokens < 16384 and size >= plain[0]
+            config.kv_reserve_tokens += 16
+            with pytest.raises(ValueError, match="budget too small"):
+                engine._resolve_auto_moe_cache_size(config, StubBanks())
+            config.kv_reserve_tokens -= 16
+        else:
+            assert config.kv_reserve_tokens == kept  # never more than the model's context, never less than the default
+        assert ("kv_reserve_tokens" in config.preset_fields) == (config.kv_reserve_tokens != default)
+        assert pages * 16 >= config.kv_reserve_tokens
     # the planner's account starts from the plan without the preset's fields and ends at the plan that runs
     config.preset_fields, config.kv_reserve_tokens = ("max_running_req", "kv_reserve_tokens"), 16384
     stages = engine._preset_stages(config, StubBanks(), None, None)
