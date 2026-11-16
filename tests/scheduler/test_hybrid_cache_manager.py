@@ -172,6 +172,35 @@ def test_a_final_chunk_commits_the_snapshot_of_the_chunk_before_it():
     assert again.cuda_handle.cached_len == 64 and again.mamba_value == frozen
 
 
+def test_turn_anchor_is_where_the_next_turn_parts_from_the_prompt():
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.utils.hf import load_turn_anchor_tails
+
+    class Tok:
+        """One id a character; the generation prompt ends with a tag only when thinking is off, and a rendered reply drops it."""
+
+        def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True, enable_thinking=True):
+            return "".join(f"<{m['role'][0]}>{m['content']}" for m in msgs) + "<a>" + ("" if enable_thinking else "TT")
+
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+    tails = load_turn_anchor_tails(Tok())
+    assert tails == ((ord("T"), ord("T")),)  # with thinking on the generation prompt survives whole: no tail
+
+    pt = torch.zeros(4, 64, dtype=torch.int32)
+    prompt = torch.tensor([1, 2, 3, 4, ord("T"), ord("T")], dtype=torch.int32)
+    for lookahead in (False, True):
+        cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=_pool(), radix_lookahead=lookahead)
+        pm = PrefillManager(cm, TableManager(max_running_reqs=3, page_table=pt), DecodeManager(page_size=1))
+        pm.turn_anchor_tails = tails
+        # a node's last key holds the token after it under lookahead, so the anchor stops one token earlier
+        assert pm._turn_anchor(prompt) == (3 if lookahead else 4)
+        assert pm._turn_anchor(prompt[:4]) is None
+
+
 def test_naive_cache_does_not_align_prefill_chunks():
     """The alignment hook is hybrid-only; every other cache keeps the raw budget chunk."""
     from freetoken.scheduler.prefill import PrefillAdder
