@@ -217,6 +217,54 @@ def test_a_seeded_draw_is_keyed_by_the_token_position_not_by_the_step():
         assert keys([other, req(5)], "prefill") is None
 
 
+def test_a_seeded_request_draws_the_same_tokens_whatever_the_server_drew_before(monkeypatch):
+    """Positions 5..10 of a seeded request on servers whose shared stream stands elsewhere, in decode steps, in verify steps of 4 and of 6 rows, and beside another request. The kernels are a stand-in that reads seed and offset as both backends do (one seed a call; the shared stream without one), so this checks which draws the sampler asks for; the CUDA test below checks the kernels."""
+    from types import SimpleNamespace
+
+    from freetoken.core import Batch, Req, SamplingParams
+    from freetoken.engine import sample
+
+    def sampling_from_probs(probs, seed=None, offset=None):
+        generator = None if seed is None else torch.Generator().manual_seed(seed + offset)
+        uniforms = torch.rand(probs.shape[0], 1, generator=generator)
+        return torch.searchsorted(probs.cumsum(-1), uniforms).squeeze(1).clamp_(max=probs.shape[1] - 1)
+
+    kernels = SimpleNamespace(
+        softmax=lambda logits, temperatures, enable_pdl=False: torch.softmax(logits / temperatures.unsqueeze(1), dim=-1),
+        sampling_from_probs=sampling_from_probs,
+    )
+    monkeypatch.setattr(sample, "sampling_module", lambda: kernels)
+    monkeypatch.setattr(sample, "is_sm90_supported", lambda: False)
+    vocab = 64
+    sampler = _sampler(torch.device("cpu"), vocab)
+    table = torch.randn(16, vocab, generator=torch.Generator().manual_seed(3))
+
+    def req(device_len, seed=None):
+        return Req(input_ids=torch.zeros(device_len, dtype=torch.int32), table_idx=0, cached_len=device_len - 1, output_len=64,
+                   uid=0, sampling_params=SamplingParams(temperature=1.0, seed=seed), cache_handle=None)
+
+    def lifetime(history, width, seed=7, neighbor=False):
+        """The request's tokens at positions 5..10 on a server whose shared stream starts at ``history``, ``width`` rows a step (1: decode steps)."""
+        torch.manual_seed(history)
+        tokens = []
+        for start in range(5, 11, width):
+            reqs = [req(3), req(start, seed)] if neighbor else [req(start, seed)]
+            logits = torch.cat([table[r.device_len : r.device_len + width] for r in reqs])
+            batch = Batch(reqs=reqs, phase="decode") if width == 1 else Batch(reqs=reqs, phase="verify", rows_per_req=width)
+            # a decode step goes through sample_verify with no drafts: Sampler.sample opens an NVTX range, which a CPU build of torch lacks
+            out = sampler.sample_verify(logits, sampler.prepare(batch), torch.zeros(len(reqs), width - 1, dtype=torch.int64))
+            tokens += out[-width:].tolist()
+        return tokens[:6]
+
+    first = lifetime(0, 1)
+    assert lifetime(1, 1) == first
+    assert lifetime(2, 4) == first
+    assert lifetime(3, 6, neighbor=True) == first
+    assert lifetime(0, 1, seed=8) != first
+    # without a seed the same request follows the shared stream, as it does today
+    assert lifetime(0, 1, seed=None) != lifetime(1, 1, seed=None)
+
+
 @cuda
 @pytest.mark.parametrize("params", [{}, {"top_k": 8, "top_p": 0.9}, {"min_p": 0.05}])
 def test_a_seeded_request_draws_the_same_token_at_a_position_in_any_step(params):

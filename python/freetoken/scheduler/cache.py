@@ -32,7 +32,8 @@ _SWA_RETAIN_GAP = 16
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: bool = False):
+                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: bool = False,
+                 reproducible_seeds: bool = False):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -65,6 +66,7 @@ class CacheManager:
         # radix_lookahead keys position i by (t_i, t_{i+1}), so a hit also matches the token after it and a draft whose KV slot i depends on t_{i+1} (MTP) never reuses a slot written for a different next token
         assert not (radix_lookahead and self.is_swa), "the SWA radix cache keeps token keys"
         self.radix_lookahead = radix_lookahead
+        self.reproducible_seeds = reproducible_seeds
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -99,9 +101,18 @@ class CacheManager:
             return SWARadixCache(device, page_size, self.sliding_window_size)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
+    def skips_prefix_cache(self, req: PendingReq | Req) -> bool:
+        """--reproducible-seeds: a request with a seed matches nothing and commits nothing.
+
+        A reused prefix carries the floats of the request that wrote it (a restored GDN state, KV from another chunking),
+        so the logits after a hit differ from a cold prefill's and the text would depend on what the server has cached."""
+        return self.reproducible_seeds and req.sampling_params.seed is not None
+
     def match_req(self, req: PendingReq, max_len: int | None = None) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
+        if self.skips_prefix_cache(req):
+            max_len = 0
         limit = input_len - 1 if max_len is None else max(0, min(input_len - 1, max_len))
         ids = self._keys(req.input_ids, limit)
         if self.is_swa:
@@ -290,6 +301,8 @@ class CacheManager:
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
+        if self.skips_prefix_cache(req):
+            return self._release_uncommitted(req, finished=finished)
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
         if self.is_hybrid:
@@ -334,6 +347,23 @@ class CacheManager:
                     canonical[old_handle.cached_len : cached_len])
             req.cache_handle = new_handle
             self.lock(new_handle)
+
+    def _release_uncommitted(self, req: Req, *, finished: bool) -> None:
+        """cache_req for a request that stays out of the prefix cache: it keeps its own pages until it finishes, then frees them all.
+
+        An insert would also re-point the request's rows at the pages an earlier request left in the tree."""
+        if not finished:
+            # hybrid: the frozen snapshot stays in the request's ping-pong slot instead of being donated
+            req.mamba_last_track_seqlen = None
+            return
+        handle = req.cache_handle
+        self.unlock(handle)
+        tail = self._padded_tail(req, handle.cached_len)
+        if self.swa_paged:
+            self._free_swa(tail)
+        self._free(tail)
+        if self.is_hybrid:
+            self._free_req_slots(req)
 
     def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.

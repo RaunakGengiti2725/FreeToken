@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from freetoken.core import Context, Req, SamplingParams, get_global_ctx, set_global_ctx
@@ -209,4 +210,78 @@ def test_swa_unfinished_commit_keeps_its_pages_under_a_locked_tombstone():
         with cm.lazy_free_region():
             cm.cache_req(r, finished=True)
     assert cm.free_slots.numel() == torch.unique(cm.free_slots).numel(), "pages freed twice"
+    cm.check_integrity()
+
+
+@pytest.mark.parametrize("cache_type", ["radix", "hybrid_radix", "swa_radix"])
+def test_reproducible_seeds_keeps_a_seeded_request_out_of_the_prefix_cache(cache_type):
+    """Under --reproducible-seeds a request with a seed starts cold on a prompt whose prefix is cached, its commit
+    leaves its row on its own pages and the tree as it was, and its finish returns every page and slot it took.
+    Without the flag, and for a request without a seed, the prefix is reused as before."""
+    long = list(range(1, 25))
+    shared = long[:16]
+    pool = None
+    if cache_type == "swa_radix":
+        cm, page_table, _ = _swa_cache_manager(window=64)
+    else:
+        if cache_type == "hybrid_radix":
+            g = LinearGatedDeltaGroupConfig(
+                name="linear", layer_ids=(0,), num_key_heads=2, num_value_heads=4,
+                key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate=True,
+            )
+            pool = LinearStatePool(group=g, num_slots=16, dtype=torch.bfloat16, device=torch.device("cpu"), tp_size=1)
+        page_table = torch.zeros(4, 32, dtype=torch.int32)
+        cm = CacheManager(64, 1, page_table, cache_type, linear_state_pool=pool)
+
+    def pend(ids, seed=None):
+        t = torch.tensor(ids, dtype=torch.int32)
+        return SimpleNamespace(input_ids=t, input_len=len(ids), sampling_params=SamplingParams(seed=seed))
+
+    def admit(table_idx, ids, seed=None):
+        p = pend(ids, seed)
+        handle = cm.match_req(p).cuda_handle
+        req = Req(input_ids=p.input_ids, table_idx=table_idx, cached_len=handle.cached_len, output_len=0,
+                  uid=table_idx, sampling_params=p.sampling_params, cache_handle=handle)
+        cm.lock(handle)
+        if handle.cached_len:
+            page_table[table_idx, : handle.cached_len] = handle.get_matched_indices()[: handle.cached_len]
+        cm.allocate_paged([req])
+        req.cached_len = len(ids)
+        if pool is not None:
+            req.linear_slot_idx = pool.alloc(1)[0]
+            req.mamba_ping_pong = tuple(pool.alloc(2))
+            req.mamba_next_track_idx = 1
+            req.mamba_last_track_seqlen = len(ids)
+        return req
+
+    def commit(req, finished):
+        with cm.lazy_free_region():
+            cm.cache_req(req, finished=finished)
+
+    def reusable():
+        return cm.match_req(pend(long)).cuda_handle.cached_len
+
+    commit(admit(0, shared), finished=True)
+    assert reusable() == len(shared)
+    assert cm.match_req(pend(long, seed=7)).cuda_handle.cached_len == len(shared)
+
+    cm.reproducible_seeds = True
+    free_pages = cm.free_slots.numel()
+    free_states = pool.num_free_slots if pool is not None else None
+    cold = cm.match_req(pend(long, seed=7))
+    assert cold.cuda_handle.cached_len == 0 and cold.mamba_value is None
+    req = admit(1, long, seed=7)
+    own = page_table[1, : len(long)].tolist()
+    assert len(set(own)) == len(long)
+
+    commit(req, finished=False)
+    assert page_table[1, : len(long)].tolist() == own
+    assert set(own).isdisjoint(cm.free_slots.tolist())
+    assert reusable() == len(shared)
+
+    commit(req, finished=True)
+    assert reusable() == len(shared)
+    assert cm.free_slots.numel() == free_pages
+    assert pool is None or pool.num_free_slots == free_states
+    assert cm.free_slots.numel() == torch.unique(cm.free_slots).numel()
     cm.check_integrity()

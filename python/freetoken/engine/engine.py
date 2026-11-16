@@ -2587,6 +2587,31 @@ def offload_expert_method(config: EngineConfig):
     return offload_expert_methods(config)[0]
 
 
+def _check_reproducible_seeds(config: EngineConfig, is_moe: bool) -> None:
+    """Refuse the settings under which a seeded request's logits follow what the server did before it.
+
+    --reproducible-seeds says the text follows from the flags and the request alone, so a setting this cannot hold for
+    stops the start instead of serving text that only sometimes repeats."""
+    if not config.reproducible_seeds:
+        return
+    if config.max_running_req != 1:
+        raise ValueError(
+            f"--reproducible-seeds needs --max-running-requests 1 (got {config.max_running_req}): the logits of a step "
+            "change in the last bit with the rows the step holds, so a seeded request has to run alone"
+        )
+    if config.speculative_algorithm == "dflash":
+        raise ValueError(
+            "--reproducible-seeds does not work with --speculative-algorithm dflash: its sampled drafts and their "
+            "accept test draw from the stream every request shares; use mtp or no speculative decoding"
+        )
+    if is_moe and _decode_target(config) != "gpu":
+        raise ValueError(
+            "--reproducible-seeds needs every expert computed on the GPU (--moe-strategy offload or fused, without "
+            "--moe-cpu-layers): hybrid computes on the CPU the experts that are not resident, which follows earlier "
+            "requests, and the CPU kernels round differently from the GPU's"
+        )
+
+
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
@@ -2913,6 +2938,8 @@ def _adjust_config(config: EngineConfig):
                 "out of bounds; extend the rope with --hf-overrides (YaRN rope_parameters) instead."
             )
 
+    _check_reproducible_seeds(config, is_moe)
+
     # The startup ServerArgs dump is the *requested* config, printed in the frontend process
     # before any of the resolution above ran -- so "moe_strategy='auto'" is all it can say. This
     # is the one line that reports what actually runs, for every path (explicit backends never
@@ -2924,4 +2951,6 @@ def _adjust_config(config: EngineConfig):
     ]
     if is_moe:
         resolved.insert(0, f"moe_strategy={config.moe_strategy!r}")
+    if config.reproducible_seeds:
+        resolved.append("reproducible_seeds=True")
     logger.info_rank0(f"Resolved config: {', '.join(resolved)}")

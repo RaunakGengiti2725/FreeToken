@@ -484,3 +484,45 @@ def test_dflash_keeps_the_windowed_refusal():
     # dflash's own adjust_config demands a draft checkpoint before the window gate, so its
     # refusal is pinned on the predicate engine.py:221 consults
     assert SpecRunner.target_may_be_windowed(_config("swa", speculative_algorithm="dflash")) is False
+
+
+@pytest.mark.parametrize(
+    "overrides, is_moe, refused",
+    [
+        ({"max_running_req": 1}, True, None),
+        ({"max_running_req": 1, "moe_strategy": "fused", "speculative_algorithm": "mtp"}, True, None),
+        ({}, False, "--max-running-requests 1"),  # the default of 4
+        ({"max_running_req": 1, "speculative_algorithm": "dflash"}, False, "dflash"),
+        ({"max_running_req": 1, "moe_strategy": "hybrid"}, True, "on the GPU"),
+        ({"max_running_req": 1, "moe_strategy": "cpu"}, True, "on the GPU"),
+        ({"max_running_req": 1, "moe_cpu_layers": "4"}, True, "on the GPU"),
+        ({"max_running_req": 1, "moe_strategy": "hybrid"}, False, None),  # a dense model has no experts to place
+    ],
+)
+def test_reproducible_seeds_refuses_what_would_let_earlier_requests_into_the_logits(overrides, is_moe, refused):
+    from freetoken.engine.engine import _check_reproducible_seeds
+
+    settings = {"moe_strategy": "offload", **overrides}
+    _check_reproducible_seeds(_config("full", **settings), is_moe)  # without the flag nothing is refused
+    config = _config("full", reproducible_seeds=True, **settings)
+    if refused is None:
+        _check_reproducible_seeds(config, is_moe)
+    else:
+        with pytest.raises(ValueError, match=refused):
+            _check_reproducible_seeds(config, is_moe)
+
+
+def test_reproducible_seeds_is_checked_at_resolution_and_resolves_nothing_else(monkeypatch):
+    import dataclasses
+
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    with pytest.raises(ValueError, match="--max-running-requests 1"):
+        _adjust_config(_config("linear_hybrid", reproducible_seeds=True))
+    on = _config("linear_hybrid", reproducible_seeds=True, max_running_req=1)
+    off = _config("linear_hybrid", max_running_req=1)
+    _adjust_config(on)
+    _adjust_config(off)
+    differing = [f.name for f in dataclasses.fields(on) if f.name != "model_config" and getattr(on, f.name) != getattr(off, f.name)]
+    assert differing == ["reproducible_seeds"]

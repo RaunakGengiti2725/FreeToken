@@ -1030,6 +1030,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--reproducible-seeds",
+        action="store_true",
+        dest="reproducible_seeds",
+        default=ServerArgs.reproducible_seeds,
+        help=(
+            "Make the text of a request that carries a seed follow from the flags and the request alone, so it "
+            "repeats after a restart and after any other requests. Such a request prefills its whole prompt (no "
+            "prefix-cache reuse) and leaves no prefix behind for later requests. Requires --max-running-requests 1 "
+            "and GPU-computed experts (--moe-strategy offload or fused); refuses hybrid, cpu, --moe-cpu-layers "
+            "and --speculative-algorithm dflash. Requests without a seed are served as usual."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-collect-stats",
         action="store_true",
         default=ServerArgs.moe_collect_stats,

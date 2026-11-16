@@ -125,6 +125,9 @@ class EngineConfig:
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True
+    # --reproducible-seeds: a request with a seed prefills cold and leaves no prefix behind (CacheManager.skips_prefix_cache);
+    # _adjust_config refuses the settings under which its logits would still follow earlier requests
+    reproducible_seeds: bool = False
     # speculative decoding
     speculative_algorithm: str | None = None
     speculative_num_steps: int = 0

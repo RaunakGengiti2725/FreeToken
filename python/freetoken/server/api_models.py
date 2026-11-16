@@ -95,7 +95,8 @@ class ChatCompletionRequest(BaseModel):
     # reads the dict form and 400s only on an unknown "type" value.
     thinking: Any | None = None
     ignore_eos: bool = False
-    # fixes each sampled token's draw; the logits can still differ between runs where two tokens are nearly tied
+    # fixes each sampled token's draw; the logits can still differ between runs where two tokens are nearly tied,
+    # unless the server runs with --reproducible-seeds
     seed: int | None = None
     tools: list[Tool] | None = None
     tool_choice: Literal["none", "auto", "required"] | ToolChoiceObject | None = None
