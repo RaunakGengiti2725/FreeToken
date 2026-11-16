@@ -22,6 +22,7 @@ class PendingReq:
     mm_items: list | None = None
     mrope_positions_full: torch.Tensor | None = None
     mrope_delta: int = 0
+    turn_anchor_len: int | None = None  # see Req.turn_anchor_len
     # timing/draft counters; add_one_req stamps enqueued_at on it, and every chunk
     # Req built from this pending request shares the same instance
     stats: ReqStats = field(default_factory=ReqStats)

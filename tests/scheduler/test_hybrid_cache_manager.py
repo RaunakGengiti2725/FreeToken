@@ -138,6 +138,129 @@ def test_prefill_chunk_ends_on_a_page_boundary():
     assert adder.try_add_one(pending).extend_len == 40
 
 
+def test_a_final_chunk_commits_the_snapshot_of_the_chunk_before_it():
+    """A prompt longer than one chunk whose last chunk crosses no boundary: the snapshot the chunk before wrote is
+    committed with the final chunk, so the same prompt sent again has a prefix to reuse."""
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    pool = _pool()
+    pt = torch.zeros(4, 512, dtype=torch.int32)
+    cm = CacheManager(512, 1, pt, "hybrid_radix", linear_state_pool=pool)
+    pm = PrefillManager(cm, TableManager(max_running_reqs=3, page_table=pt), DecodeManager(page_size=1))
+    prompt = torch.arange(1, 131, dtype=torch.int32)  # 128 tokens in the first chunk, 2 in the last
+    pm.pending_list = [PendingReq(0, prompt, SamplingParams(max_tokens=1))]
+
+    first = pm.schedule_next_batch(128).reqs[0]
+    assert isinstance(first, ChunkedReq) and first.extend_len == 128
+    cm.allocate_paged([first])
+    # what the chunk's forward does (attention/linear.py: _build_track_metadata): a snapshot at the deepest boundary
+    # strictly inside the chunk, written to the ping-pong slot it then flips away from
+    frozen = first.mamba_ping_pong[first.mamba_next_track_idx]
+    first.mamba_last_track_seqlen, first.mamba_next_track_idx = 64, 1 - first.mamba_next_track_idx
+    first.complete_one()
+
+    last = pm.schedule_next_batch(128).reqs[0]
+    assert not isinstance(last, ChunkedReq) and last.extend_len == 2
+    cm.allocate_paged([last])
+    last.complete_one()
+    cm.cache_req(last, finished=False)
+
+    again = cm.match_req(_pend(prompt.tolist()))
+    assert again.cuda_handle.cached_len == 64 and again.mamba_value == frozen
+
+
+def test_turn_anchor_is_where_the_next_turn_parts_from_the_prompt():
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.utils.hf import load_turn_anchor_tails
+
+    class Tok:
+        """One id a character; the generation prompt ends with a tag only when thinking is off, and a rendered reply drops it."""
+
+        def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True, enable_thinking=True):
+            return "".join(f"<{m['role'][0]}>{m['content']}" for m in msgs) + "<a>" + ("" if enable_thinking else "TT")
+
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+    tails = load_turn_anchor_tails(Tok())
+    assert tails == ((ord("T"), ord("T")),)  # with thinking on the generation prompt survives whole: no tail
+
+    pt = torch.zeros(4, 64, dtype=torch.int32)
+    prompt = torch.tensor([1, 2, 3, 4, ord("T"), ord("T")], dtype=torch.int32)
+    for lookahead in (False, True):
+        cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=_pool(), radix_lookahead=lookahead)
+        pm = PrefillManager(cm, TableManager(max_running_reqs=3, page_table=pt), DecodeManager(page_size=1))
+        pm.turn_anchor_tails = tails
+        # a node's last key holds the token after it under lookahead, so the anchor stops one token earlier
+        assert pm._turn_anchor(prompt) == (3 if lookahead else 4)
+        assert pm._turn_anchor(prompt[:4]) is None
+
+
+def test_prefill_plan_is_one_or_two_replays_cut_at_the_forwards_own_snapshot():
+    """SpecRunner.prefill_plan with prefill graphs: a chunk within the limit is one replay, or two cut at the last
+    64-token boundary before its end with the snapshot between them, and the request's mark and slot stay what the
+    forward's own tracking set; anything else is one eager forward (None)."""
+    from freetoken.scheduler.prefill import ChunkedReq
+    from freetoken.spec.runner import SpecRunner
+
+    sizes, limit, pair = {*range(1, 65), *range(128, 513, 64)}, 512, (7, 8)
+    runner = object.__new__(SpecRunner)
+    runner.k, runner.device = 3, torch.device("cpu")
+    runner.engine = SimpleNamespace(
+        chunk_runners=dict.fromkeys(sizes), chunk_graphs_usable=lambda: True, page_table=torch.zeros(1, 1 << 16),
+        config=SimpleNamespace(prefill_graph_tokens=limit, prefill_graph_chunks="1-64,128-512:64", page_size=1), prefill_runner=None,
+    )
+    for start in (0, 100):
+        for n in [*range(1, 600), 1024, 8192]:
+            for chunked in (False, True):
+                tracked = (n - 1) // 64 >= 1  # what attention/linear.py's own tracking does for this extend
+                req = object.__new__(ChunkedReq) if chunked else SimpleNamespace()
+                req.cached_len, req.mamba_ping_pong = start, pair
+                mark = (1, start + (n - 1) // 64 * 64) if tracked else (0, None)
+                req.mamba_next_track_idx, req.mamba_last_track_seqlen = mark
+                if chunked:
+                    req.device_len = start + n
+                else:
+                    req.extend_len = n
+                dst = torch.tensor([pair[0]]) if tracked else None
+                batch = SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=dst))
+                steps = runner.prefill_plan(batch)
+                head = (n - 1) // 64 * 64
+                if n > limit or (head and head not in sizes):
+                    assert steps is None, (n, steps)
+                elif head:
+                    assert steps == [("chunk", head), ("track", 0), ("chunk", n - head)] and batch.prefill_track_dst is dst
+                else:
+                    assert steps == [("chunk", n)]
+                # the plan never moves the snapshot
+                assert (req.mamba_next_track_idx, req.mamba_last_track_seqlen) == mark
+    # a size that was not captured leaves the chunk eager
+    del runner.engine.chunk_runners[37]
+    req = SimpleNamespace(cached_len=0, extend_len=64 + 37, mamba_ping_pong=None)
+    assert runner.prefill_plan(SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=None))) is None
+
+
+def test_prefill_plan_without_its_graphs_is_eager():
+    from freetoken.spec.runner import SpecRunner
+
+    runner = object.__new__(SpecRunner)
+    runner.k, runner.device = 3, torch.device("cpu")
+    runner.engine = SimpleNamespace(
+        chunk_runners={}, page_table=torch.zeros(1, 4096), prefill_runner=None,
+        config=SimpleNamespace(prefill_graph_tokens=64, prefill_graph_chunks="1,2,4", page_size=1),
+    )
+    req = SimpleNamespace(cached_len=128, extend_len=6, mamba_ping_pong=None)
+    assert runner.prefill_plan(SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=None))) is None
+    # the verify-step arm is its own configuration: no prefill graphs asked for
+    runner.engine.config.prefill_graph_chunks = ""
+    assert runner.prefill_plan(SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=None))) == [("verify", 4), ("verify", 4)]
+
+
 def test_naive_cache_does_not_align_prefill_chunks():
     """The alignment hook is hybrid-only; every other cache keeps the raw budget chunk."""
     from freetoken.scheduler.prefill import PrefillAdder

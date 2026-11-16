@@ -7,6 +7,8 @@ The kernels are templates (:mod:`freetoken.kernel.triton.nvfp4_fused_moe`, :mod:
 from __future__ import annotations
 
 import functools
+import math
+import os
 import re
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Tuple
@@ -220,6 +222,57 @@ _PREFILL_TUNING = {
     ("geforce", (12, 0)): _TUNING_GEFORCE,
     ("geforce", None): replace(_TUNING_GEFORCE, tiles=_PREFILL_TILES_H100),
 }
+# FREETOKEN_PREFILL_TILES replaces parts of the detected GPU class's tuning, to serve a sweep's result without a code change; unset changes nothing.
+# Items are joined by ";": "steps=16:150:inf" (tokens per expert where BLOCK_SIZE_M becomes 32, 64, 128),
+# "<BLOCK_SIZE_M>=<BLOCK_SIZE_N>x<BLOCK_SIZE_KB>x<num_stages>" for one tile, and the other _PrefillTuning fields by name,
+# e.g. "steps=16:100:inf;32=64x64x3;large_tile_decode=2;scale_words=1;long_k_warps=8". ROCm ignores it.
+PREFILL_TILES_ENV = "FREETOKEN_PREFILL_TILES"
+_PREFILL_OVERRIDE_FIELDS = {"pair_decode_below": float, "small_tile_decode": int, "large_tile_decode": int, "scale_words": int, "long_k_warps": int}
+_PREFILL_OVERRIDE_RANGES = {"small_tile_decode": (0, 1, 2), "large_tile_decode": (0, 1, 2), "scale_words": (0, 1), "long_k_warps": (4, 8)}
+
+
+def _parse_prefill_tiles(spec: str) -> Dict[str, Any]:
+    """The _PrefillTuning fields a FREETOKEN_PREFILL_TILES value replaces; ``tiles`` holds only the tiles it names."""
+    fields: Dict[str, Any] = {}
+    for item in filter(None, (part.strip() for part in spec.split(";"))):
+        key, _, value = (part.strip() for part in item.partition("="))
+        try:
+            if key == "steps":
+                steps = tuple(float(v) for v in value.split(":"))
+                if len(steps) != 3 or not 0 < steps[0] <= steps[1] <= steps[2]:
+                    raise ValueError("steps are three ascending token counts")
+                fields["steps"] = steps
+            elif key in ("16", "32", "64", "128"):
+                block_n, block_kb, stages = (int(v) for v in value.split("x"))
+                # a K step reads whole 16-value scale blocks, and the TMA scale box holds 16 of them
+                if block_n < 16 or block_n & (block_n - 1) or block_kb not in (8, 16, 32, 64, 128) or stages < 1:
+                    raise ValueError("a tile is <power of two N>x<8..128 packed bytes>x<stages>")
+                fields.setdefault("tiles", {})[int(key)] = (block_n, block_kb, stages)
+            elif key in _PREFILL_OVERRIDE_FIELDS:
+                number = _PREFILL_OVERRIDE_FIELDS[key](value)
+                if number not in _PREFILL_OVERRIDE_RANGES.get(key, (number,)) or not 0 <= number < math.inf:
+                    raise ValueError(f"{key} is out of range")
+                fields[key] = bool(number) if key == "scale_words" else number
+            else:
+                raise ValueError("unknown key")
+        except ValueError as exc:
+            raise ValueError(f"{PREFILL_TILES_ENV}: bad item {item!r} ({exc})") from None
+    return fields
+
+
+_PREFILL_TILES_OVERRIDE = _parse_prefill_tiles(os.environ.get(PREFILL_TILES_ENV, ""))
+
+
+def _override_prefill_tuning(tuning: _PrefillTuning, fields: Dict[str, Any]) -> _PrefillTuning:
+    if not fields:
+        return tuning
+    tuning = replace(tuning, **{**fields, "tiles": {**tuning.tiles, **fields.get("tiles", {})}})
+    missing = [m for m, at in zip((32, 64, 128), tuning.steps) if at != _INF and m not in tuning.tiles]
+    if missing:
+        raise ValueError(f"{PREFILL_TILES_ENV}: the steps reach BLOCK_SIZE_M {missing}, which this GPU class has no tile for; name one")
+    return tuning
+
+
 # steps while the Gluon kernel runs BLOCK_SIZE_M >= 64, from an RTX PRO 6000 sweep; classes without an entry keep the Triton steps
 _PREFILL_BLOCK_M_STEPS_GLUON = ((3.0, (16, 36, 96)),)
 
@@ -266,13 +319,16 @@ def _prefill_tuning(device_index: int) -> _PrefillTuning:
     rho = _device_rho(device_index)
     rho_class = "wide" if rho >= 8.0 else "pro" if rho >= 3.0 else "geforce"
     cc = torch.cuda.get_device_capability(device_index)
-    return _PREFILL_TUNING.get((rho_class, cc), _PREFILL_TUNING[(rho_class, None)])
+    tuning = _PREFILL_TUNING.get((rho_class, cc), _PREFILL_TUNING[(rho_class, None)])
+    if _PREFILL_TILES_OVERRIDE:
+        logger.warning("%s replaces the NVFP4 MoE prefill tuning of the %s class with %s", PREFILL_TILES_ENV, rho_class, _PREFILL_TILES_OVERRIDE)
+    return _override_prefill_tuning(tuning, _PREFILL_TILES_OVERRIDE)
 
 
 @functools.lru_cache(maxsize=None)
 def _prefill_block_m_steps(device_index: int) -> Tuple[float, float, float]:
     steps = _prefill_tuning(device_index).steps
-    if _gluon_prefill(device_index) is not None:
+    if "steps" not in _PREFILL_TILES_OVERRIDE and _gluon_prefill(device_index) is not None:
         rho = _device_rho(device_index)
         steps = next((s for min_rho, s in _PREFILL_BLOCK_M_STEPS_GLUON if rho >= min_rho), steps)
     return steps

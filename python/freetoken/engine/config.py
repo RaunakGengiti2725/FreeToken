@@ -70,6 +70,13 @@ class EngineConfig:
     # (cudaMemcpyBatchAsync) or HIP (hipMemcpyBatchAsync);
     # no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
+    # A prefill chunk of at most this many tokens on a cached prefix runs as captured verify steps
+    # (speculative decoding only) instead of an eager forward; 0 = always eager.
+    prefill_graph_tokens: int = 0
+    # Rows of the wider verify step captured for those chunks (one request); 0 = only the decode step's k + 1 rows.
+    prefill_graph_rows: int = 0
+    # Token counts of the prefill forwards captured for those chunks, e.g. "1024,256,64,16"; "" = none.
+    prefill_graph_chunks: str = ""
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.

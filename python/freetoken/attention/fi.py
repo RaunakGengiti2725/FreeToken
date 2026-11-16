@@ -294,7 +294,8 @@ class FlashInferBackend(BaseAttnBackend):
 
         capture = self.capture
         assert capture is not None
-        if self.capture_rows_per_req > 1:
+        # a captured prefill forward keeps the prefill kernel at one row too, so that it is the eager forward's
+        if self.capture_rows_per_req > 1 or getattr(self, "capture_prefill", False):
             wrapper = BatchPrefillWithPagedKVCacheWrapper(
                 self.float_workspace_buffer,
                 kv_layout="NHD",
@@ -326,6 +327,10 @@ class FlashInferBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         metadata.wrapper = self.graph_wrappers[bs]
+        if getattr(self, "capture_prefill", False):
+            # the LM head of a prefill forward takes each request's last row from the query indptr; the batch's own
+            # tensor is freed after the capture, the wrapper's buffer holds the same values at every replay
+            metadata.cu_seqlens_q_gpu = self.capture.cu_seqlens_q[: bs + 1]
         self._initialize_metadata_once(metadata)
 
     def prepare_for_replay(self, batch: Batch) -> None:

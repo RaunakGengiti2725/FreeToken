@@ -73,6 +73,14 @@ class Proposer:
         """(fixed bytes, draft KV bytes per target KV token), from the config alone."""
         return 0, 0
 
+    def adopt_verify_rows(self, n: int) -> torch.Tensor | None:
+        """The final hidden of the last verify forward's first ``n`` rows, copied; None from a proposer that keeps none."""
+        return None
+
+    def prefill_sink_from(self, batch: Batch, hidden: torch.Tensor) -> None:
+        """Stand in for the sink of a prefill forward of ``batch`` whose rows' final hidden is ``hidden``, so on_prefill reads it."""
+        raise NotImplementedError
+
     @classmethod
     def slot_states(cls, config) -> tuple[SlotStateSpec, ...]:
         """Per-request draft state that rides the target's GDN slots and is copied and restored with them; from the config alone. The proposer writes its own prefill track snapshot."""

@@ -335,6 +335,13 @@ class MTPProposer(Proposer):
         self._prefill_sink = _PrefillSink([(r.cached_len, r.device_len) for r in batch.reqs])
         return self._prefill_sink
 
+    def adopt_verify_rows(self, n: int) -> torch.Tensor:
+        return self.verify_hidden[:n].clone()
+
+    def prefill_sink_from(self, batch: Batch, hidden: torch.Tensor) -> None:
+        self._prefill_sink = _PrefillSink([(r.cached_len, r.device_len) for r in batch.reqs])
+        self._prefill_sink.hidden = hidden
+
     def _extend_forward(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Draft hiddens of a verify-shaped batch; returns each request's row at its last accepted position and that row's argmax."""
         input_ids = get_global_ctx().batch.input_ids

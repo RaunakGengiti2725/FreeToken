@@ -1042,6 +1042,48 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--prefill-graph-tokens",
+        type=int,
+        dest="prefill_graph_tokens",
+        default=ServerArgs.prefill_graph_tokens,
+        help=(
+            "With speculative decoding and no --prefill-graph-chunks, a prefill chunk of at most this many "
+            "tokens on a cached prefix runs as captured verify steps (the CUDA graphs decode already uses) "
+            "instead of an eager forward: other kernels, so other text. With --prefill-graph-chunks it is "
+            "the longest chunk that runs through the captured prefill forwards. 0 = always eager."
+        ),
+    )
+
+    parser.add_argument(
+        "--prefill-graph-chunks",
+        type=str,
+        dest="prefill_graph_chunks",
+        default=ServerArgs.prefill_graph_chunks,
+        help=(
+            "With --prefill-graph-tokens, capture prefill forwards of these token counts of one request: "
+            "counts and ranges, comma separated, e.g. 1-64,128-512:64 (1 to 64, then every 64 to 512). A chunk "
+            "runs as one replay, or as two cut at the last 64-token boundary before its end, where its snapshot "
+            "goes anyway, so the result is that of eager prefill forwards cut at that token; a chunk no such "
+            "pair covers runs as one eager forward. A replay has a fixed cost of several milliseconds, so "
+            "the captured forwards pay for chunks of a few hundred tokens or fewer. With an offloaded MoE the "
+            "sizes are captured once every expert is resident (a cache with a slot for each, "
+            "--moe-prefill-hit-d2d) or within --moe-prefill-demand-tokens. Empty = none."
+        ),
+    )
+
+    parser.add_argument(
+        "--prefill-graph-rows",
+        type=int,
+        dest="prefill_graph_rows",
+        default=ServerArgs.prefill_graph_rows,
+        help=(
+            "With --prefill-graph-tokens, also capture a verify step of this many rows of one request for "
+            "chunks longer than a decode step, so a chunk of N tokens takes ceil(N / rows) replays. "
+            "0 = only the decode step's rows."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-prefill-hit-d2d",
         action="store_true",
         dest="moe_prefill_hit_d2d",

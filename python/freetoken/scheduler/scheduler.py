@@ -28,6 +28,7 @@ from freetoken.utils import (
     load_eos_token_ids,
     load_tokenizer,
     load_toolcall_anchor_id,
+    load_turn_anchor_tails,
 )
 
 from .cache import CacheManager
@@ -147,6 +148,8 @@ class Scheduler(SchedulerIOMixin):
                 self.tokenizer,
                 toolcall_opener_for(getattr(config, "tool_call_parser", "")),
             )
+        if self.cache_manager.is_hybrid:
+            self.prefill_manager.turn_anchor_tails = load_turn_anchor_tails(self.tokenizer)
         self.token_pool = self.table_manager.token_pool
         # Floor the prefill chunk by the cache manager's cap (DSV4: ~half the window pool) so a
         # sliding-window cache chunks long prompts and frees out-of-window pages between chunks

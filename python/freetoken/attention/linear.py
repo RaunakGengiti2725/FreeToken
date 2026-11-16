@@ -215,4 +215,56 @@ class LinearAttnBackend(BaseAttnBackend):
         self.capture.cache_indices[:bs].copy_(metadata.cache_indices)
 
 
-__all__ = ["FLACaptureData", "FLAMetadata", "LinearAttnBackend", "build_fla_metadata"]
+class ChunkCaptureLinearBackend(LinearAttnBackend):
+    """A capture for prefill chunks of one fixed length of one request that continue a live state: the metadata is
+    the same tensors at capture and at every replay, only the state slot changes."""
+
+    def __init__(self, device: torch.device, pool: LinearStatePool, tokens: int) -> None:
+        super().__init__(device, pool)
+        # int64 as the chunk kernel wants it: a converted copy would be a new tensor each layer and miss fla's index cache
+        self.cu_seqlens = torch.tensor([0, tokens], dtype=torch.int64, device=device)
+        self.slot = torch.zeros(1, dtype=torch.int32, device=device)
+        self.has_state = torch.ones(1, dtype=torch.bool, device=device)
+
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        self.capture_bs = sorted(bs_list)
+
+    def _metadata(self, batch: "Batch") -> None:
+        self.slot.fill_(gdn_slot(batch.padded_reqs[0]))
+        batch.fla_metadata = FLAMetadata(cu_seqlens=self.cu_seqlens, cache_indices=self.slot, has_initial_state=self.has_state)
+
+    prepare_metadata = _metadata
+
+    def prepare_for_capture(self, batch: "Batch") -> None:
+        from freetoken.kernel.fla.index import prepare_chunk_indices, prepare_chunk_offsets, prepare_lens
+
+        self._metadata(batch)
+        # the chunk kernels take their index tensors from an identity cache of a few entries, which later prefills
+        # evict; the capture reads the ones held here (16, 32 and 64 are the chunk sizes the kernels ask for)
+        self.chunk_index = [prepare_lens(self.cu_seqlens)]
+        for size in (16, 32, 64):
+            self.chunk_index += [prepare_chunk_indices(self.cu_seqlens, size), prepare_chunk_offsets(self.cu_seqlens, size)]
+
+    def prepare_for_replay(self, batch: "Batch") -> None:
+        pass  # prepare_metadata wrote the slot into the captured tensor
+
+
+class WideVerifyLinearBackend(LinearAttnBackend):
+    """A second capture, for verify steps of one request with another row count: the rows park in a scratch of their own."""
+
+    def __init__(self, device: torch.device, pool: LinearStatePool, rows_per_req: int) -> None:
+        from freetoken.kvcache.linear_state_pool import LinearVerifyScratch
+
+        super().__init__(device, pool)
+        self.scratch = LinearVerifyScratch(pool, 1, rows_per_req)
+
+    def prepare_metadata(self, batch: "Batch") -> None:
+        super().prepare_metadata(batch)
+        batch.fla_metadata.verify_scratch = self.scratch
+
+    def prepare_for_capture(self, batch: "Batch") -> None:
+        super().prepare_for_capture(batch)
+        batch.fla_metadata.verify_scratch = self.scratch
+
+
+__all__ = ["ChunkCaptureLinearBackend", "FLACaptureData", "FLAMetadata", "LinearAttnBackend", "WideVerifyLinearBackend", "build_fla_metadata"]

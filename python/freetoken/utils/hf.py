@@ -114,6 +114,28 @@ def load_toolcall_anchor_id(
     return int(ids[0]) if len(ids) == 1 else None
 
 
+def load_turn_anchor_tails(tokenizer: PreTrainedTokenizerBase) -> tuple[tuple[int, ...], ...]:
+    """The token tails of the chat template's generation prompt that a continued conversation does not keep.
+
+    A prompt ends with the generation prompt (the assistant header, a thinking tag). When the client sends the next
+    turn, the template renders the reply in its place, so the two sequences part some tokens before the prompt's end;
+    the state just before that point is the deepest one the next turn can reuse. Found by rendering one turn and its
+    continuation, with thinking unset, off and on; longest first. Empty without a chat template."""
+    tails: set[tuple[int, ...]] = set()
+    turn = [{"role": "user", "content": "a"}]
+    more = [*turn, {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}]
+    for kwargs in ({}, {"enable_thinking": False}, {"enable_thinking": True}):
+        try:
+            one = tokenizer.encode(tokenizer.apply_chat_template(turn, tokenize=False, add_generation_prompt=True, **kwargs), add_special_tokens=False)
+            two = tokenizer.encode(tokenizer.apply_chat_template(more, tokenize=False, add_generation_prompt=True, **kwargs), add_special_tokens=False)
+        except Exception:  # noqa: BLE001 -- no template, or one that does not take the argument
+            continue
+        same = next((i for i, (x, y) in enumerate(zip(one, two)) if x != y), min(len(one), len(two)))
+        if 0 < same < len(one):
+            tails.add(tuple(int(x) for x in one[same:]))
+    return tuple(sorted(tails, key=len, reverse=True))
+
+
 def load_generation_sampling(model_path: str) -> dict[str, Any]:
     """Recommended sampling defaults from ``generation_config.json`` (sglang's
     ``sampling_defaults='model'``). Returns ``{temperature, top_k, top_p}`` for the keys
