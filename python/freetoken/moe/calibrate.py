@@ -17,16 +17,21 @@ A draft token map is one more candidate where a file for this checkpoint is in t
 by scripts/make_token_map.py --store with a manifest that names its corpus): MAP_DEPTH draft tokens with the map,
 per strategy. A --speculative-token-map on the command line is not a candidate: every server then has that map.
 
-The candidates are timed in a fixed order, inside BUDGET_S seconds: the static choice, the other strategy at the
-static choice's depth, then the other settings (5 with the map, 4, 5, none) of the strategy that is ahead of the
-two, then those of the other strategy. One strategy is ahead of the other by the rule above with a margin of 0. A
+The candidates are timed in a fixed order, inside BUDGET_S seconds, the static choice first. Where it serves every
+expert from the GPU (fused, or a cache with a slot for each): 5 drafts with the map (5 without, where there is no
+map), 4 drafts, the other strategy at the static depth, then the rest. On full cards 5 drafts with a 32K map was
+the one setting seen ahead of the static choice, on two boxes, and the strategies decode alike there. Where the
+cache holds part of the experts: the other strategy at the static choice's depth, then the other settings (5 with
+the map, 4, 5, none) of the strategy that is ahead of the two, then those of the other strategy; there the strategy
+decided most on every box that was read. One strategy is ahead of the other by the rule above with a margin of 0. A
 candidate is started only if the time used so far plus SLACK times the longest candidate so far is within the
 budget, and its server must be ready while the longest time a candidate so far took after its load still fits. The
 budget's end is also a deadline for every candidate, the static choice included: a load or a request still running
 then is ended, and the server is gone GRACE_S seconds later at the latest, whatever it does. The candidates not
-started, not ready or not done in time are not chosen, and a later start does not time them (--calibrate-again
-does, inside a budget of its own); where the static choice itself is not done in time, the static preset runs
-untimed and the log says so. The draft depth cannot be changed in a running server (its
+started, not ready or not done in time are stored as not timed and are not chosen. A later start does not time
+them; --calibrate-again does, keeping the stored timings and spending a budget of its own on the candidates not
+timed yet (once none is left, it times them all again). Where the static choice itself is not done in time, the
+static preset runs untimed and the log says so. The draft depth cannot be changed in a running server (its
 verify graphs and buffers are built for one depth), so every candidate is a model load, and on a box that loads in
 80 s the budget holds two or three of them.
 
@@ -323,31 +328,63 @@ def _stopping_on_signals():
             signal.signal(sig, signal.SIG_DFL if handler is None else handler)
 
 
-def measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str | None]]) -> dict:
-    """Time ``todo`` (the static choice first) and return the row. Raises RuntimeError when the static choice cannot be timed."""
+def measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str | None]], known: dict | None = None) -> dict:
+    """Time ``todo`` (the static choice first) and return the row. ``known``: a stored row whose timings are kept, so
+    that only the candidates it had no time for are timed. Raises RuntimeError when the static choice cannot be timed."""
     with _stopping_on_signals():
-        return _measure(args, argv, todo)
+        return _measure(args, argv, todo, known)
 
 
-def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str | None]]) -> dict:
+def _resident(static: tuple, first: dict) -> bool:
+    """Whether the static choice serves every expert from the GPU: fused, or an expert cache with a slot for each."""
+    return static[1] == "fused" or (bool(first.get("total_slots")) and (first.get("cache_slots") or 0) >= first["total_slots"])
+
+
+def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str | None]], known: dict | None = None) -> dict:
     t0 = _now()
+    static, names = todo[0], [c[0] for c in todo]
     # failed: did not start or answer, timed again on the next start. skipped: left out for a reason that holds then too
     tok_s, failed, skipped, wall = {}, {}, {}, {}
     first, tail = None, 0.0  # tail: the longest a candidate took after its server was ready (its requests and its stop)
-    # the strategies at the static choice's depth, then the other depths, those of the strategy that is ahead first
-    heads = [c for c in todo if c[2] == todo[0][2] and c[3] is None]
-    queue, rest = list(heads), [c for c in todo if c not in heads]
-    while queue or rest:
+    if known is not None:
+        tok_s = {n: v for n, v in known["tok_s"].items() if n in names}
+        skipped = {n: why for n, why in known.get("skipped", {}).items() if n in names and why != OUT_OF_TIME}
+        wall = {n: float(v) for n, v in (known.get("wall_s") or {}).items() if n in tok_s} or {static[0]: 0.0}
+        first = {**known["static"], **{k: known.get(k) for k in ("cache_slots", "total_slots", "slot_bytes", "gpu_free_bytes")}}
+        tail = float(known.get("tail_s") or 0.0)
+    heads = [c for c in todo[1:] if c[2] == static[2] and c[3] is None]
+    rest = [c for c in todo[1:] if c not in heads]
+    queue, stage = [static], 0
+    while queue or stage < 2:
+        if not queue and stage == 0:
+            stage = 1
+            queue = list(heads)
+            if _resident(static, first):
+                # every expert on the GPU: a start is short and the strategies decode alike, so the static strategy's
+                # deeper drafts come first (with the map: the one setting seen ahead of the static choice on full
+                # cards), then 4 drafts, then the other strategy and what is left
+                own = [c for c in rest if c[1] == static[1]]
+                deep = next((c for c in own if c[3]), None) or next((c for c in own if c[2] == MAP_DEPTH), None)
+                near = next((c for c in own if c[2] == DEPTHS[1] and c[3] is None), None)
+                lead_in = [c for c in (deep, near) if c is not None]
+                queue, stage = lead_in + heads + [c for c in rest if c not in lead_in], 2
+            continue
         if not queue:
-            ahead = choose(tok_s, [c[0] for c in heads], margin=0.0)[0]
-            leader = next(c[1] for c in heads if c[0] == ahead)
-            queue, rest = sorted(rest, key=lambda c: c[1] != leader), []
+            # a cache that holds part of the experts: the strategy decides most, so the other one came first; then the
+            # other settings, those of the strategy that is ahead first
+            stage = 2
+            ahead = choose(tok_s, [static[0]] + [c[0] for c in heads], margin=0.0)[0]
+            leader = next(c[1] for c in todo if c[0] == ahead)
+            queue = sorted(rest, key=lambda c: c[1] != leader)
+            continue
         name, strategy, depth, token_map = queue.pop(0)
-        if first is not None and not first["drafts"] and (depth != todo[0][2] or token_map) and not first.get("no_drafts"):
+        if name in tok_s or name in skipped:
+            continue  # kept from the stored row
+        if first is not None and not first["drafts"] and (depth != static[2] or token_map) and not first.get("no_drafts"):
             # the static choice drafted nothing: this checkpoint has no MTP layers, and every depth is the same server
             skipped[name] = "the checkpoint drafts nothing"
             continue
-        if first is not None and first.get("no_drafts") and strategy == todo[0][1]:
+        if first is not None and first.get("no_drafts") and strategy == static[1]:
             # the static preset dropped its drafts for this cache (engine._settle_preset_drafts): no drafts is the static
             # choice itself, and its rule already says the other depths of this strategy lose here
             skipped[name] = "the static preset serves this cache size without drafts"
@@ -382,7 +419,8 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
         tok_s[name] = r["tok_s"]
     return {
         "tok_s": tok_s, "failed": failed, "skipped": skipped, "columns": list(PROMPTS), "warm": WARM, "warm_again": WARM_AGAIN,
-        "decode": DECODE, "passes": PASSES, "budget_s": BUDGET_S, "wall_s": {n: round(v, 1) for n, v in wall.items()},
+        "decode": DECODE, "passes": PASSES, "budget_s": BUDGET_S, "wall_s": {n: round(v, 1) for n, v in wall.items()}, "tail_s": round(tail, 1),
+        "static": {"early": first.get("early"), "drafts": first["drafts"], "no_drafts": bool(first.get("no_drafts"))},
         "cache_slots": first["cache_slots"], "total_slots": first["total_slots"], "slot_bytes": first["slot_bytes"],
         "gpu_free_bytes": first["gpu_free_bytes"], "seconds": round(_now() - t0, 1),
         "measured_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
@@ -484,15 +522,21 @@ def measured_choice(args, argv: list[str]) -> dict:
         failed_before = set(row.get("failed", {})) if row is not None else set()
         if row is not None and (stale := _stale(row, names, free, args)):
             row, reason = None, f"the stored calibration does not apply: {stale}"
+        known = None
         if row is not None and getattr(args, "calibrate_again", False):
-            row, reason = None, "--calibrate-again"
+            reason = "--calibrate-again"
+            static_kept = row.get("static")
+            if OUT_OF_TIME in row.get("skipped", {}).values() and isinstance(static_kept, dict) and "drafts" in static_kept:
+                # the last calibration ran out of time: its timings stay, and this one times what it did not reach
+                known, reason = row, "--calibrate-again: timing what the stored calibration had no time for"
+            row = None
         if row is None:
             logger.info(
                 f"--preset {PRESET}: calibrating, up to {len(todo)} server starts within {BUDGET_S} s, each {PASSES} passes on "
                 f"{len(PROMPTS)} prompts of {DECODE} timed tokens after {WARM} warm-up tokens, {WARM_AGAIN} from the second pass on ({reason})"
             )
             # the launcher's own reading of the free memory: a later start compares its reading with this one
-            row = {**measure(args, argv, todo), "stamp": stamp, "gpu_free_bytes": free}
+            row = {**measure(args, argv, todo, known), "stamp": stamp, "gpu_free_bytes": free}
             if any(c[3] for c in todo):
                 row["token_map"] = {"path": token_map, "sha256": map_sha}
             for again in failed_before & set(row["failed"]):

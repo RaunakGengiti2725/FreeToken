@@ -1335,7 +1335,8 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     fifth, fifth_argv = parsed("--memory-ratio", "0.75")
     measured_depth = tuple(n for n in fifth.preset_fields if n != "speculative_num_steps")  # as its server was started: the depth typed
     assert starts(fifth, fifth_argv) == ({"moe_strategy": "fused", "speculative_num_steps": 5, "preset_fields": measured_depth}, 4)
-    assert started[-4:] == [("fused", 3), ("fused", 4), ("fused", 5), ("fused", 0)] and starts(fifth, fifth_argv)[1] == 0
+    # every expert on the GPU: the deeper drafts of the static strategy come right after it
+    assert started[-4:] == [("fused", 3), ("fused", 5), ("fused", 4), ("fused", 0)] and starts(fifth, fifth_argv)[1] == 0
     speeds["fused", 5] = [105.0, 190.0]
     assert starts(*parsed("--memory-ratio", "0.72")) == ({"speculative_num_steps": 3}, 4)  # the static choice: the strategy stays auto
     # a typed strategy is not asked about and stays, and typed drafts leave nothing to time
@@ -1402,8 +1403,21 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     boxed, boxed_argv = parsed("--memory-ratio", "0.85")
     assert starts(boxed, boxed_argv) == (hybrid_3, 2) and started[-2:] == [("offload", 3), ("hybrid", 3)]
     assert starts(boxed, boxed_argv) == (hybrid_3, 0)
-    # --calibrate-again times again whatever is stored, in a budget of its own
-    assert starts(*parsed("--memory-ratio", "0.85", "--calibrate-again")) == (hybrid_3, 2)
+    # --calibrate-again keeps those timings and spends a budget of its own on what was not reached: the other depths of
+    # the strategy that was ahead. A start without the flag reads the larger row
+    again = parsed("--memory-ratio", "0.85", "--calibrate-again")
+    choice, timed = starts(*again)
+    assert timed == 2 and started[-2:] == [("hybrid", 4), ("hybrid", 5)] and (choice["moe_strategy"], choice["speculative_num_steps"]) == ("hybrid", 4)
+    assert starts(boxed, boxed_argv) == (choice, 0)
+    assert [starts(*again)[1] for _ in range(2)] == [2, 2] and started[-4:] == [("hybrid", 0), ("offload", 4), ("offload", 5), ("offload", 0)]
+    # nothing is left untimed: the flag times every candidate again, from the static choice
+    assert starts(*again)[1] == 2 and started[-2:] == [("offload", 3), ("hybrid", 3)]
+    # an expert cache with a slot for every expert is ordered as fused is: 5 drafts, 4 drafts, then the other strategy
+    whole = lambda args, argv, s, d, floors=None, ready_s=None, left_s=None: {**time_candidate(args, argv, s, d), "cache_slots": 80}
+    monkeypatch.setattr(calibrate, "_time_candidate", whole)
+    assert starts(*parsed("--memory-ratio", "0.83"))[1] == 8
+    assert started[-8:-4] == [("offload", 3), ("offload", 5), ("offload", 4), ("hybrid", 3)]
+    monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0))
     # at 60 s a candidate that is four: then the other depths of the strategy that is ahead of the two, nearest first
     monkeypatch.setattr(calibrate, "_time_candidate", taking(60.0))
     choice, timed = starts(*parsed("--memory-ratio", "0.86"))

@@ -45,7 +45,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--api-key` | `$FREETOKEN_API_KEY`, else off | Require the key on every route except `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`; other requests get a 401 |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
 | `--preset` | — | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. `single-fast`: `single` with captured prefill forwards, whose replies can differ from `single`'s. See [Presets](#presets) |
-| `--calibrate-again` | off | With `--preset single-measured`: time the candidates on this start and replace the stored choice, also when one is stored for this checkpoint, flags and machine. See [Presets](#presets) |
+| `--calibrate-again` | off | With `--preset single-measured`: time on this start also when a choice is stored for this checkpoint, flags and machine: the candidates the stored calibration had no time for, or all of them once none is left. See [Presets](#presets) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
@@ -202,17 +202,22 @@ No map is shipped: one has to be built for the checkpoint, from text that no ben
 
 The calibration runs before the server loads and has 300 seconds. Every candidate is a model load,
 because a running server cannot change its strategy or its draft depth, so the candidates are timed
-in a fixed order and only as many as fit: the static choice, the other strategy with 3 draft
-tokens, then 5 draft tokens with the map (where there is one), 4, 5 and no draft tokens for the
-strategy that is ahead of those two, then for the other one. A candidate is started only while 1.1 times the longest candidate so far still fits in
+in a fixed order and only as many as fit, the static choice first. Where it serves every expert
+from the GPU (`fused`, or an expert cache with a slot for each), the next are 5 draft tokens with
+the map (5 without one where there is no map), then 4 draft tokens, then the other strategy with 3,
+then the rest: on full cards 5 drafts with a 32K map was the one setting measured ahead of the
+static choice. Where the cache holds part of the experts, the next is the other strategy with 3
+draft tokens, then 5 draft tokens with the map, 4, 5 and no draft tokens for the strategy that is
+ahead of those two, then for the other one: there the strategy decided most. A candidate is started only while 1.1 times the longest candidate so far still fits in
 what is left, and its server is stopped if it is not ready with time left for its requests. The end
 of the 300 seconds is also a deadline for every load and every request, the static choice's
 included: what is still running then is ended, and that server is gone at most 30 seconds later,
 by SIGKILL if it does not stop. If the static choice itself is not timed by then, the static preset
 runs untimed and the log says so. On a machine that loads the model in 80
 seconds that is two or three candidates; the log names the ones that were not started, and prints
-the time (`calibration took N s`). A candidate that was not started is not chosen and is not timed
-on a later start. A strategy or a speculative setting given on the command line is not
+the time (`calibration took N s`). A candidate that was not timed is stored as such, is not chosen,
+and is not timed on a later start; `--calibrate-again` keeps the stored timings and spends another
+300 seconds on the candidates not timed yet. A strategy or a speculative setting given on the command line is not
 timed, and a checkpoint that drafts nothing is timed for the strategy alone (two model loads).
 Where the static preset serves the experts resident, `fused` is every candidate's strategy and only
 the draft settings are timed: with every expert on the GPU `hybrid` has
@@ -223,8 +228,9 @@ with exit code 128 + the signal.
 
 The timings are kept in the decode profile, next to the `ft bench decode` rows, and are read under
 the same conditions as those rows (same checkpoint and flags, same machine and release), so later
-starts measure nothing and say which calibration they read. `--calibrate-again` times the
-candidates on this start whatever is stored and replaces the stored choice. A `--moe-cache-rate` or `--moe-cache-size`
+starts measure nothing and say which calibration they read. `--calibrate-again` times on this
+start whatever is stored: the candidates the stored calibration had no time for, or, once every
+candidate has been timed, all of them again. A `--moe-cache-rate` or `--moe-cache-size`
 is part of those flags. With an automatically sized cache the timings are read only while about as
 much GPU memory is free as when they were taken: clearly more or clearly less is timed again. Where
 the calibration cannot be done or its

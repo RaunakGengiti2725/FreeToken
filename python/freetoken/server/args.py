@@ -1187,8 +1187,9 @@ def parse_args(
         "--calibrate-again",
         action="store_true",
         help=(
-            "With --preset single-measured: time the candidates on this start and replace the stored choice, "
-            "also when a calibration for this checkpoint, flags and machine is stored. Ignored without that preset."
+            "With --preset single-measured: time on this start also when a calibration for this checkpoint, flags and "
+            "machine is stored: the candidates it had no time for, keeping its timings, or every candidate again once "
+            "none is left untimed. Ignored without that preset."
         ),
     )
 
