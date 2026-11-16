@@ -315,7 +315,7 @@ class OffloadMoELayer(MoELayer):
             topk_ids,
             views=cache.pool_bank_views(self.layer_id),
             n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
+            alphas=self._slot_alphas(cache),
             is_prefill=False,
             sum_routes=sum_routes,
         )
@@ -361,7 +361,7 @@ class OffloadMoELayer(MoELayer):
             gpu_slots,
             views=cache.pool_bank_views(self.layer_id),
             n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
+            alphas=self._slot_alphas(cache),
             is_prefill=False,
         )
         if not _HYBRID_OVERLAP:
@@ -411,7 +411,7 @@ class OffloadMoELayer(MoELayer):
                 routes,
                 views=cache.pool_bank_views(self.layer_id),
                 n=cache.pool_slots(self.layer_id),
-                alphas=cache.alphas_for_slots(self.layer_id),
+                alphas=self._slot_alphas(cache),
                 routed=RoutedExperts(self.num_experts, cache.alphas_for_layer(self.layer_id), slot_of),
                 is_prefill=True,
             )
@@ -443,6 +443,10 @@ class OffloadMoELayer(MoELayer):
         )
         cache.release_prefill_layer(self.layer_id)
         return out
+
+    def _slot_alphas(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The cache's alphas by slot, for a kernel that reads them from a slot view."""
+        return cache.alphas_for_slots(self.layer_id) if self.quant_method.kernel.reads_slot_alphas else None
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache, topk_ids: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the

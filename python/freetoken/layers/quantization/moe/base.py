@@ -162,6 +162,8 @@ class MoEKernel(ABC):
     supports_inactive_slots: ClassVar[bool] = False
     # Whether a prefill ``apply`` over a slot view takes ``RoutedExperts.slot_of`` with the routes left as expert ids.
     groups_prefill_by_expert: ClassVar[bool] = False
+    # Whether ``apply`` reads ``ExpertView.alphas`` of a slot view; a kernel that does not is spared their per-slot gather, which a decode step would repeat for every layer.
+    reads_slot_alphas: ClassVar[bool] = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         return None

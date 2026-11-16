@@ -93,6 +93,8 @@ class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):
     """
 
     name = "w4a4"
+    # decode runs the Triton kernels, and a prefill over slots takes the layer's scales from RoutedExperts
+    reads_slot_alphas = False
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = super().unusable_reason(cfg)
