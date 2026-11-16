@@ -1022,6 +1022,17 @@ def test_a_signal_during_calibration_stops_the_candidates_server_and_ends_the_la
             for proc in servers:
                 if proc.poll() is None:
                     proc.kill()
+    # a signal the launcher ignores (SIGHUP under nohup) stays ignored while the candidates are timed
+    row = {"tok_s": [[100.0, 100.0], [200.0, 200.0]], "drafts": 300, "early": [100.0, 200.0], "cache_slots": 40, "total_slots": 80,
+           "slot_bytes": 1 << 20, "gpu_free_bytes": _ROW_FREE, "ready_s": 1.0}
+    before = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(calibrate, "_time_candidate", lambda *a, **k: (signal.raise_signal(signal.SIGHUP), row)[1])
+            assert set(calibrate.measure(SimpleNamespace(), [], todo)["tok_s"]) == {"offload@3", "hybrid@3"}
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, before)
 
 
 def test_auto_does_not_take_a_row_whose_hybrid_cache_is_below_the_models_floor(decode_rows):

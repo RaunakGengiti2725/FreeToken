@@ -179,7 +179,11 @@ def _stopping_on_signals():
         logger.info(f"--preset {PRESET}: {signal.Signals(signum).name} during the calibration, stopping")
         raise SystemExit(128 + signum)
 
-    found = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    # a signal the launcher ignores (SIGHUP under nohup) stays ignored
+    found = {
+        sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+        if signal.getsignal(sig) is not signal.SIG_IGN
+    }
     try:
         yield
     finally:
