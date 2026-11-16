@@ -9,7 +9,7 @@ import json
 import os
 
 from freetoken.engine.cache_budget import (
-    budget_advice, expert_bytes_per_slot, kv_capacity_warning, plan_cache_budget, plan_changes, plan_kv_target,
+    CacheBudgetTooSmall, budget_advice, expert_bytes_per_slot, kv_capacity_warning, plan_cache_budget, plan_changes, plan_kv_target,
     resolve_moe_cache_auto,
 )
 from freetoken.engine.engine import _pin_budget_bytes
@@ -184,30 +184,56 @@ def test_preset_plan_leaves_a_prefill_chunk_of_working_memory_free_and_the_plain
 
     # Qwen3.6-35B-A3B in bf16: hidden 2048, 16 key and 32 value heads of 128, the chunk kernel's 64-token chunks
     shapes = dict(hidden=2048, key_dim=2048, value_dim=4096, value_heads=32, head_dim=128, chunk=64, itemsize=2)
-    need, largest = prefill_working_bytes(8192, **shapes)
+    need = prefill_working_bytes(8192, **shapes)
     # 116 KB of temporaries a token and 1 MiB of state per kernel chunk: 0.46 GiB free did not hold 3785 tokens, 1.20 GiB held 8192
-    assert (need, largest) == (8192 * 118_784 + 128 * 2**20, 8192 * 24_576)
-    assert 0.46 * 2**30 < prefill_working_bytes(3785, **shapes)[0] and need < 1.20 * 2**30
+    assert need == 8192 * 118_784 + 128 * 2**20
+    assert 0.46 * 2**30 < prefill_working_bytes(3785, **shapes) and need < 1.20 * 2**30
     slot, weights = 1_780_000, int(4.44 * 2**30)
 
     def terms(ratio, gain_slots, reserve):
         return dict(
             baseline_free=free << 30, weights_bytes=weights - gain_slots * slot, memory_ratio=ratio, cache_per_page=16 * 20_000,
-            fixed_cache_size=reserve, per_expert_bytes=slot, num_experts=256, total_experts=10240, prefill_overlap=True,
-            kv_reserve_tokens=8192, page_size=16,
+            fixed_cache_size=0, per_expert_bytes=slot, num_experts=256, total_experts=10240, prefill_overlap=True,
+            kv_reserve_tokens=8192, page_size=16, reserve_bytes=reserve,
         )
 
     def left_free(plan, t):
         return t["baseline_free"] - t["weights_bytes"] - required_bytes(plan[0], plan[1], slot, t["cache_per_page"])
 
     plain, preset = terms(0.9, 0, 0), terms(0.95, 575, need)
-    assert resolve_moe_cache_auto(**plain) == resolve_moe_cache_auto(**{**plain, "fixed_cache_size": 0})  # no reserve without the preset
     plan = resolve_moe_cache_auto(**preset)
+    # not every expert fits at these sizes, so KV holds its reserve and less than a slot's bytes more: the slots pay for the chunk
+    assert (plan[1] - 8192 // 16) * 16 * 20_000 < slot
+    assert resolve_moe_cache_auto(**terms(0.95, 575, 0))[0] - plan[0] in (need // slot, need // slot + 1)
     # the ratio's own headroom and the whole chunk on top of it; without the reserve the same ratio leaves less than the chunk needs
     assert left_free(plan, preset) >= need + int(0.05 * (free << 30))
     unreserved = terms(0.95, 575, 0)
     assert left_free(resolve_moe_cache_auto(**unreserved), unreserved) < need
     assert plan[0] >= resolve_moe_cache_auto(**plain)[0]  # host embeddings and one request pay for the reserve
+
+
+@pytest.mark.parametrize(
+    "reserve, slots, pages",
+    [
+        (0, 10, 100),  # every expert cached, KV holds 90 pages above its floor of 10
+        (300, 10, 70),  # the pages above the floor cover the reserve: the slots are untouched
+        (900, 10, 10),  # exactly the pages above the floor
+        (1200, 7, 10),  # 300 B more than those pages: three slots pay the rest
+        (5000, 4, 10),  # more than the plan can give: both caches at their floors, and the plan still stands
+    ],
+)
+def test_reserve_comes_out_of_kv_above_its_floor_before_expert_slots(reserve, slots, pages):
+    plan = dict(
+        budget_bytes=2000, per_expert_bytes=100, cache_per_page=10, num_experts=2, total_experts=10,
+        prefill_overlap=True, kv_reserve_pages=10, max_slots=10,
+    )
+    assert plan_cache_budget(**plan, reserve_bytes=reserve)[:2] == (slots, pages)
+    # what is left out of the caches is the reserve, or all the floors (4 slots, 10 pages) leave of it
+    assert 2000 - slots * 100 - pages * 10 >= min(reserve, 2000 - 4 * 100 - 10 * 10)
+    # a budget the floors do not fit fails as it does without a reserve, the same bytes short
+    with pytest.raises(CacheBudgetTooSmall) as short:
+        plan_cache_budget(**{**plan, "budget_bytes": 480}, reserve_bytes=reserve)
+    assert short.value.short == 20
 
 
 def test_prefill_overlap_false_is_honored():
@@ -539,21 +565,58 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     from freetoken.engine.cache_budget import prefill_working_bytes
 
     config.dtype, config.max_forward_len, config.model_config.hidden_size, config.memory_ratio = torch.bfloat16, 256, 64, 0.95
-    need = prefill_working_bytes(256, hidden=64, key_dim=32, value_dim=64, value_heads=4, head_dim=16, chunk=64, itemsize=2)[0]
+    need = prefill_working_bytes(256, hidden=64, key_dim=32, value_dim=64, value_heads=4, head_dim=16, chunk=64, itemsize=2)
     typed = engine._auto_cache_terms(config, StubBanks())
-    assert engine._preset_prefill_reserve(config) == 0
+    assert engine._preset_prefill_reserve(config) == 0 == typed["reserve_bytes"]
     config.preset_fields = ("max_running_req", "memory_ratio", "kv_reserve_tokens")
     assert engine._preset_prefill_reserve(config) == need > 0
-    assert engine._auto_cache_terms(config, StubBanks()) == {**typed, "fixed_cache_size": typed["fixed_cache_size"] + need}
+    # the planner gets it as bytes neither cache takes, not as a fixed cost: KV pages above the reserve pay first
+    assert engine._auto_cache_terms(config, StubBanks()) == {**typed, "reserve_bytes": need}
     stages = engine._preset_stages(config, StubBanks(), None, None)
     assert [label.split(" left free")[0] for label, _ in stages[2:4]] == ["--memory-ratio 0.95", f"{need / 2**30:.2f} GiB"]
-    assert stages[3][1]["fixed_cache_size"] - stages[2][1]["fixed_cache_size"] == need and stages[0][1]["memory_ratio"] == 0.9
+    assert (stages[2][1]["reserve_bytes"], stages[3][1]["reserve_bytes"]) == (0, need) and stages[0][1]["memory_ratio"] == 0.9
+    # every expert has a slot here, so the chunk costs KV tokens and no slot
+    with_chunk, without = resolve_moe_cache_auto(**stages[3][1]), resolve_moe_cache_auto(**stages[2][1])
+    assert with_chunk[0] == without[0] == 8 and 0 < (without[1] - with_chunk[1]) * stages[3][1]["cache_per_page"] - need < stages[3][1]["cache_per_page"]
     assert stages[-1][1] == engine._auto_cache_terms(config, StubBanks())
     engine._settle_preset_memory_ratio(config)
     assert config.memory_ratio == 0.95
     config.model_config.linear_attention_group = lambda: None
     engine._settle_preset_memory_ratio(config)
     assert config.memory_ratio == 0.9 and "memory_ratio" not in config.preset_fields and engine._preset_prefill_reserve(config) == 0
+
+
+def test_prefill_working_bytes_counts_gdn_models_only():
+    from dataclasses import replace
+
+    from freetoken.engine.cache_budget import prefill_working_bytes
+    from freetoken.engine.engine import _prefill_working_bytes
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+    # Qwen3.6-35B-A3B in bf16: hidden 2048, 16 key and 32 value heads of 128, the chunk kernel's 64-token chunks
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(0, 1, 2), num_key_heads=16, num_value_heads=32, key_head_dim=128, value_head_dim=128,
+        conv_kernel_dim=4, output_gate="silu",
+    )
+    shapes = dict(hidden=2048, key_dim=2048, value_dim=4096, value_heads=32, head_dim=128, chunk=64, itemsize=2)
+
+    def config(group, chunk=8192, context=262144):
+        model = SimpleNamespace(hidden_size=2048, linear_attention_group=lambda: group)
+        return SimpleNamespace(
+            model_config=model, max_forward_len=chunk, max_seq_len=context, dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1)
+        )
+
+    assert _prefill_working_bytes(config(group)) == (8192, prefill_working_bytes(8192, **shapes))
+    # no chunk is longer than the context
+    assert _prefill_working_bytes(config(group, context=4096)) == (4096, prefill_working_bytes(4096, **shapes))
+    # two ranks hold half the heads each
+    halved = {**shapes, "key_dim": 1024, "value_dim": 2048, "value_heads": 16}
+    two_ranks = config(group)
+    two_ranks.tp_info.size = 2
+    assert _prefill_working_bytes(two_ranks)[1] == prefill_working_bytes(8192, **halved)
+    # not counted: no linear attention layers, or the KDA kernels
+    assert _prefill_working_bytes(config(None))[1] == 0
+    assert _prefill_working_bytes(config(replace(group, variant="kda")))[1] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -889,7 +952,7 @@ def test_preset_serves_every_expert_resident_where_the_checkpoint_fits_and_the_s
     # 300 B of linear state, 7000 B for a prefill chunk; the weight file on disk is 100 B
     monkeypatch.setattr(engine, "resolve_pool_class", lambda model: SimpleNamespace(kv_cost=lambda config: (16_000, 500, 16, 0)))
     monkeypatch.setattr(engine, "state_pool_bytes", lambda config: 300)
-    monkeypatch.setattr(engine, "_prefill_working_bytes", lambda config, tokens: (7000, 0))
+    monkeypatch.setattr(engine, "_prefill_working_bytes", lambda config: (8192, 7000))
     need = 100 + 8192 * 1000 + 500 + 300 + 7000
 
     def strategy(free, fields=("moe_strategy",), **flags):
@@ -921,7 +984,7 @@ def test_preset_single_fast_serves_as_single_where_its_captures_do_not_fit(decod
     captures = ("prefill_graph_tokens", "prefill_graph_chunks")
     monkeypatch.setattr(engine, "resolve_pool_class", lambda model: SimpleNamespace(kv_cost=lambda config: (16_000, 500, 16, 0)))
     monkeypatch.setattr(engine, "state_pool_bytes", lambda config: 300)
-    monkeypatch.setattr(engine, "_prefill_working_bytes", lambda config, tokens: (7000, 0))
+    monkeypatch.setattr(engine, "_prefill_working_bytes", lambda config: (8192, 7000))
     monkeypatch.setattr(engine, "_adjust_spec_config", lambda config, override, windowed_kv: None)
     monkeypatch.setattr(engine, "_spec_runner", lambda: SimpleNamespace(budget=lambda config: (0, 0)))
     need = 100 + 8192 * 1000 + 500 + 300 + 7000
