@@ -41,6 +41,8 @@ def _fused_experts_decode_nvfp4(
     two_i = gate_up_packed.shape[1]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
+    if nvfp4_moe._DECODE_DISTINCT:
+        nvfp4_moe.count_distinct_experts(topk_ids)
 
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
     gemm_fn(

@@ -295,6 +295,216 @@ def _decode_nvfp4_marlin_kernel(
 
 
 @triton.jit
+def _marlin_row_tile(
+    partial, a_base, widx, w_mask,
+    b0, b1, b2, b3, b4, b5, b6, b7, scale,
+    stride_ak,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_KW: tl.constexpr,
+    A_WIDE: tl.constexpr,
+):
+    """One activation row against a decoded word tile: the row's ``partial`` after the tile, with the operations and their order of :func:`_decode_nvfp4_marlin_kernel`."""
+    if A_WIDE:
+        a64 = a_base.to(tl.pointer_type(tl.int64), bitcast=True)
+        v = tl.load(
+            a64 + widx[:, None] * 2 + tl.arange(0, 2)[None, :],
+            mask=w_mask[:, None], other=0,
+        )
+        v0, v1 = tl.split(v)
+        if a_base.dtype.element_ty == tl.bfloat16:
+            a0, a1, a2, a3 = _bf16x4_to_f32(v0)
+            a4, a5, a6, a7 = _bf16x4_to_f32(v1)
+        else:
+            a0, a1, a2, a3 = _f16x4_to_f32(v0)
+            a4, a5, a6, a7 = _f16x4_to_f32(v1)
+    else:
+        kbase = 8 * widx
+        a0 = tl.load(a_base + kbase * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+        a1 = tl.load(a_base + (kbase + 1) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+        a2 = tl.load(a_base + (kbase + 2) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+        a3 = tl.load(a_base + (kbase + 3) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+        a4 = tl.load(a_base + (kbase + 4) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+        a5 = tl.load(a_base + (kbase + 5) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+        a6 = tl.load(a_base + (kbase + 6) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+        a7 = tl.load(a_base + (kbase + 7) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+
+    acc_w = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_KW), dtype=tl.float32)
+    acc_w += a0[None, :] * b0
+    acc_w += a1[None, :] * b1
+    acc_w += a2[None, :] * b2
+    acc_w += a3[None, :] * b3
+    acc_w += a4[None, :] * b4
+    acc_w += a5[None, :] * b5
+    acc_w += a6[None, :] * b6
+    acc_w += a7[None, :] * b7
+    return partial + acc_w * scale
+
+
+@triton.jit
+def _marlin_row_out(
+    partial, g, route,
+    topk_weights_ptr,
+    stride_tw_m, stride_tw_k,
+    TOP_K: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+):
+    """A route's fp32 output row from its ``partial``, as the epilogue of :func:`_decode_nvfp4_marlin_kernel` computes it."""
+    accumulator = tl.sum(partial, axis=1)
+    accumulator = accumulator * g
+    if MUL_ROUTED_WEIGHT:
+        token = route // TOP_K
+        weight = tl.load(topk_weights_ptr + token * stride_tw_m + (route - token * TOP_K) * stride_tw_k)
+        accumulator = accumulator * weight
+    return accumulator
+
+
+@triton.jit
+def _decode_nvfp4_marlin_grouped_kernel(
+    a_ptr,             # [M, K] activations (compute dtype)
+    packed_ptr,        # [S, N, K // 8] int32 (8 fp4 codes per word, nibble j -> k=8*w+j)
+    scale_ptr,         # [S, N, K // 16] fp8-e4m3
+    global_ptr,        # [S, N] fp32
+    c_ptr,             # [M, TOP_K, N] output (compute dtype)
+    topk_weights_ptr,  # [M, TOP_K] fp32
+    topk_ids_ptr,      # [M, TOP_K] int32 -> cache slot
+    total_routes,
+    N,
+    K,
+    stride_am, stride_ak,
+    stride_pe, stride_pn, stride_pkw,
+    stride_se, stride_sn, stride_sblk,
+    stride_ge, stride_gn,
+    stride_cm, stride_ck, stride_cn,
+    stride_tw_m, stride_tw_k,
+    stride_tid_m, stride_tid_k,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_KW: tl.constexpr,
+    UNROLL: tl.constexpr,
+    TOP_K: tl.constexpr,
+    ROUTES_PAD: tl.constexpr,     # next power of two of total_routes
+    ROWS: tl.constexpr,           # routes of one slot a program computes: 1, 2 or 4
+    A_ROW_IS_ROUTE: tl.constexpr,
+    A_WIDE: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    compute_type: tl.constexpr,
+):
+    """:func:`_decode_nvfp4_marlin_kernel` with each weight tile read once for up to ``ROWS`` routes of its slot.
+
+    The grid is still one program per (route, N block), the size when every route has its own slot, so a captured graph
+    replays it for any routing. A program scans the step's slot ids: the routes of its slot, in route order, split into
+    runs of ``ROWS``; the first route of a run computes the whole run and every other program returns at once. Each
+    route keeps its own ``partial`` and goes through the per-route kernel's operations in its order, so the outputs are
+    its bits; only the loads and the decode of the weight words are shared."""
+    route_id = tl.program_id(0)
+    n_block_id = tl.program_id(1)
+    token_id = route_id // TOP_K
+    route_k = route_id - token_id * TOP_K
+    slot32 = tl.load(topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k)
+
+    offs_r = tl.arange(0, ROUTES_PAD)
+    r_token = offs_r // TOP_K
+    r_ids = tl.load(
+        topk_ids_ptr + r_token * stride_tid_m + (offs_r - r_token * TOP_K) * stride_tid_k,
+        mask=offs_r < total_routes, other=0,
+    )
+    same = (r_ids == slot32) & (offs_r < total_routes)
+    earlier = tl.sum(tl.where(offs_r < route_id, same.to(tl.int32), 0), axis=0)
+    if earlier % ROWS != 0:
+        return
+
+    offs_n = n_block_id * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    n_mask = offs_n < N
+    slot = slot32.to(tl.int64)
+
+    # the next routes of this slot, in route order; ROUTES_PAD marks a row of the run that has no route
+    a_base0 = a_ptr + (route_id if A_ROW_IS_ROUTE else token_id) * stride_am
+    partial0 = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_KW), dtype=tl.float32)
+    if ROWS > 1:
+        route1 = tl.min(tl.where(same & (offs_r > route_id), offs_r, ROUTES_PAD), axis=0)
+        live1 = route1 < ROUTES_PAD
+        a_base1 = a_ptr + (route1 if A_ROW_IS_ROUTE else route1 // TOP_K) * stride_am
+        partial1 = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_KW), dtype=tl.float32)
+    if ROWS > 2:
+        route2 = tl.min(tl.where(same & (offs_r > route1), offs_r, ROUTES_PAD), axis=0)
+        live2 = route2 < ROUTES_PAD
+        a_base2 = a_ptr + (route2 if A_ROW_IS_ROUTE else route2 // TOP_K) * stride_am
+        partial2 = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_KW), dtype=tl.float32)
+        route3 = tl.min(tl.where(same & (offs_r > route2), offs_r, ROUTES_PAD), axis=0)
+        live3 = route3 < ROUTES_PAD
+        a_base3 = a_ptr + (route3 if A_ROW_IS_ROUTE else route3 // TOP_K) * stride_am
+        partial3 = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_KW), dtype=tl.float32)
+
+    offs_kw = tl.arange(0, BLOCK_SIZE_KW)
+    offs_kh = tl.arange(0, BLOCK_SIZE_KW // 2)
+    K_WORDS = K // 8
+
+    p_base = packed_ptr + slot * stride_pe + offs_n[:, None] * stride_pn
+    s_base = scale_ptr + slot * stride_se + offs_n[:, None] * stride_sn
+    for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_SIZE_KW), UNROLL):
+        for u in tl.static_range(UNROLL):
+            widx = (kw_start + u) * BLOCK_SIZE_KW + offs_kw
+            w_mask = widx < K_WORDS
+            word = tl.load(
+                p_base + widx[None, :] * stride_pkw,
+                mask=n_mask[:, None] & w_mask[None, :], other=0,
+            )
+            hidx = (kw_start + u) * (BLOCK_SIZE_KW // 2) + offs_kh
+            s_ptrs = s_base + hidx[None, :] * stride_sblk
+            s_mask = n_mask[:, None] & (hidx[None, :] < K_WORDS // 2)
+            if e4m3_native_cx():
+                s_half = tl.load(s_ptrs, mask=s_mask, other=0.0).to(tl.float32)
+            else:
+                s_half = e4m3_u8_to_f32(tl.load(s_ptrs, mask=s_mask, other=0))
+            s_half = s_half * 16384.0
+            scale = tl.interleave(s_half, s_half)
+
+            b0, b4 = _nvfp4_pair_f32(word)
+            b1, b5 = _nvfp4_pair_f32(word >> 4)
+            b2, b6 = _nvfp4_pair_f32(word >> 8)
+            b3, b7 = _nvfp4_pair_f32(word >> 12)
+            partial0 = _marlin_row_tile(
+                partial0, a_base0, widx, w_mask, b0, b1, b2, b3, b4, b5, b6, b7, scale,
+                stride_ak, BLOCK_SIZE_N, BLOCK_SIZE_KW, A_WIDE,
+            )
+            if ROWS > 1:
+                if live1:
+                    partial1 = _marlin_row_tile(
+                        partial1, a_base1, widx, w_mask, b0, b1, b2, b3, b4, b5, b6, b7, scale,
+                        stride_ak, BLOCK_SIZE_N, BLOCK_SIZE_KW, A_WIDE,
+                    )
+            if ROWS > 2:
+                if live2:
+                    partial2 = _marlin_row_tile(
+                        partial2, a_base2, widx, w_mask, b0, b1, b2, b3, b4, b5, b6, b7, scale,
+                        stride_ak, BLOCK_SIZE_N, BLOCK_SIZE_KW, A_WIDE,
+                    )
+                if live3:
+                    partial3 = _marlin_row_tile(
+                        partial3, a_base3, widx, w_mask, b0, b1, b2, b3, b4, b5, b6, b7, scale,
+                        stride_ak, BLOCK_SIZE_N, BLOCK_SIZE_KW, A_WIDE,
+                    )
+
+    g = tl.load(global_ptr + slot * stride_ge + offs_n * stride_gn, mask=n_mask, other=0.0).to(tl.float32)
+    c_base = c_ptr + offs_n * stride_cn
+    out0 = _marlin_row_out(partial0, g, route_id, topk_weights_ptr, stride_tw_m, stride_tw_k, TOP_K, MUL_ROUTED_WEIGHT)
+    tl.store(c_base + token_id * stride_cm + route_k * stride_ck, out0.to(compute_type), mask=n_mask)
+    if ROWS > 1:
+        if live1:
+            out1 = _marlin_row_out(partial1, g, route1, topk_weights_ptr, stride_tw_m, stride_tw_k, TOP_K, MUL_ROUTED_WEIGHT)
+            token1 = route1 // TOP_K
+            tl.store(c_base + token1 * stride_cm + (route1 - token1 * TOP_K) * stride_ck, out1.to(compute_type), mask=n_mask)
+    if ROWS > 2:
+        if live2:
+            out2 = _marlin_row_out(partial2, g, route2, topk_weights_ptr, stride_tw_m, stride_tw_k, TOP_K, MUL_ROUTED_WEIGHT)
+            token2 = route2 // TOP_K
+            tl.store(c_base + token2 * stride_cm + (route2 - token2 * TOP_K) * stride_ck, out2.to(compute_type), mask=n_mask)
+        if live3:
+            out3 = _marlin_row_out(partial3, g, route3, topk_weights_ptr, stride_tw_m, stride_tw_k, TOP_K, MUL_ROUTED_WEIGHT)
+            token3 = route3 // TOP_K
+            tl.store(c_base + token3 * stride_cm + (route3 - token3 * TOP_K) * stride_ck, out3.to(compute_type), mask=n_mask)
+
+
+@triton.jit
 def _e2m1_f16_x2p14(code):
     """e2m1 code (low 4 bits) -> fp16 value * 2^-14: magnitude bits go to fp16 [11:9], the sign to [15]; fp16 subnormals line up the e == 0 codes."""
     bits = ((code & 7) << 9) | ((code & 8) << 12)
@@ -519,6 +729,7 @@ def _prefill_nvfp4_moe_kernel(
 __all__ = [
     "_decode_nvfp4_moe_kernel",
     "_decode_nvfp4_marlin_kernel",
+    "_decode_nvfp4_marlin_grouped_kernel",
     "_prefill_nvfp4_moe_kernel",
     "_e2m1_lut",
 ]

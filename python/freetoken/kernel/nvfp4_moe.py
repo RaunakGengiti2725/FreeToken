@@ -6,6 +6,7 @@ The kernels are templates (:mod:`freetoken.kernel.triton.nvfp4_fused_moe`, :mod:
 
 from __future__ import annotations
 
+import atexit
 import functools
 import math
 import os
@@ -21,6 +22,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from freetoken.kernel.backend import is_rocm
 from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view, e4m3_native
 from freetoken.kernel.triton.nvfp4_fused_moe import (
+    _decode_nvfp4_marlin_grouped_kernel,
     _decode_nvfp4_marlin_kernel,
     _decode_nvfp4_moe_kernel,
     _e2m1_lut,
@@ -47,6 +49,18 @@ _DECODE_MARLIN_DEEPK_BLOCK_N = 8
 _DECODE_MARLIN_DEEPK_BLOCK_KW = 32
 _DECODE_MARLIN_DEEPK_UNROLL = 2
 _DECODE_MARLIN_DEEPK_THRESHOLD = 2048
+
+# Rows of a batched decode step often route to the same expert. The grouped kernel reads such an expert's weights once
+# for up to _DECODE_GROUP_ROWS of its routes; FREETOKEN_NVFP4_DECODE_GROUPED=0 keeps one read per route, to A/B.
+DECODE_GROUPED_ENV = "FREETOKEN_NVFP4_DECODE_GROUPED"
+_DECODE_GROUPED = os.environ.get(DECODE_GROUPED_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
+_DECODE_GROUP_ROWS = 4
+
+# FREETOKEN_NVFP4_DECODE_DISTINCT=1 counts the distinct experts of every decode layer call per row count, on the device
+# so that graph replays count too, and logs the means at exit. Debug only: it adds launches to each layer.
+DECODE_DISTINCT_ENV = "FREETOKEN_NVFP4_DECODE_DISTINCT"
+_DECODE_DISTINCT = os.environ.get(DECODE_DISTINCT_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+_DISTINCT_COUNTS: Dict[Tuple[torch.device, int], torch.Tensor] = {}
 
 
 def _tl_dtype(dt: torch.dtype):
@@ -95,6 +109,35 @@ def decode_gemm(
     )
 
 
+def count_distinct_experts(topk_ids: torch.Tensor) -> None:
+    """Add one decode layer call's distinct experts to the device counters of its row count."""
+    key = (topk_ids.device, topk_ids.shape[0])
+    counts = _DISTINCT_COUNTS.get(key)
+    if counts is None:
+        if not _DISTINCT_COUNTS:
+            atexit.register(_log_distinct_experts)
+        counts = _DISTINCT_COUNTS[key] = torch.zeros(2, dtype=torch.int64, device=topk_ids.device)
+    ids = topk_ids.reshape(-1)
+    repeats = (ids[:, None] == ids[None, :]).tril(-1).any(dim=1)
+    counts[0] += 1
+    counts[1] += ids.numel() - repeats.sum()
+
+
+def decode_distinct_experts() -> Dict[int, Tuple[int, float]]:
+    """rows -> (decode layer calls, mean distinct experts a call) of the calls counted so far."""
+    out: Dict[int, Tuple[int, float]] = {}
+    for (_, rows), counts in sorted(_DISTINCT_COUNTS.items(), key=lambda item: item[0][1]):
+        calls, distinct = counts.tolist()
+        seen, total = out.get(rows, (0, 0.0))
+        out[rows] = (seen + calls, total + distinct)
+    return {rows: (calls, total / calls) for rows, (calls, total) in out.items()}
+
+
+def _log_distinct_experts() -> None:
+    for rows, (calls, mean) in decode_distinct_experts().items():
+        logger.warning("%s: %d rows route to %.2f distinct experts a layer (%d layer calls)", DECODE_DISTINCT_ENV, rows, mean, calls)
+
+
 def decode_gemm_marlin(
     a: torch.Tensor,
     packed: torch.Tensor,
@@ -105,10 +148,14 @@ def decode_gemm_marlin(
     topk_ids: torch.Tensor,
     mul_routed_weight: bool,
     a_row_is_route: bool,
+    grouped: bool | None = None,
 ) -> None:
     """Marlin-style decode GEMV: int32 wide loads + deferred reduction
     (:func:`_decode_nvfp4_marlin_kernel`). ``packed`` is the uint8 ``[S, N, K//2]`` bank;
-    it is reinterpreted as int32 ``[S, N, K//8]`` (contiguous, K%8==0 for NVFP4)."""
+    it is reinterpreted as int32 ``[S, N, K//8]`` (contiguous, K%8==0 for NVFP4).
+
+    ``grouped`` picks :func:`_decode_nvfp4_marlin_grouped_kernel`, which gives the same bits; unset, it follows
+    FREETOKEN_NVFP4_DECODE_GROUPED for more than one row. One row's routes are its top-k, with nothing to share."""
     M, top_k = topk_ids.shape
     N = packed.shape[1]
     K = packed.shape[2] * 2
@@ -124,8 +171,15 @@ def decode_gemm_marlin(
         a.dtype in (torch.bfloat16, torch.float16)
         and a.stride(1) == 1 and a.stride(0) % 8 == 0 and a.data_ptr() % 16 == 0
     )
+    if grouped is None:
+        grouped = _DECODE_GROUPED and M > 1
+    kernel, group = _decode_nvfp4_marlin_kernel, {}
+    if grouped:
+        kernel = _decode_nvfp4_marlin_grouped_kernel
+        group = dict(ROUTES_PAD=triton.next_power_of_2(total_routes), ROWS=_DECODE_GROUP_ROWS)
+    # the grouped kernel keeps this grid: it is the worst case, every route on its own slot
     grid = (total_routes, triton.cdiv(N, block_n))
-    _decode_nvfp4_marlin_kernel[grid](
+    kernel[grid](
         a, packed_i32, scale, glob, c, topk_weights, topk_ids,
         total_routes, N, K,
         a.stride(0), a.stride(1),
@@ -139,6 +193,7 @@ def decode_gemm_marlin(
         BLOCK_SIZE_KW=block_kw,
         UNROLL=unroll,
         TOP_K=top_k,
+        **group,
         A_ROW_IS_ROUTE=a_row_is_route,
         A_WIDE=a_wide,
         MUL_ROUTED_WEIGHT=mul_routed_weight,

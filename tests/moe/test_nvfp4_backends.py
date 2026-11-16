@@ -863,6 +863,61 @@ def test_triton_decode_marlin_unsummed_routes_are_what_its_sum_kernel_reads():
 
 
 @cuda
+@pytest.mark.parametrize("rows,routes,dtype", [
+    *((rows, routes, torch.bfloat16) for rows in range(1, 9) for routes in ("shared", "distinct")),
+    (5, "shared", torch.float32),  # activations the kernel loads one value at a time
+])
+def test_triton_decode_grouped_kernel_gives_the_per_route_bits(monkeypatch, rows, routes, dtype):
+    """The grouped decode GEMV reads an expert once for the rows that share it and must give every route the bits of
+    the per-route kernel: both GEMMs at the 35B-A3B shapes (deep-K and short-K tiles), with and without the routed
+    weight, rows on shared experts (more routes of an expert than one program takes, and a repeat inside a row) and
+    rows on distinct experts."""
+    import freetoken.moe.fused_nvfp4 as fused_nvfp4
+    from freetoken.kernel import nvfp4_moe
+
+    device = torch.device("cuda")
+    slots, top_k, hidden_size, inter = 72, 8, 2048, 512
+    g = torch.Generator().manual_seed(100 * rows + len(routes))
+
+    def bank(n, k):
+        packed = torch.randint(0, 256, (slots, n, k // 2), dtype=torch.uint8, generator=g)
+        scale = (torch.rand(slots, n, k // 16, generator=g) * 1.5 + 0.25).to(torch.float8_e4m3fn)
+        return packed.to(device), scale.to(device), (torch.rand(slots, n, generator=g) + 0.5).to(device)
+
+    gate_up, down = bank(2 * inter, hidden_size), bank(hidden_size, inter)
+    if routes == "distinct":
+        ids = torch.randperm(slots, generator=g)[: rows * top_k].view(rows, top_k)
+    else:
+        ids = torch.stack([torch.randperm(12, generator=g)[:top_k] for _ in range(rows)])
+        ids[0, 1] = ids[0, 0]
+    ids = ids.to(device, torch.int32).contiguous()
+    weights = torch.rand(rows, top_k, generator=g).to(device)
+    x = (torch.randn(rows, hidden_size, generator=g) / 4).to(device, dtype)
+    act = (torch.randn(rows * top_k, inter, generator=g) / 4).to(device, dtype)
+
+    def bits(t):
+        return t.view(torch.int16 if t.dtype == torch.bfloat16 else torch.int32)
+
+    for a, (packed, scale, glob), a_row_is_route in ((x, gate_up, False), (act, down, True)):
+        for mul_routed_weight in (False, True):
+            out = []
+            for grouped in (False, True):
+                c = torch.full((rows, top_k, packed.shape[1]), float("nan"), dtype=dtype, device=device)
+                nvfp4_moe.decode_gemm_marlin(a, packed, scale, glob, c, weights, ids, mul_routed_weight, a_row_is_route, grouped=grouped)
+                out.append(c)
+            assert not torch.isnan(out[1]).any()
+            assert torch.equal(bits(out[0]), bits(out[1])), (packed.shape, mul_routed_weight)
+
+    if dtype != torch.bfloat16:
+        return
+    layer = []
+    for grouped in (False, True):
+        monkeypatch.setattr(nvfp4_moe, "_DECODE_GROUPED", grouped)
+        layer.append(fused_nvfp4.fused_experts_decode_nvfp4_marlin(x, *gate_up, *down, weights, ids, "silu", False))
+    assert torch.equal(bits(layer[0]), bits(layer[1]))
+
+
+@cuda
 def test_b12x_decode_matches_dequant_reference():
     """sm_120 + CUDA>=13 only: the flashinfer b12x W4A16 fused MoE over the slot cache
     vs the dequant reference (skipped on hardware/toolkits where b12x cannot run)."""
