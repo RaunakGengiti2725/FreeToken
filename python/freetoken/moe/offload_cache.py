@@ -1203,6 +1203,10 @@ class OffloadMoeCache:
         """Whether a prefill keeps the experts it streams (see _keep_streamed_experts): hit-d2d prefills with GPU decode."""
         return self.prefill_hit_d2d and self.prefill_overlap and self.decode_target == "gpu" and self.device.type == "cuda"
 
+    def warm_prefill_keeps(self) -> bool:
+        """Whether a warmup prefill would leave experts resident: the cache keeps what a prefill streams and the hit-d2d split is usable. Asked once at startup, where a fallback is logged."""
+        return self.keeps_streamed_experts and self._hit_d2d_usable()
+
     def _keep_streamed_experts(self, layer_id: int, buffer_id: int, absent) -> None:
         """Copy the experts ``layer_id`` streamed from host, staging buffer -> empty slots, and register them.
 
