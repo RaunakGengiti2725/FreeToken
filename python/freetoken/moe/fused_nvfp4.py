@@ -113,6 +113,21 @@ def fused_experts_decode_nvfp4_serial(
     )
 
 
+def _align_routes(
+    topk_ids: torch.Tensor, block_m: int, num_experts: int, tile_experts: int, slot_of: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``moe_align_block_size`` over the ``num_experts`` bank rows ``topk_ids`` index; or, with ``slot_of``, over the
+    layer's ``tile_experts`` expert ids, each M block then naming the bank row (slot) of its expert.
+
+    Aligning over a pool of slots sizes ``sorted_ids``, and with it the GEMM grid, for a padded block per slot of the
+    pool, though a layer's routes reach ``tile_experts`` of them at most."""
+    if slot_of is None:
+        return moe_align_block_size(topk_ids, block_m, num_experts)
+    sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, block_m, tile_experts)
+    # the blocks past ntpp are never run but hold uninitialized ids
+    return sorted_ids, slot_of.index_select(0, expert_ids.clamp_(0, tile_experts - 1)), ntpp
+
+
 def fused_experts_nvfp4(
     hidden_states: torch.Tensor,
     gate_up_packed: torch.Tensor,
@@ -128,18 +143,24 @@ def fused_experts_nvfp4(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    routed_experts: int | None = None,
+    slot_of: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prefill inline-NVFP4 MoE. ``topk_ids`` index rows of the bank tensors in
     ``[0, num_experts)``: full-layer banks with position == expert id (the
-    materialized ``[:E]`` slot view or the overlap double buffer), raw ids."""
+    materialized ``[:E]`` slot view or the overlap double buffer), raw ids; or the
+    cache slots a demand prefill chunk routes to, whose layer's ``routed_experts``
+    size the tiles as the stream's banks would. With ``slot_of`` they are the expert
+    ids of that layer, and ``slot_of[expert]`` the bank row of each."""
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
-    cfg = nvfp4_moe.prefill_config(M, top_k, num_experts, hidden_states.device.index)
+    tile_experts = num_experts if routed_experts is None else routed_experts
+    cfg = nvfp4_moe.prefill_config(M, top_k, tile_experts, hidden_states.device.index)
 
-    sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
+    sorted_ids, expert_ids, ntpp = _align_routes(topk_ids, cfg["BLOCK_SIZE_M"], num_experts, tile_experts, slot_of)
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 
@@ -178,23 +199,28 @@ def fused_experts_nvfp4_w4a4(
     activation: str = "silu",
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    routed_experts: int | None = None,
+    slot_of: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prefill NVFP4 MoE with NVFP4 activations (W4A4) where the GPU and the batch favour it, else :func:`fused_experts_nvfp4`.
 
-    ``*_input_scale`` are the per-expert static activation scales of the ``num_experts`` banks; each GEMM input is quantized under their max, as vLLM does.
+    ``*_input_scale`` are the per-expert static activation scales of the experts the routes are drawn from: the
+    ``num_experts`` banks, or a demand prefill chunk's layer of ``routed_experts`` where the banks are cache slots.
+    Each GEMM input is quantized under their max, as vLLM does.
     """
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     inter = gate_up_packed.shape[1] // 2
-    cfg = nvfp4_moe.w4a4_prefill_config(M, top_k, num_experts, H, inter, activation, hidden_states.dtype, hidden_states.device.index)
+    tile_experts = num_experts if routed_experts is None else routed_experts
+    cfg = nvfp4_moe.w4a4_prefill_config(M, top_k, tile_experts, H, inter, activation, hidden_states.dtype, hidden_states.device.index)
     if cfg is None:
         return fused_experts_nvfp4(
             hidden_states, gate_up_packed, gate_up_scale, gate_up_global, down_packed, down_scale, down_global,
-            topk_weights, topk_ids, num_experts, activation, False, act_alpha, act_limit,
+            topk_weights, topk_ids, num_experts, activation, False, act_alpha, act_limit, routed_experts, slot_of,
         )
     dev = hidden_states.device
-    g = torch.stack((gate_up_input_scale[:num_experts], down_input_scale[:num_experts])).float().amax(dim=1)
-    sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
+    g = torch.stack((gate_up_input_scale[:tile_experts], down_input_scale[:tile_experts])).float().amax(dim=1)
+    sorted_ids, expert_ids, ntpp = _align_routes(topk_ids, cfg["BLOCK_SIZE_M"], num_experts, tile_experts, slot_of)
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 

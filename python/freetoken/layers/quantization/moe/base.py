@@ -77,6 +77,19 @@ class BankSpec:
     resident: bool = False
 
 
+@dataclass(frozen=True)
+class RoutedExperts:
+    """The layer behind the slot view of a demand prefill chunk: the prefill GEMMs size their tiles by its ``count`` of
+    experts and W4A4 takes its activation scales over their ``alphas``, as the stream of that layer would.
+
+    With ``slot_of`` (the slot of each of the layer's experts) the routes handed to ``apply`` are still expert ids:
+    a kernel with ``groups_prefill_by_expert`` groups them over ``count`` experts and reads each group's weights at its slot."""
+
+    count: int
+    alphas: tuple[torch.Tensor, torch.Tensor] | None = None
+    slot_of: torch.Tensor | None = None
+
+
 @dataclass
 class ExpertView:
     """The weights an apply() call reads: layout roles -> [E, ...] (resident, materialized layer) or [S, ...] (slot cache)."""
@@ -87,6 +100,7 @@ class ExpertView:
     alphas: tuple[torch.Tensor, torch.Tensor] | None = None
     # False: a decode apply() may return each route's weighted output [M, top_k, hidden], unsummed
     sum_routes: bool = True
+    routed: RoutedExperts | None = None
 
 
 def fused_piece(pieces: dict[str, torch.Tensor], role: str) -> torch.Tensor:
@@ -146,6 +160,8 @@ class MoEKernel(ABC):
     # Hybrid decode hands the GPU a route split with such holes; kernels without this get the holes
     # pointed at slot 0 with weight 0 (slot storage is zero-filled at allocation, so that is exact).
     supports_inactive_slots: ClassVar[bool] = False
+    # Whether a prefill ``apply`` over a slot view takes ``RoutedExperts.slot_of`` with the routes left as expert ids.
+    groups_prefill_by_expert: ClassVar[bool] = False
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         return None

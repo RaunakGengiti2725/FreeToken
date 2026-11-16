@@ -68,16 +68,22 @@ class Qwen3_5Attention(BaseOP):
 
         self._fuse_gate = attn_gate_fusable()
 
-    def _project(self, x: torch.Tensor, gate_in_place: bool = False):
+    def _project(self, x: torch.Tensor, gate_in_place: bool = False, gate_view: bool = False):
         """Returns (q, k, v, gate): q [N, num_q, head_dim] post qk-norm+rope,
         k [N, num_kv*head_dim] post norm+rope, v [N, num_kv*head_dim], gate [N, num_q*head_dim].
-        ``gate_in_place`` returns the q|gate projection [N, num_q, head_dim*2] as the gate, uncopied."""
+        ``gate_in_place`` returns the q|gate projection [N, num_q, head_dim*2] as the gate, uncopied;
+        ``gate_view`` its gate half [N, num_q, head_dim], a strided view of the projection."""
         positions = get_global_ctx().batch.get_attn_positions()
         qkv = self.qkv_proj.forward(x)
         qg, k, v = torch.split(qkv, self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
         q = qg[..., : self.head_dim].contiguous()  # [N, num_q, head_dim]
-        gate = qg if gate_in_place else qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
+        if gate_in_place:
+            gate = qg
+        elif gate_view:
+            gate = qg[..., self.head_dim :]
+        else:
+            gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
         k = k.view(-1, self.num_kv, self.head_dim).contiguous()
         v = v.contiguous()  # split view has the qkv row stride; the KV store needs contiguous
         q = self.q_norm.forward(q).reshape(-1, self.qo_attn_dim)
@@ -86,7 +92,8 @@ class Qwen3_5Attention(BaseOP):
         return q.view(-1, self.num_q, self.head_dim), k, v, gate
 
     def _combine(self, attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        gated = attn_out.reshape(-1, self.qo_attn_dim) * torch.sigmoid(gate)
+        # the sigmoid of a strided gate view comes out dense: the reshape is free either way
+        gated = attn_out.reshape(-1, self.qo_attn_dim) * torch.sigmoid(gate).reshape(-1, self.qo_attn_dim)
         return self.o_proj.forward(gated)
 
     @nvtx_annotate("MHA")
@@ -94,7 +101,8 @@ class Qwen3_5Attention(BaseOP):
         ctx = get_global_ctx()
         # a bf16 decode step gates the output in one kernel, bit for bit what _combine gives
         fuse = self._fuse_gate and x.dtype == torch.bfloat16 and not ctx.batch.is_prefill
-        q, k, v, gate = self._project(x, gate_in_place=fuse)
+        # a prefill's gate is read by the sigmoid where it lies: no [N, num_q*head_dim] copy of it
+        q, k, v, gate = self._project(x, gate_in_place=fuse, gate_view=ctx.batch.is_prefill)
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
         if fuse and o.dtype == torch.bfloat16:
             from freetoken.kernel.triton.attn_gate import attn_gate_mul

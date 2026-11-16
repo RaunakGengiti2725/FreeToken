@@ -23,18 +23,20 @@ def _bf16_offload_layer(layer_id: int, num_experts: int, top_k: int, hidden_size
     )
 
 
-def _make_layer_and_cache():
+def _make_layer_and_cache(num_experts: int = 4, cache_size: int = 6):
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     _init_tp()
-    layer = _bf16_offload_layer(0, 4, 2, 8, 16)
+    layer = _bf16_offload_layer(0, num_experts, 2, 8, 16)
     cache = OffloadMoeCache(
         num_layers=1,
-        num_experts=4,
-        cache_size=6,
+        num_experts=num_experts,
+        cache_size=cache_size,
         device=torch.device("cpu"),
     )
-    cache.set_bank_sources({"gate_up": [torch.randn(4, 32, 8)], "down": [torch.randn(4, 8, 16)]})
+    cache.set_bank_sources(
+        {"gate_up": [torch.randn(num_experts, 32, 8)], "down": [torch.randn(num_experts, 8, 16)]}
+    )
     layer.offload_cache = cache
     return layer, cache
 
@@ -123,6 +125,108 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
     assert calls["topk_ids"].dtype == torch.int32
     # slot == expert id after materialize, so the routing ids pass through unmapped
     assert calls["topk_ids"].tolist() == [[2, 1]]
+
+
+def test_offload_moe_layer_short_prefill_loads_its_experts_through_the_slot_cache(monkeypatch):
+    from freetoken.layers.quantization import RoutedExperts
+    from freetoken.moe import offload_kernels
+
+    layer, cache = _make_layer_and_cache(num_experts=160, cache_size=192)
+    cache.prefill_demand_tokens = 96
+    cache.collect_decode_freq = True
+    # the first 96 tokens route 192 times, to all 160 experts
+    routes = torch.arange(194, dtype=torch.int32).remainder(160).view(97, 2)
+    events = []
+    calls = {}
+
+    monkeypatch.setattr(
+        "freetoken.layers.moe.fused_topk",
+        lambda *, hidden_states, gating_output, topk, renormalize: (
+            torch.rand(hidden_states.shape[0], 2), routes[: hidden_states.shape[0]].clone()
+        ),
+    )
+    monkeypatch.setattr(cache, "materialize_layer", lambda layer_id: events.append(("materialized", layer_id)))
+    monkeypatch.setattr(cache, "copy_missing", lambda: events.append(("copied",)))
+
+    def admit(cache, layer_id, expert_ids, *, record_stats=True):
+        # the slot cache's contract: every queried expert resident, the query rewritten to its slots in place
+        query = expert_ids.view(-1)
+        events.append(("admitted", query.tolist(), record_stats))
+        cache.slot_for_id[layer_id, query.long()] = cache.cache_size - 1 - query
+        query.copy_(cache.cache_size - 1 - query)
+
+    monkeypatch.setattr(offload_kernels, "ensure_experts", admit)
+
+    def fake_fused(hidden_states, w1, w2, got_topk_weights, got_topk_ids, activation, apply_router_weight_on_input,
+                   act_alpha=1.0, act_limit=float("inf")):
+        calls["w1"] = w1
+        calls["topk_ids"] = got_topk_ids.clone()
+        return hidden_states
+
+    monkeypatch.setattr("freetoken.moe.fused.fused_experts_impl", fake_fused)
+    apply = layer.quant_method.apply
+
+    def apply_and_keep_the_view(*args, **kwargs):
+        calls["view"] = args[3]
+        return apply(*args, **kwargs)
+
+    monkeypatch.setattr(layer.quant_method, "apply", apply_and_keep_the_view)
+
+    hidden_states = torch.randn(96, 8)
+    out = layer.prefill_forward(hidden_states, torch.randn(96, 160))
+
+    admissions = [event for event in events if event[0] == "admitted"]
+    # lru_ensure takes at most 128 ids a query, never a chunk's routes
+    assert [len(query) for _, query, _ in admissions] == [128, 32]
+    # each query's misses are copied before the next query can evict
+    assert events == [event for admission in admissions for event in (admission, ("copied",))]
+    assert sorted(expert for _, query, _ in admissions for expert in query) == list(range(160))
+    assert not any(record_stats for *_, record_stats in admissions)
+    assert int(cache.decode_freq.sum()) == 0
+    assert out is hidden_states
+    # the grouped GEMM reads the whole slot cache at the slots the admission wrote
+    assert calls["w1"].shape[0] == cache.cache_size
+    assert torch.equal(calls["topk_ids"], cache.cache_size - 1 - routes[:96])
+    # and sizes itself by the layer's experts, which bf16 keeps no scales for
+    assert calls["view"].routed == RoutedExperts(160, None)
+
+    events.clear()
+    layer.prefill_forward(torch.randn(97, 8), torch.randn(97, 160))
+    assert events == [("materialized", 0), ("copied",)]
+
+
+@pytest.mark.parametrize(("kernel_groups", "switch"), [(True, True), (False, True), (True, False)])
+def test_offload_moe_layer_resident_prefill_leaves_the_slot_lookup_to_a_kernel_that_groups_by_expert(monkeypatch, kernel_groups, switch):
+    """Once every expert is resident, a kernel that groups a prefill's routes by expert gets the expert ids and the
+    layer's live row of the slot table; any other kernel, or the switch off, gets the routes as slots."""
+    layer, cache = _make_layer_and_cache(num_experts=4, cache_size=12)
+    cache.all_resident = True
+    cache.slot_for_id[0] = torch.tensor([9, 4, 11, 6], dtype=torch.int32)
+    routes = torch.tensor([[2, 1], [0, 2], [3, 2]], dtype=torch.int32)
+    calls = {}
+    monkeypatch.setattr("freetoken.layers.moe._PREFILL_EXPERT_ALIGN", switch)
+    monkeypatch.setattr(type(layer.quant_method.kernel), "groups_prefill_by_expert", kernel_groups)
+    monkeypatch.setattr(layer.quant_method, "apply", lambda x, w, ids, view, **kwargs: calls.update(ids=ids.clone(), view=view))
+
+    layer._prefill_routed(torch.randn(3, 8), torch.rand(3, 2), routes.clone())
+
+    routed = calls["view"].routed
+    assert calls["view"].n == cache.cache_size and routed.count == 4
+    if kernel_groups and switch:
+        assert torch.equal(calls["ids"], routes)
+        assert routed.slot_of.data_ptr() == cache.slot_for_id.data_ptr() and routed.slot_of.tolist() == [9, 4, 11, 6]
+    else:
+        assert calls["ids"].tolist() == [[11, 4], [9, 11], [6, 11]]
+        assert routed.slot_of is None
+
+
+def test_offload_moe_cache_takes_a_prefill_chunk_on_demand_only_within_its_threshold():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"))
+    assert not cache.loads_prefill_on_demand(0)
+    cache.prefill_demand_tokens = 2
+    assert [cache.loads_prefill_on_demand(tokens) for tokens in range(4)] == [False, True, True, False]
 
 
 def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(monkeypatch):
@@ -240,6 +344,22 @@ def test_offload_moe_cache_marlin_rejects_slot_count_beyond_kernel_limit():
         )
 
 
+@pytest.mark.parametrize("decode_target", ["cpu", "hybrid"])
+def test_offload_moe_cache_rejects_demand_prefill_without_gpu_decode(decode_target):
+    # a demand-loaded chunk admits its experts into GPU decode's slot cache, which cpu and hybrid decode do not read
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    with pytest.raises(ValueError, match="needs GPU decode"):
+        OffloadMoeCache(
+            num_layers=1,
+            num_experts=4,
+            cache_size=6,
+            device=torch.device("cpu"),
+            decode_target=decode_target,
+            prefill_demand_tokens=64,
+        )
+
+
 def test_prefill_overlap_prefetch_invalidates_borrowed_unified_cache_slots():
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -275,6 +395,39 @@ def test_prefill_overlap_prefetch_invalidates_borrowed_unified_cache_slots():
         assert int(cache.slot_for_id[layer_id, expert_id].item()) == -1
     assert torch.equal(cache.bank_caches["gate_up"][:num_experts], gate_up_source[0])
     assert torch.equal(cache.bank_caches["down"][:num_experts], down_source[0])
+
+
+def test_prefill_keeps_the_most_recently_used_experts_out_of_its_staging_slots():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    L, E = 4, 4
+    cache = OffloadMoeCache(num_layers=L, num_experts=E, cache_size=4 * E, device=torch.device("cpu"), prefill_overlap=True, prefill_hit_d2d=True)
+    cache.set_bank_sources({
+        "gate_up": [torch.randn(E, 32, 8) for _ in range(L)],
+        "down": [torch.randn(E, 8, 16) for _ in range(L)],
+    })
+    assert cache._pool_stable_from == [2 * E]
+    # what decode left: the last use of each slot's expert, 0 for the one empty slot; the first 2 * E slots get staged over
+    uses = [15, 3, 12, 1, 9, 14, 2, 6] + [10, 4, 13, 0, 5, 11, 7, 8]
+    owner = {slot: (7 * slot + 3) % (L * E) for slot, use in enumerate(uses) if use}
+    for slot, i in owner.items():
+        cache.id_of_slot[slot], cache.usage[slot], cache.slot_for_id.view(-1)[i] = i, uses[slot], slot
+        for src, bank in cache.banks:
+            bank[slot] = src[i // E][i % E]
+
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    cache.prefetch_prefill_layer(1)
+
+    # the slots outside the staging buffers hold the most recently used experts of the whole pool, each with its own rows
+    kept = {owner[slot]: uses[slot] for slot in sorted(owner, key=uses.__getitem__)[-2 * E :]}
+    resident = {i: slot for i, slot in enumerate(cache.slot_for_id.view(-1).tolist()) if slot >= 0}
+    assert set(resident) == set(kept)
+    assert sorted(cache.id_of_slot.tolist()) == [-1] * (2 * E) + sorted(kept)
+    for i, slot in resident.items():
+        assert slot >= 2 * E and int(cache.id_of_slot[slot]) == i and int(cache.usage[slot]) == kept[i]
+        for src, bank in cache.banks:
+            assert torch.equal(bank[slot], src[i // E][i % E])
 
 
 def test_prefill_overlap_waits_for_previous_prefill_release_after_begin(monkeypatch):

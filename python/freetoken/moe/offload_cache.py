@@ -128,6 +128,9 @@ class OffloadMoeCache:
     cache_size: int
     device: torch.device
     cache_policy: str = "lru"
+    # A prefill chunk of at most this many tokens admits the experts it routes to into the slot
+    # cache, as decode does, instead of streaming every expert of each layer; 0 streams them all.
+    prefill_demand_tokens: int = 0
     prefill_overlap: bool = False
     # Prefill hit/miss split: experts already resident in the slot cache (slots
     # >= 2 * num_experts) are gathered device-side into the double buffer instead
@@ -176,6 +179,10 @@ class OffloadMoeCache:
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
+        if self.prefill_demand_tokens and self.decode_target != "gpu":
+            raise ValueError(
+                f"--moe-prefill-demand-tokens needs GPU decode; this cache decodes on {self.decode_target!r}"
+            )
         if self.layer_layouts is not None:
             assert self.layout is None, "pass layout or layer_layouts, not both"
             assert len(self.layer_layouts) == self.num_layers, (len(self.layer_layouts), self.num_layers)
@@ -344,6 +351,20 @@ class OffloadMoeCache:
         self._prefill_slot_snapshot: torch.Tensor | None = None
         self._prefill_snapshot_np = None
         self._prefill_hit_d2d_active = False
+        # every expert of every layer has a slot outside the staging buffers: begin_prefill sees it in its snapshot.
+        # Nothing evicts from then on (decode and prefill only hit), so it holds until the cache is reset or rebuilt,
+        # and a prefill reads the slots as decode does, with no staging, gather or host sync.
+        self.all_resident = False
+        # A chunk with fewer routes than a layer has experts cannot route to all of them: its hit gather waits
+        # for the layer's routes (wait_prefill_layer) and copies only the routed residents.
+        # _prefill_gather_pending[b]: whether buffer b's waiting gather takes every bank.
+        self._prefill_gather_routed = False
+        self._prefill_gather_pending: list[bool | None] = [None, None]
+        # Empty slots outside the staging buffers at the chunk's start, per pool (pool-local), and per buffer
+        # the absent experts its layer streams: wait_prefill_layer keeps those in the empty slots.
+        self._prefill_id_snapshot: torch.Tensor | None = None
+        self._prefill_free_slots: list = []
+        self._prefill_streamed: list = [None, None]
         self._hit_d2d_fallback_logged = False
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
@@ -603,6 +624,9 @@ class OffloadMoeCache:
         self._gather_feat_bytes: list[torch.Tensor | None] = []
         self._gather_stage_ptrs: list[list[torch.Tensor] | None] = []
         self._gather_pool_ptrs: list[torch.Tensor | None] = []
+        self._gather_all_feat_bytes: list[torch.Tensor | None] = []
+        self._gather_all_stage_ptrs: list[list[torch.Tensor] | None] = []
+        self._gather_all_pool_ptrs: list[torch.Tensor | None] = []
         if not _FUSED_COPY or self.device.type != "cuda" or not self.banks:
             return
         from freetoken.kernel.pinned import device_ptr
@@ -643,18 +667,24 @@ class OffloadMoeCache:
         self._copy_feat_bytes = [ptrs(rows) for rows in self._row_bytes]
         self._copy_dst_ptrs_host = dst_ptrs
         self._copy_src_ptrs_host = layer_src_ptrs
-        # hit-D2D gather serves only the big banks; small banks are whole-layer
-        # H2D entries (see _SMALL_BANK_FEAT_BYTES), so their rows never need D2D.
+        # With a miss in the layer, the hit-D2D gather serves only the big banks; small banks are
+        # whole-layer H2D entries (see _SMALL_BANK_FEAT_BYTES), so their rows need no D2D then.
         # The gather copies cache rows of the layer's pool into its staging buffer, row == expert id.
         self._gather_bank_ids = [[k for k, r in enumerate(rows) if r >= _SMALL_BANK_FEAT_BYTES] for rows in self._row_bytes]
-        for g, ids in enumerate(self._gather_bank_ids):
-            self._gather_feat_bytes.append(ptrs([self._row_bytes[g][k] for k in ids]) if ids else None)
-            self._gather_stage_ptrs.append(
-                [ptrs([dst_ptrs[k] + b * self._stage_bytes[k] for k in ids]) for b in range(2)] if ids else None
-            )
-        for p in range(len(self.pool_sizes)):
-            ids = self._gather_bank_ids[self._pool_layout(p)]
-            self._gather_pool_ptrs.append(ptrs([dst_ptrs[k] + self._pool_offsets[k][p] for k in ids]) if ids else None)
+        # A layer with no miss gathers every bank that has rows: its small banks then stay on the device too.
+        every_bank = [[k for k, r in enumerate(rows) if r] for rows in self._row_bytes]
+        for bank_ids, feat_bytes, stage_ptrs, pool_ptrs in (
+            (self._gather_bank_ids, self._gather_feat_bytes, self._gather_stage_ptrs, self._gather_pool_ptrs),
+            (every_bank, self._gather_all_feat_bytes, self._gather_all_stage_ptrs, self._gather_all_pool_ptrs),
+        ):
+            for g, ids in enumerate(bank_ids):
+                feat_bytes.append(ptrs([self._row_bytes[g][k] for k in ids]) if ids else None)
+                stage_ptrs.append(
+                    [ptrs([dst_ptrs[k] + b * self._stage_bytes[k] for k in ids]) for b in range(2)] if ids else None
+                )
+            for p in range(len(self.pool_sizes)):
+                ids = bank_ids[self._pool_layout(p)]
+                pool_ptrs.append(ptrs([dst_ptrs[k] + self._pool_offsets[k][p] for k in ids]) if ids else None)
         self._copy_blocks_per_bank = default_blocks_per_bank(self.device)
         self._copy_fused_ok = True
 
@@ -723,6 +753,7 @@ class OffloadMoeCache:
         self._alloc_banks()
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).
         self.slot_for_id.fill_(-1)
+        self.all_resident = False
         self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
         self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
         self._slice_pools()
@@ -838,6 +869,7 @@ class OffloadMoeCache:
                 (self.num_layers, self.num_experts), dtype=torch.int32, pin_memory=True
             )
             self._prefill_snapshot_np = self._prefill_slot_snapshot.numpy()
+            self._prefill_id_snapshot = torch.empty((self.cache_size,), dtype=torch.int32, pin_memory=True)
             self._prefill_hit_dst = torch.empty(
                 (self.num_experts,), dtype=torch.int32, device=self.device
             )
@@ -860,11 +892,61 @@ class OffloadMoeCache:
         for tail in self._stage_tails[self.layer_layout[layer_id]][buffer_id]:
             tail.zero_()
 
-    def begin_prefill(self) -> None:
-        if not self.prefill_overlap:
+    def _keep_recent_staged_experts(self) -> None:
+        """Move the staged slots' most recently used experts over the least recently used experts outside them.
+
+        The staging buffers lie on a pool's first slots, which are also the slots decode fills first after a prefill
+        (usage 0), so each prefill dropped what the decode before it had just loaded. Pair by pair, the most recent
+        staged expert takes the slot of the least recent kept one while it is the more recent of the two, so a prefill
+        costs a pool its least recently used experts. Fixed shapes and a device-side row count: no host sync.
+        """
+        # GPU decode only: there a slot is an address and the output does not depend on which experts are resident,
+        # while hybrid computes a non-resident expert on the CPU, whose kernel rounds differently
+        if self.decode_target != "gpu" or (self.device.type == "cuda" and not self._copy_fused_ok):
+            return
+        slot_of = self.slot_for_id.view(-1)
+        for p, size in enumerate(self.pool_sizes):
+            staged = self._pool_stable_from[p]
+            n = min(staged, size - staged)
+            if n <= 0:
+                continue
+            ids, usage = self._pool_id_of_slot[p], self._pool_usage[p]
+            hot_use, hot = usage[:staged].sort(descending=True, stable=True)
+            cold_use, cold = usage[staged:].sort(stable=True)
+            hot_use, hot, cold_use, cold = hot_use[:n], hot[:n], cold_use[:n], cold[:n] + staged
+            # true for a prefix of the pairs, and never for an empty staged slot (usage 0)
+            move = hot_use > cold_use
+            moved, dropped = ids[hot], ids[cold]
+            none = torch.full_like(moved, -1)
+            # one spare entry at index -1 takes the writes of the pairs that stay and of empty slots
+            padded = torch.cat([slot_of, slot_of.new_full((1,), -1)])
+            padded[torch.where(move, dropped, none).long()] = -1
+            padded[torch.where(move, moved, none).long()] = cold.to(slot_of.dtype)
+            slot_of.copy_(padded[:-1])
+            ids[cold] = torch.where(move, moved, dropped)
+            usage[cold] = torch.where(move, hot_use, cold_use)
+            ids[hot] = torch.where(move, none, moved)
+            usage[hot] = torch.where(move, torch.zeros_like(hot_use), hot_use)
+            if self.device.type == "cuda":
+                from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+                rows = self._copy_dst_ptrs_pool[p]
+                fast_index_copy_multi_jit(
+                    rows, rows, self._copy_feat_bytes[self._pool_layout(p)], cold, hot, move.sum().view(1), blocks_per_bank=64
+                )
+            else:
+                for view in self._pool_bank_views[p]:
+                    view[cold[move]] = view[hot[move]]
+
+    def begin_prefill(self, num_routes: int | None = None) -> None:
+        """Start a prefill chunk; ``num_routes`` is its tokens times the routes of each."""
+        if not self.prefill_overlap or self.all_resident:
             return
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
+        if self.prefill_hit_d2d:
+            # on the compute stream, before the fence below lets the copy stream at the staged slots
+            self._keep_recent_staged_experts()
         if self.prefill_copy_stream is not None:
             # Fence this prefill's copy-stream work behind everything already enqueued
             # on the compute stream. The release/ready events only order against the
@@ -875,13 +957,44 @@ class OffloadMoeCache:
             self.prefill_begin_event.record(torch.cuda.current_stream(self.device))
             self.prefill_copy_stream.wait_event(self.prefill_begin_event)
         self._prefill_hit_d2d_active = self.prefill_hit_d2d and self._hit_d2d_usable()
+        self._prefill_gather_routed = (
+            self._prefill_hit_d2d_active and num_routes is not None and num_routes < self.num_experts
+        )
+        self._prefill_gather_pending = [None, None]
         if self._prefill_hit_d2d_active:
             # The copy stream is fenced behind the previous decode, so the snapshot
             # observes its final slot map; one host sync per chunk, then per-layer
             # classification is pure host math.
+            import numpy as np
+
             with torch.cuda.stream(self.prefill_copy_stream):
                 self._prefill_slot_snapshot.copy_(self.slot_for_id, non_blocking=True)
+                self._prefill_id_snapshot.copy_(self.id_of_slot, non_blocking=True)
             self.prefill_copy_stream.synchronize()
+            ids = self._prefill_id_snapshot.numpy()
+            self._prefill_free_slots = [
+                np.nonzero(ids[base + stable : base + size] < 0)[0] + stable
+                for base, size, stable in zip(self.pool_bases, self.pool_sizes, self._pool_stable_from)
+            ]
+            self._prefill_streamed = [None, None]
+            self.all_resident = self._snapshot_all_resident(ids)
+
+    def _snapshot_all_resident(self, ids) -> bool:
+        """Whether begin_prefill's snapshot has every expert in a slot and none in a staging buffer (GPU decode only: hybrid and CPU layers leave experts off the device by design)."""
+        if not self.keeps_streamed_experts or self.cpu_layer_ids or self._unpinned_layers:
+            return False
+        if (self._prefill_snapshot_np < 0).any():
+            return False
+        return all((ids[base : base + stable] < 0).all() for base, stable in zip(self.pool_bases, self._pool_stable_from))
+
+    def resident_slot_of(self, layer_id: int) -> torch.Tensor:
+        """The slot of each of ``layer_id``'s experts in its pool, a view of ``slot_for_id``; only while ``all_resident``."""
+        assert self.all_resident, "an expert without a slot would be read as slot -1"
+        return self.slot_for_id[layer_id]
+
+    def resident_slots(self, layer_id: int, topk_ids: torch.Tensor) -> torch.Tensor:
+        """``topk_ids`` as slot ids of ``layer_id``'s pool; only while ``all_resident``."""
+        return self.resident_slot_of(layer_id)[topk_ids.long()]
 
     def prefetch_prefill_layer(self, layer_id: int) -> None:
         if not self.prefill_overlap or layer_id >= self.num_layers:
@@ -981,9 +1094,6 @@ class OffloadMoeCache:
         """
         import numpy as np
 
-        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
-        from freetoken.moe.offload_kernels import prefill_hit_compact
-
         E = self.num_experts
         layout = self.layer_layout[layer_id]
         pool = self.pool_of_layer[layer_id]
@@ -991,20 +1101,17 @@ class OffloadMoeCache:
         hit_mask = snap >= self._pool_stable_from[pool]
         self.prefill_hit_rows += int(hit_mask.sum())
         self.prefill_total_rows += E
-        if self._gather_feat_bytes[layout] is not None:
-            prefill_hit_compact(self, layer_id)
-            # blocks_per_bank=64 vs the PCIe-tuned default of 8: HBM D2D needs the
-            # wider grid (~22 GB/s per 1024-thread block on H100).
-            fast_index_copy_multi_jit(
-                self._gather_stage_ptrs[layout][buffer_id],
-                self._gather_pool_ptrs[pool],
-                self._gather_feat_bytes[layout],
-                self._prefill_hit_dst,
-                self._prefill_hit_src,
-                self._prefill_hit_num,
-                blocks_per_bank=64,
-            )
         miss = np.nonzero(~hit_mask)[0]
+        # With every expert of the layer resident, the gather takes the small banks as well and nothing crosses PCIe.
+        all_resident = miss.size == 0 and self._gather_all_feat_bytes[layout] is not None
+        if self._prefill_gather_routed:
+            self._prefill_gather_pending[buffer_id] = all_resident
+        else:
+            self._gather_prefill_hits(layer_id, buffer_id, all_resident)
+        # GPU decode only, as in _keep_recent_staged_experts. An expert in a staging slot is a miss too, but its
+        # map entry is the invalidation's to clear.
+        keep = self.decode_target == "gpu" and self._prefill_free_slots[pool].size
+        self._prefill_streamed[buffer_id] = np.nonzero(snap < 0)[0] if keep else None
         with torch.cuda.stream(self.prefill_copy_stream):
             if self._prefill_buffer_has_release_event[buffer_id]:
                 self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
@@ -1019,9 +1126,11 @@ class OffloadMoeCache:
                 if feat == 0:
                     continue
                 if feat < _SMALL_BANK_FEAT_BYTES:
-                    # Whole layer as one entry, EVEN with zero misses: it keeps every
-                    # batch entry above the driver's async floor and covers the hit
-                    # rows the gather skips for these banks.
+                    if all_resident:
+                        continue  # gathered on the device with the big banks
+                    # Whole layer as one entry whenever the layer has a miss: it keeps
+                    # every batch entry above the driver's async floor and covers the
+                    # hit rows the gather skips for these banks.
                     dst.append(stage)
                     src.append(self._copy_src_ptrs_host[layer_id][b])
                     nbytes.append(E * feat)
@@ -1038,19 +1147,103 @@ class OffloadMoeCache:
                 )
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
-    def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+    def _gather_prefill_hits(
+        self, layer_id: int, buffer_id: int, all_banks: bool, routed_ids: torch.Tensor | None = None
+    ) -> None:
+        """Copy ``layer_id``'s resident experts cache -> staging buffer on the current stream: every bank
+        with rows when ``all_banks``, else the large ones; only the experts in ``routed_ids`` when given."""
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+        from freetoken.moe.offload_kernels import prefill_hit_compact
+
+        layout = self.layer_layout[layer_id]
+        if all_banks:
+            stage_ptrs, pool_ptrs, feat_bytes = self._gather_all_stage_ptrs, self._gather_all_pool_ptrs, self._gather_all_feat_bytes
+        else:
+            stage_ptrs, pool_ptrs, feat_bytes = self._gather_stage_ptrs, self._gather_pool_ptrs, self._gather_feat_bytes
+        if feat_bytes[layout] is None:
+            return
+        routed = None
+        if routed_ids is not None:
+            routed = torch.zeros(self.num_experts, dtype=torch.bool, device=self.device)
+            routed.index_fill_(0, routed_ids.reshape(-1).long(), True)
+        prefill_hit_compact(self, layer_id, routed)
+        # blocks_per_bank=64 vs the PCIe-tuned default of 8: HBM D2D needs the
+        # wider grid (~22 GB/s per 1024-thread block on H100).
+        fast_index_copy_multi_jit(
+            stage_ptrs[layout][buffer_id],
+            pool_ptrs[self.pool_of_layer[layer_id]],
+            feat_bytes[layout],
+            self._prefill_hit_dst,
+            self._prefill_hit_src,
+            self._prefill_hit_num,
+            blocks_per_bank=64,
+        )
+
+    def wait_prefill_layer(self, layer_id: int, routed_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
         """Full-layer ``[num_experts, ...]`` bank views for ``layer_id``, one per
         registered bank in registration order: bf16 ``(gate_up, down)``; nvfp4
         marlin/b12x ``(gate_up_packed, gate_up_scale, down_packed, down_scale)``;
-        nvfp4 native adds the two global banks after each scale bank."""
+        nvfp4 native adds the two global banks after each scale bank.
+
+        ``routed_ids`` are the expert ids the chunk routes to in this layer. When the chunk's hit gather
+        waited for them (see ``begin_prefill``), the rows of resident experts outside them are not
+        filled: the caller's GEMMs read only routed rows."""
         assert self.prefill_overlap
         assert self._stage_views
         self.prefetch_prefill_layer(layer_id)
         buffer_id = layer_id % 2
         assert self._prefill_buffer_layer[buffer_id] == layer_id
+        if self._prefill_gather_pending[buffer_id] is not None:
+            self._gather_prefill_hits(layer_id, buffer_id, self._prefill_gather_pending[buffer_id], routed_ids)
+            self._prefill_gather_pending[buffer_id] = None
         if self.prefill_ready_events:
             torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
+        if self._prefill_hit_d2d_active and self._prefill_streamed[buffer_id] is not None:
+            self._keep_streamed_experts(layer_id, buffer_id, self._prefill_streamed[buffer_id])
+            self._prefill_streamed[buffer_id] = None
         return self.stage_views(layer_id, buffer_id)
+
+    @property
+    def keeps_streamed_experts(self) -> bool:
+        """Whether a prefill keeps the experts it streams (see _keep_streamed_experts): hit-d2d prefills with GPU decode."""
+        return self.prefill_hit_d2d and self.prefill_overlap and self.decode_target == "gpu" and self.device.type == "cuda"
+
+    def warm_prefill_keeps(self) -> bool:
+        """Whether a warmup prefill would leave experts resident: the cache keeps what a prefill streams and the hit-d2d split is usable. Asked once at startup, where a fallback is logged."""
+        return self.keeps_streamed_experts and self._hit_d2d_usable()
+
+    def _keep_streamed_experts(self, layer_id: int, buffer_id: int, absent) -> None:
+        """Copy the experts ``layer_id`` streamed from host, staging buffer -> empty slots, and register them.
+
+        A prefill stages a layer's absent experts and drops them after its GEMMs, so the next prefill streams
+        them again. While the pool has empty slots outside the staging buffers they are kept instead, as the
+        pool's first experts to evict (usage 0): nothing is evicted for them. A slot is only an address, so the
+        output is unchanged. Runs on the current stream after the buffer's ready event.
+        """
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        pool, layout = self.pool_of_layer[layer_id], self.layer_layout[layer_id]
+        free = self._prefill_free_slots[pool]
+        count = min(absent.size, free.size)
+        if count == 0 or self._gather_all_feat_bytes[layout] is None:
+            return
+        self._prefill_free_slots[pool] = free[count:]
+        slots = torch.tensor(free[:count], dtype=torch.int32, device=self.device)
+        experts = torch.tensor(absent[:count], dtype=torch.int32, device=self.device)
+        fast_index_copy_multi_jit(
+            self._gather_all_pool_ptrs[pool],
+            self._gather_all_stage_ptrs[layout][buffer_id],
+            self._gather_all_feat_bytes[layout],
+            slots,
+            experts,
+            torch.tensor([count], dtype=torch.int64, device=self.device),
+            blocks_per_bank=64,
+        )
+        ids, usage = self._pool_id_of_slot[pool], self._pool_usage[pool]
+        self.slot_for_id[layer_id][experts.long()] = slots
+        ids[slots.long()] = layer_id * self.num_experts + experts
+        # 0, as a slot never used: the first to go, and never equal to an LRU step (lru_ensure spares usage == step)
+        usage[slots.long()] = 0
 
     def release_prefill_layer(self, layer_id: int) -> None:
         if layer_id == self.num_layers - 1:
@@ -1070,6 +1263,33 @@ class OffloadMoeCache:
             self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
+
+    def loads_prefill_on_demand(self, num_tokens: int) -> bool:
+        return 0 < num_tokens <= self.prefill_demand_tokens
+
+    def load_prefill_experts(self, layer_id: int, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Make a demand prefill chunk's routed experts resident, copying in the missing ones,
+        and return ``topk_ids`` as slot ids. The chunk's distinct experts go to the slot cache
+        ``ENSURE_QUERY_WIDTH`` at a time, each query's misses copied before the next query
+        evicts: LRU evicts an earlier query's slots last while the chunk's distinct experts fit the
+        layer's pool, which one admission of the whole chunk needs as well. The admissions stay out
+        of the decode statistics."""
+        from freetoken.moe.offload_kernels import ENSURE_QUERY_WIDTH, ensure_experts
+
+        experts = torch.arange(self.num_experts, dtype=torch.int32, device=self.device)
+        routed = torch.zeros(self.num_experts, dtype=torch.bool, device=self.device)
+        routed.index_fill_(0, topk_ids.reshape(-1).long(), True)
+        # the routed experts in ascending order, then the first of them again, which the admission
+        # dedups; a chunk's routes reach at most as many experts as there are routes
+        ordered = torch.where(routed, experts, experts + self.num_experts).sort().values
+        ordered = ordered[: min(self.num_experts, topk_ids.numel())]
+        query = torch.where(ordered < self.num_experts, ordered, ordered[0])
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        for piece in query.split(ENSURE_QUERY_WIDTH):
+            ensure_experts(self, layer_id, piece, record_stats=False)
+            self.copy_missing()
+        return self.slot_for_id[layer_id][topk_ids.long()]
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
@@ -1122,6 +1342,7 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import reset_cache
 
         reset_cache(self)
+        self.all_resident = False
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)

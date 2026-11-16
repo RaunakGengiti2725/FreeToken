@@ -11,7 +11,7 @@ from freetoken.moe.offload_cache import OffloadMoeCache
 
 
 from .base import BaseOP
-from .quantization import ExpertView, LayerKind, QuantConfig, quant_method_for
+from .quantization import ExpertView, LayerKind, QuantConfig, RoutedExperts, quant_method_for
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -25,6 +25,10 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+
+# Once every expert is resident, a prefill groups its routes over the layer's experts where the kernel can, not over the
+# pool's slots. Set FREETOKEN_PREFILL_EXPERT_ALIGN=0 for the grouping over the slots -- a measurement-only escape hatch.
+_PREFILL_EXPERT_ALIGN = os.getenv("FREETOKEN_PREFILL_EXPERT_ALIGN", "1") != "0"
 
 
 class MoELayer(BaseOP):
@@ -269,8 +273,9 @@ class OffloadMoELayer(MoELayer):
     # ------------------------------------------------------------------
     # Data movement -- one decision tree for every quant format (the banks
     # registry makes the cache machinery bank-count agnostic). Decode loads
-    # on demand; prefill streams whole layers, double-buffered when overlap
-    # is enabled. The kernels only ever see bank views plus row indices;
+    # on demand, and so does a short enough prefill chunk; a longer one
+    # streams whole layers, double-buffered when overlap is enabled. The
+    # kernels only ever see bank views plus row indices;
     # which kernel runs is decided afterwards, in ``_expert_gemm``.
     # ------------------------------------------------------------------
 
@@ -369,14 +374,41 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill movement: stream whole layers -- double-buffered behind the
-        previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
-        ``materialize_layer``. In both, position == expert id, so the routing ids
-        pass through unmapped."""
+        """Prefill movement. A chunk within ``prefill_demand_tokens`` loads its routed experts
+        into the slot cache as decode does and runs the same grouped GEMM over the slots; so does
+        any chunk once every expert is resident, with nothing to load. Otherwise a chunk streams
+        whole layers -- double-buffered behind the previous layer's GEMMs when ``prefill_overlap``
+        is on, else a synchronous ``materialize_layer`` -- where position == expert id, so the
+        routing ids pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        demand = cache.loads_prefill_on_demand(hidden_states.shape[0])
+        if self.layer_id == 0 and not demand:
+            cache.begin_prefill(num_routes=topk_ids.numel())
+        if cache.all_resident or demand:
+            slot_of = None
+            if not cache.all_resident:
+                routes = cache.load_prefill_experts(self.layer_id, topk_ids)
+            elif _PREFILL_EXPERT_ALIGN and self.quant_method.kernel.groups_prefill_by_expert:
+                # a GEMM grid sized for a padded block per slot of the pool is mostly empty programs: the kernel groups
+                # the expert ids and looks up one slot per block
+                routes, slot_of = topk_ids, cache.resident_slot_of(self.layer_id)
+            else:
+                # every expert has a slot (the host knows it from a prefill's snapshot): the slots are read as they are
+                routes = cache.resident_slots(self.layer_id, topk_ids)
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                routes,
+                views=cache.pool_bank_views(self.layer_id),
+                n=cache.pool_slots(self.layer_id),
+                alphas=cache.alphas_for_slots(self.layer_id),
+                routed=RoutedExperts(self.num_experts, cache.alphas_for_layer(self.layer_id), slot_of),
+                is_prefill=True,
+            )
         if cache.prefill_overlap:
-            views = self._wait_prefill_overlap(cache)
+            views = self._wait_prefill_overlap(cache, topk_ids)
             out = self._expert_gemm(
                 cache,
                 hidden_states,
@@ -404,20 +436,18 @@ class OffloadMoELayer(MoELayer):
         cache.release_prefill_layer(self.layer_id)
         return out
 
-    def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
+    def _wait_prefill_overlap(self, cache: OffloadMoeCache, topk_ids: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the
         next layer's full-layer H2D copy, then return this layer's bank views (in
         bank registration order; buffer position == expert id, so routing ids pass
         through unmapped). The caller runs ``release_prefill_layer`` after its GEMMs.
         """
-        if self.layer_id == 0:
-            cache.begin_prefill()
         cache.prefetch_prefill_layer(self.layer_id)
         cache.prefetch_prefill_layer(self.layer_id + 1)
-        return cache.wait_prefill_layer(self.layer_id)
+        return cache.wait_prefill_layer(self.layer_id, topk_ids)
 
     # ------------------------------------------------------------------
-    # Kernel dispatch: ``views`` are the bank tensors the movement step produced (in bank registration order) and ``topk_ids`` already index their rows.
+    # Kernel dispatch: ``views`` are the bank tensors the movement step produced (in bank registration order) and ``topk_ids`` already index their rows, unless ``routed.slot_of`` maps them.
     # ------------------------------------------------------------------
 
     def _expert_gemm(
@@ -432,12 +462,13 @@ class OffloadMoELayer(MoELayer):
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
         sum_routes: bool = True,
+        routed: RoutedExperts | None = None,
     ) -> torch.Tensor:
         from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
 
         view = ExpertView(
             {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
-            slots=None if n is not None else topk_ids, n=n, alphas=alphas, sum_routes=sum_routes,
+            slots=None if n is not None else topk_ids, n=n, alphas=alphas, sum_routes=sum_routes, routed=routed,
         )
         return self.quant_method.apply(
             hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill

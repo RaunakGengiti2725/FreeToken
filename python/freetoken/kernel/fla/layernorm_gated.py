@@ -196,6 +196,7 @@ def _layer_norm_fwd(
     norm_before_gate=True,
     is_rms_norm=False,
     activation: str = "swish",
+    tile_rows=None,
 ):
     M, N = x.shape
     if group_size is None:
@@ -231,7 +232,7 @@ def _layer_norm_fwd(
     # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     # Calculate rows per block based on SM count
-    rows_per_block = calc_rows_per_block(M, x.device)
+    rows_per_block = calc_rows_per_block(M if tile_rows is None else tile_rows, x.device)
     # Update grid to use rows_per_block
     grid = (triton.cdiv(M, rows_per_block), ngroups)
     with _device_context(x.device):
@@ -272,8 +273,12 @@ def rms_norm_gated(
     norm_before_gate=True,
     is_rms_norm=False,
     activation: str = "swish",
+    tile_rows=None,
 ):
-    """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+    """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z)).
+
+    ``tile_rows`` sizes the kernel's row tile as for that many rows instead of ``x``'s own count: a call
+    over ``group_size`` groups then runs the tile the same data takes as one row a group."""
 
     x_shape_og = x.shape
     # reshape input data into 2D tensor
@@ -298,6 +303,7 @@ def rms_norm_gated(
         norm_before_gate=norm_before_gate,
         is_rms_norm=is_rms_norm,
         activation=activation,
+        tile_rows=tile_rows,
     )
     return y.reshape(x_shape_og)
 

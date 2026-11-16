@@ -739,9 +739,13 @@ class Engine:
 
         # ======================= Graph capture initialization ========================
         self.graph_runner = self._make_graph_runner(config.cuda_graph_bs, init_free_memory, aligned_max_seq_len)
-        if config.attention_backend.split(",")[0] == "triton":
-            # Prefill runs on the first comma part; warm its autotune cache.
-            self._warmup_prefill()
+        backend = config.attention_backend.split(",")[0]
+        # the warmup addresses K/V through the page table row alone, which these backends do too
+        keeps = backend in ("triton", "fi", "fa", "trtllm") and self.moe_offload_cache is not None and self.moe_offload_cache.warm_prefill_keeps()
+        if backend == "triton" or keeps:
+            # Prefill runs on the first comma part; warm its autotune cache. With a cache that keeps what a prefill
+            # streams, the warmup also loads the experts.
+            self._warmup_prefill(autotune=backend == "triton", keeps=keeps)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1246,6 +1250,7 @@ class Engine:
             cache_size=config.moe_cache_size,
             device=self.device,
             cache_policy=config.moe_cache_policy,
+            prefill_demand_tokens=config.moe_prefill_demand_tokens,
             prefill_overlap=config.moe_prefill_overlap,
             prefill_hit_d2d=config.moe_prefill_hit_d2d,
             quant_format=banks.quant_format,
@@ -1741,7 +1746,7 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()
-    def _warmup_prefill(self) -> None:
+    def _warmup_prefill(self, autotune: bool = True, keeps: bool = False) -> None:
         """Compile the Triton prefill path before the first real request.
 
         Decode CUDA graph capture warms the decode path, but the first prefill
@@ -1753,7 +1758,8 @@ class Engine:
             return
 
         warmup_lens = [min(80, self.max_seq_len)]
-        if self.max_seq_len >= 128:
+        if self.max_seq_len >= 128 and autotune:
+            # the second length is for the autotune cache; one forward streams every expert
             warmup_lens.append(128)
         warmup_lens = sorted({length for length in warmup_lens if length >= 2})
         if not warmup_lens:
@@ -1778,6 +1784,7 @@ class Engine:
                     sampling_params=None,  # type: ignore[arg-type]
                     cache_handle=None,  # type: ignore[arg-type]
                 )
+                warm_req.linear_slot_idx = self.dummy_req.linear_slot_idx  # the padding state slot, not a free one
                 batch = Batch(reqs=[warm_req], phase="prefill")
                 batch.padded_reqs = batch.reqs
                 batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
@@ -1793,7 +1800,13 @@ class Engine:
         finally:
             dummy_row.fill_(dummy_slot)
             if self.moe_offload_cache is not None:
-                self.moe_offload_cache.reset()
+                if keeps:
+                    # the warmup streamed every expert once and the cache kept what it had room for: the first request
+                    # finds them resident. One more snapshot tells the cache whether that is every expert.
+                    self.moe_offload_cache.begin_prefill()
+                    self.moe_offload_cache.reset_stats()
+                else:
+                    self.moe_offload_cache.reset()
         ended.record(self.stream)
         torch.cuda.synchronize(self.device)
         logger.info_rank0(
@@ -2209,6 +2222,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hybrid_max_fetch": -1,
     "moe_locked_fetch": -1.0,
     "moe_locked_max_fetch": 8,
+    "moe_prefill_demand_tokens": 0,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",

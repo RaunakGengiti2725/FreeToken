@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen, causal_conv1d_verify
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
+
+# A prefill's chunk kernel reads the values out of the conv output where they lie, a row a value dim, with the
+# operations it runs on a token-major copy. Set FREETOKEN_GDN_VALUES_IN_PLACE=0 to hand it the copy again.
+_VALUES_IN_PLACE = os.getenv("FREETOKEN_GDN_VALUES_IN_PLACE", "1") != "0"
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -213,7 +219,11 @@ class GatedDeltaNet(BaseOP):
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+            # the conv output as it is stored, [conv_dim, total]: its last value_dim rows are the values
+            value_rows = mixed.transpose(0, 1)[2 * self.key_dim:] if _VALUES_IN_PLACE else None
+            if value_rows is not None and (value_rows.dtype != dtype or not value_rows.is_contiguous()):
+                value_rows = None
+            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype) if value_rows is None else None
             g, beta = self._gate_params(a, b)
             g = g.reshape(1, total, self.num_v_heads)
             beta = beta.float().reshape(1, total, self.num_v_heads)
@@ -229,13 +239,16 @@ class GatedDeltaNet(BaseOP):
                 q=q, k=k, v=v, g=g, beta=beta, scale=self.head_k_dim ** -0.5,
                 initial_state=pool.recurrent_states[li], initial_state_indices=fla.cache_indices.to(torch.int32),
                 cu_seqlens=fla.cu_seqlens.to(torch.int64), head_first=False,
-                use_qk_l2norm_in_kernel=True, track_state=track_state,
+                use_qk_l2norm_in_kernel=True, track_state=track_state, value_rows=value_rows,
             )
             core_out = o[0]  # [total, num_v_heads, head_v_dim]
             if fla.track_dst is not None:
                 self._write_track_snapshot(pool, li, conv_in, track_state, fla)
 
-        if out is None:
+        if out is None and batch.is_prefill:
+            # z is a column slice of the input projection: per-head rows of it would be a copy of [total, value_dim]
+            out = self.norm.forward_heads(core_out.reshape(total, -1), z.reshape(total, -1), self.num_v_heads)
+        elif out is None:
             core_out = core_out.reshape(-1, self.head_v_dim)
             z = z.reshape(-1, self.head_v_dim)
             out = self.norm.forward(core_out, z).reshape(total, -1)
