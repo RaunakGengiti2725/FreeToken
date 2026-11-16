@@ -2601,7 +2601,7 @@ def _check_reproducible_seeds(config: EngineConfig, is_moe: bool) -> None:
 
     --reproducible-seeds says the text follows from the flags and the request alone, so a setting this cannot hold for
     stops the start instead of serving text that only sometimes repeats."""
-    if not config.reproducible_seeds:
+    if not getattr(config, "reproducible_seeds", False):  # duck-typed test configs omit it
         return
     if config.max_running_req != 1:
         raise ValueError(
@@ -2960,6 +2960,6 @@ def _adjust_config(config: EngineConfig):
     ]
     if is_moe:
         resolved.insert(0, f"moe_strategy={config.moe_strategy!r}")
-    if config.reproducible_seeds:
+    if getattr(config, "reproducible_seeds", False):
         resolved.append("reproducible_seeds=True")
     logger.info_rank0(f"Resolved config: {', '.join(resolved)}")
