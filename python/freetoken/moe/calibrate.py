@@ -1,13 +1,15 @@
 """--preset single-measured: time what the static preset cannot choose, once, and keep the choice.
 
 The rule: every candidate (offload and hybrid, each with no drafts, 3 and 5 MTP draft tokens) is one server start
-that decodes DECODE tokens after WARM warm-up tokens on each of the two built-in prompts. The candidate whose
-smaller lead over the static preset's choice across the two prompts is largest runs, if that lead is above MARGIN;
-otherwise the static choice runs.
+that decodes DECODE tokens after WARM warm-up tokens on each of the two built-in prompts, PASSES times over. A
+candidate's lead over the static preset's choice is its smallest over the prompts and the passes, so one that is
+ahead only while the expert cache still fills has none. The candidate with the largest lead runs, if that lead is
+above MARGIN; otherwise the static choice runs.
 
 A dimension the command line fixed (--moe-strategy, --speculative-algorithm) is not a candidate. The timings are a
 row of the decode profile (moe/decode_profile.py), under the key and the stamp `--moe-strategy auto` reads its rows
-by, so a later start with the same checkpoint, flags, machine and release measures nothing. A candidate that does
+by, so a later start with the same checkpoint, flags, machine and release measures nothing; with an automatically
+sized cache, only while about as much GPU memory is free as when they were taken. A candidate that does
 not start is not chosen; when the static choice itself cannot be timed, or anything else fails, the static preset
 runs and one log line says why. The servers are started and timed by `ft bench decode`'s own code (moe/benchdecode.py).
 """
@@ -28,13 +30,16 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 PRESET = "single-measured"
-WARM, DECODE = 256, 512   # unmeasured: tokens that fill the expert cache, then tokens that are timed, per prompt
+# unmeasured: tokens that fill the expert cache, then tokens that are timed, per prompt and pass. The warm-up is the
+# bench's own default: after fewer, a cold cache was timed, and a candidate that misses less from cold looked faster.
+WARM, DECODE = 1024, 512
+PASSES = 2                # per prompt, in one server start: the second pass runs on the cache the first one left
 # unmeasured: about twice the noise of a lead between two single passes, whose tok/s had an SD of up to 3.8% (decode_profile.py)
 MARGIN = 0.10
 READY_S = 900             # the longest a candidate's server may take to load
 PROMPTS = ("math", "code")
 DEPTHS = (3, 0, 5)        # the static preset's first
-_VERSION = 1
+_VERSION = 2
 
 # removed from the command line of a candidate's server: the bench names these itself, and the preset must not measure again
 _DROPPED = ("--model-path", "--model", "--host", "--port", "--api-key", "--moe-strategy", "--moe-backend", "--preset")
@@ -50,16 +55,17 @@ def candidates(args) -> list[tuple[str, str, int | None]]:
 
 
 def choose(tok_s: dict, names: list[str], margin: float = MARGIN) -> tuple[str, float]:
-    """``(candidate, lead)``: of ``names`` (the static choice first), the one whose smaller lead over the static
-    choice across the prompts is largest, if that lead is above ``margin``; else the static choice, with lead 0.
-    ``tok_s`` maps a candidate to its tok/s per prompt; one that is missing did not run and is not chosen. A tie
-    goes to the candidate named first."""
+    """``(candidate, lead)``: of ``names`` (the static choice first), the one whose smallest lead over the static
+    choice across the prompts and passes is largest, if that lead is above ``margin``; else the static choice, with
+    lead 0. ``tok_s`` maps a candidate to its tok/s per prompt and pass; one that is missing did not run and is not
+    chosen. A tie goes to the candidate named first."""
     base = tok_s[names[0]]
     best, best_lead = names[0], 0.0
     for name in names[1:]:
         if name not in tok_s:
             continue
-        lead = min(c / b for c, b in zip(tok_s[name], base)) - 1.0
+        # pass k against pass k: both servers had then decoded the same number of tokens
+        lead = min(c / b for cs, bs in zip(tok_s[name], base) for c, b in zip(cs, bs)) - 1.0
         if lead > margin and lead > best_lead:
             best, best_lead = name, lead
     return best, best_lead
@@ -75,7 +81,8 @@ def _usable(row: dict) -> bool:
         return False
     return all(
         isinstance(cols, list) and len(cols) == width
-        and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0 for v in cols)
+        and all(isinstance(col, list) and len(col) == PASSES for col in cols)
+        and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0 for col in cols for v in col)
         for cols in tok.values()
     )
 
@@ -120,7 +127,7 @@ def child_flags(argv: list[str], depth: int | None) -> list[str]:
 
 
 def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, floors: list[float] | None = None) -> dict:
-    """One server start of a candidate through the bench's own code: its tok/s per prompt and what it ran with.
+    """One server start of a candidate through the bench's own code: its tok/s per prompt and pass, and what it ran with.
     Raises RuntimeError when the server does not start or does not answer, or when a request starts below its
     prompt's tok/s in ``floors`` (the bench then stops it: such a candidate cannot be the one chosen)."""
     from freetoken.moe import benchdecode
@@ -129,7 +136,7 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
     if strategy == "hybrid":
         # the rounding mode the real server will run (moe/offload_kernels.py reads the same variable)
         arm = f"hybrid:{(os.getenv('FREETOKEN_HYBRID_FETCH_ROUND') or 'min-wait').strip().lower()}"
-    bench_argv = ["--model", args.model_path, "--seeds", "1", "--warm", str(WARM), "--decode", str(DECODE), "--streams", "1",
+    bench_argv = ["--model", args.model_path, "--seeds", str(PASSES), "--warm", str(WARM), "--decode", str(DECODE), "--streams", "1",
                   "--no-write", "--server-timeout", str(READY_S), "--", *child_flags(argv, depth)]
     try:
         ns, extra = benchdecode.parse_args(bench_argv, "ft serve --preset " + PRESET)
@@ -142,7 +149,8 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
     if any(x.get("gave_up") for x in r["results"]):
         raise RuntimeError("stopped early: under half the static choice's speed")
     return {
-        "tok_s": [float(v) for v in r["tok_s"]], "drafts": sum(int(x.get("draft_n") or 0) for x in r["results"]),
+        "tok_s": [[float(run["tok_s"]) for run in benchdecode.runs_of(x)] for x in r["results"]],
+        "drafts": sum(int(x.get("draft_n") or 0) for x in r["results"]),
         "early": [x.get("early") for x in r["results"]],
         "cache_slots": r["cache_slots"], "total_slots": r["total_slots"], "slot_bytes": r["slot_bytes"],
         "gpu_free_bytes": r["gpu_free_bytes"], "ready_s": r["ready_s"],
@@ -172,7 +180,7 @@ def measure(args, argv: list[str], todo: list[tuple[str, str, int | None]]) -> d
         first = first or r
         tok_s[name] = r["tok_s"]
     return {
-        "tok_s": tok_s, "failed": failed, "columns": list(PROMPTS), "warm": WARM, "decode": DECODE,
+        "tok_s": tok_s, "failed": failed, "columns": list(PROMPTS), "warm": WARM, "decode": DECODE, "passes": PASSES,
         "cache_slots": first["cache_slots"], "total_slots": first["total_slots"], "slot_bytes": first["slot_bytes"],
         "gpu_free_bytes": first["gpu_free_bytes"], "seconds": round(time.monotonic() - t0, 1),
         "measured_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
@@ -256,7 +264,10 @@ def measured_choice(args, argv: list[str]) -> dict:
         if row is not None and (stale := _stale(row, names, free, args)):
             row, reason = None, f"the stored calibration does not apply: {stale}"
         if row is None:
-            logger.info(f"--preset {PRESET}: calibrating, {len(todo)} server starts of {WARM} + {DECODE} tokens on {len(PROMPTS)} prompts ({reason})")
+            logger.info(
+                f"--preset {PRESET}: calibrating, {len(todo)} server starts of {PASSES} passes of {WARM} + {DECODE} tokens on "
+                f"{len(PROMPTS)} prompts ({reason})"
+            )
             # the launcher's own reading of the free memory: a later start compares its reading with this one
             row = {**measure(args, argv, todo), "stamp": stamp, "gpu_free_bytes": free}
             decode_profile.store(key, row, gpu={"name": gpu_name, "uuid": gpu_uuid})
@@ -267,7 +278,10 @@ def measured_choice(args, argv: list[str]) -> dict:
     except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         return static(f"the calibration failed: {type(exc).__name__}: {str(exc).splitlines()[0][:300] if str(exc) else ''}")
     _, strategy, depth = todo[names.index(name)]
-    timed = ", ".join(f"{n} {'/'.join(f'{v:.0f}' for v in row['tok_s'][n])}" for n in names if n in row["tok_s"])
-    why = f"its smaller lead over {names[0]} is {lead:+.1%}" if name != names[0] else f"no candidate leads it by more than {MARGIN:.0%} on both prompts"
-    logger.info(f"--preset {PRESET}: {took}; tok/s on {'/'.join(PROMPTS)}: {timed}; taking {name}: {why}")
+    timed = ", ".join(f"{n} {'/'.join(f'{sum(col) / len(col):.0f}' for col in row['tok_s'][n])}" for n in names if n in row["tok_s"])
+    if name != names[0]:
+        why = f"its smallest lead over {names[0]} across the prompts and passes is {lead:+.1%}"
+    else:
+        why = f"no candidate leads it by more than {MARGIN:.0%} on every prompt and pass"
+    logger.info(f"--preset {PRESET}: {took}; mean tok/s on {'/'.join(PROMPTS)}: {timed}; taking {name}: {why}")
     return _overrides(args, strategy, depth)

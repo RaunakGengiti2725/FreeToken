@@ -769,19 +769,41 @@ def test_preset_speculative_decoding_is_dropped_where_an_explicit_start_is_refus
 # ---- --preset single-measured (moe/calibrate.py): its rule, the timings it keeps in the decode profile, its fallback ----
 
 
-def test_calibration_takes_the_largest_worst_prompt_lead_above_the_margin():
+def test_calibration_takes_the_largest_worst_lead_above_the_margin_and_times_two_passes_on_a_filled_cache(monkeypatch):
+    from freetoken.moe import benchdecode, calibrate
     from freetoken.moe.calibrate import MARGIN, choose
 
+    def both(*prompts):
+        return [[v, v] for v in prompts]  # the same tok/s in each pass
+
     names = ["offload@3", "hybrid@3", "offload@0", "hybrid@0"]
-    static = {"offload@3": [100.0, 200.0]}
+    static = {"offload@3": both(100.0, 200.0)}
     assert MARGIN == 0.10
     assert choose(static, names) == ("offload@3", 0.0)  # no other candidate ran: a failed one has no timing and is not chosen
-    assert choose({**static, "hybrid@3": [150.0, 205.0]}, names)[0] == "offload@3"  # +50% on one prompt, +2.5% on the other
-    assert choose({**static, "hybrid@3": [109.0, 240.0]}, names)[0] == "offload@3"  # +9% on its worse prompt
-    assert choose({**static, "hybrid@3": [120.0, 250.0]}, names) == ("hybrid@3", pytest.approx(0.2))
-    assert choose({**static, "hybrid@3": [120.0, 240.0], "hybrid@0": [120.0, 240.0]}, names)[0] == "hybrid@3"  # a tie: the one named first
-    assert choose({**static, "hybrid@3": [120.0, 240.0], "hybrid@0": [126.0, 250.0]}, names)[0] == "hybrid@0"
-    assert choose({**static, "offload@0": [60.0, 90.0], "hybrid@0": [95.0, 230.0]}, names)[0] == "offload@3"  # slower ones change nothing
+    assert choose({**static, "hybrid@3": both(150.0, 205.0)}, names)[0] == "offload@3"  # +50% on one prompt, +2.5% on the other
+    assert choose({**static, "hybrid@3": both(109.0, 240.0)}, names)[0] == "offload@3"  # +9% on its worse prompt
+    assert choose({**static, "hybrid@3": both(120.0, 250.0)}, names) == ("hybrid@3", pytest.approx(0.2))
+    assert choose({**static, "hybrid@3": both(120.0, 240.0), "hybrid@0": both(120.0, 240.0)}, names)[0] == "hybrid@3"  # a tie: the one named first
+    assert choose({**static, "hybrid@3": both(120.0, 240.0), "hybrid@0": both(126.0, 250.0)}, names)[0] == "hybrid@0"
+    assert choose({**static, "offload@0": both(60.0, 90.0), "hybrid@0": both(95.0, 230.0)}, names)[0] == "offload@3"  # slower ones change nothing
+    # the lead has to hold in every pass: ahead only in the first, while the expert cache still fills, is not a lead
+    assert choose({**static, "hybrid@3": [[150.0, 105.0], [300.0, 260.0]]}, names)[0] == "offload@3"
+    assert choose({**static, "hybrid@3": [[150.0, 115.0], [300.0, 260.0]]}, names) == ("hybrid@3", pytest.approx(0.15))
+
+    # a candidate's server, through the bench's own code: a warm-up that fills the cache, then two or more timed passes a prompt
+    seen = {}
+
+    def run_arm(ns, extra, arm, rate, single, together, sampling, floors=None, passes=None):
+        seen.update(passes=ns.seeds, warm=ns.warm, prompts=[name for name, _ in single], together=together)
+        cols = [{"tok_s": (a + b) / 2, "seeds": [{"tok_s": a}, {"tok_s": b}], "draft_n": 4, "early": a, "gave_up": False} for a, b in ((90.0, 110.0), (180.0, 220.0))]
+        return {"tok_s": [c["tok_s"] for c in cols], "results": cols, "cache_slots": 40, "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": None, "ready_s": 1.0}
+
+    monkeypatch.setattr(benchdecode, "run_arm", run_arm)
+    monkeypatch.setattr(benchdecode, "eos_strings", lambda model: ())
+    timed = calibrate._time_candidate(SimpleNamespace(model_path="/models/anon"), ["--preset", "single-measured"], "offload", 3)
+    assert timed["tok_s"] == [[90.0, 110.0], [180.0, 220.0]] and timed["drafts"] == 8
+    assert seen["passes"] == calibrate.PASSES >= 2 and seen["warm"] == calibrate.WARM >= 1024
+    assert seen["prompts"] == list(calibrate.PROMPTS) and not seen["together"]
 
 
 def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_preset(decode_rows, monkeypatch):
@@ -804,7 +826,7 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
         started.append((strategy, depth))
         if (strategy, depth) not in speeds:
             raise RuntimeError("server exited with code 1 during startup")
-        return {"tok_s": speeds[strategy, depth], "drafts": 100 * (depth or 0), "early": speeds[strategy, depth], "cache_slots": 40,
+        return {"tok_s": [[v, v] for v in speeds[strategy, depth]], "drafts": 100 * (depth or 0), "early": speeds[strategy, depth], "cache_slots": 40,
                 "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": _ROW_FREE, "ready_s": 1.0}
 
     def starts(args, argv):
