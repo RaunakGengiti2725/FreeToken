@@ -225,7 +225,6 @@ class ChunkCaptureLinearBackend(LinearAttnBackend):
         self.cu_seqlens = torch.tensor([0, tokens], dtype=torch.int64, device=device)
         self.slot = torch.zeros(1, dtype=torch.int32, device=device)
         self.has_state = torch.ones(1, dtype=torch.bool, device=device)
-        self.query_indptr = torch.tensor([0, tokens], dtype=torch.int32, device=device)
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
         self.capture_bs = sorted(bs_list)
@@ -245,10 +244,6 @@ class ChunkCaptureLinearBackend(LinearAttnBackend):
         self.chunk_index = [prepare_lens(self.cu_seqlens)]
         for size in (16, 32, 64):
             self.chunk_index += [prepare_chunk_indices(self.cu_seqlens, size), prepare_chunk_offsets(self.cu_seqlens, size)]
-        # the LM head takes the chunk's last row from the attention metadata's query indptr inside the captured
-        # forward; the per-batch tensor would be freed by the first replay, so the capture reads one that stays
-        if hasattr(batch.attn_metadata, "cu_seqlens_q_gpu"):
-            batch.attn_metadata.cu_seqlens_q_gpu = self.query_indptr
 
     def prepare_for_replay(self, batch: "Batch") -> None:
         pass  # prepare_metadata wrote the slot into the captured tensor

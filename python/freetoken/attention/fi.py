@@ -327,6 +327,10 @@ class FlashInferBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         metadata.wrapper = self.graph_wrappers[bs]
+        if getattr(self, "capture_prefill", False):
+            # the LM head of a prefill forward takes each request's last row from the query indptr; the batch's own
+            # tensor is freed after the capture, the wrapper's buffer holds the same values at every replay
+            metadata.cu_seqlens_q_gpu = self.capture.cu_seqlens_q[: bs + 1]
         self._initialize_metadata_once(metadata)
 
     def prepare_for_replay(self, batch: Batch) -> None:
