@@ -181,6 +181,7 @@ candidate that fails on two starts in a row is left out from then on). The 10% m
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
 | `--enable-timings-report` | off | Attach a llama.cpp-shaped per-request `timings` object to responses |
 | `--anthropic-inline-system` | auto | Placement of late Anthropic system instructions: `auto`, `preserve`, or `fold` |
+| `--reproducible-seeds` | off | A request with a `seed` is computed without the prefix cache, so its text does not follow earlier requests; needs `--max-running-requests 1` (see below) |
 
 With `--enable-timings-report` every chat completion, completion and Responses response
 also carries a llama.cpp-shaped `timings` object next to `usage` (`cache_n`, `prompt_n`,
@@ -215,6 +216,33 @@ decoding a forced token ends that step's accepted drafts. A `/v1/chat/completion
 under a budget reports `usage.completion_tokens_details.reasoning_tokens`, and
 `"reasoning_closed_by": "budget"` in `usage` when the server closed the thinking; on a
 stream both ride the usage chunk (`"stream_options": {"include_usage": true}`).
+
+A chat completion or completion request may carry an integer `seed`. Each sampled token is
+then drawn from the seed and the token's position, so the draws repeat. The text can still
+change, because the logits change in the last bit with what the server did before: a
+prompt that reuses a cached prefix continues from stored state, a cold one computes it
+again, and the two disagree where two tokens are nearly tied.
+
+`--reproducible-seeds` takes that dependence away for requests that carry a seed. Such a
+request reuses no cached prefix and leaves none behind, so its text follows from the model,
+the server flags, the prompt, the sampling parameters and the seed, on the same GPU, driver
+and build. What it costs:
+
+- Every seeded request prefills its whole prompt. Its first token takes a cold prefill
+  however much of the prompt is cached (`cached_tokens` is 0), and a later turn of the same
+  conversation cannot reuse what it computed.
+- `--max-running-requests` must be 1: a step's logits change with the rows beside it, so
+  requests are served one at a time, seeded or not.
+- Every expert must be computed on the GPU: `--moe-strategy offload` or `fused`. `hybrid`,
+  `cpu` and `--moe-cpu-layers` are refused, because which experts the CPU computes follows
+  what is resident and the CPU kernels round differently.
+- `--speculative-algorithm dflash` is refused (its drafts draw from the stream all requests
+  share). `mtp` works.
+
+The server refuses to start on a combination from this list rather than serve text that
+only sometimes repeats. Requests without a seed are served as without the flag and still
+use the prefix cache. Text is not promised to match across GPUs, drivers, kernel builds,
+speculative depths or other server flags.
 
 ### Image input
 
