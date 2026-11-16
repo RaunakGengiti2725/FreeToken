@@ -44,7 +44,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--port` | 1919 | Bind port |
 | `--api-key` | `$FREETOKEN_API_KEY`, else off | Require the key on every route except `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`; other requests get a 401 |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
-| `--preset` | — | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing; see [Presets](#presets) |
+| `--preset` | — | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. See [Presets](#presets) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
@@ -132,6 +132,26 @@ an explicit `--speculative-algorithm mtp` would be refused), host embeddings whe
 to the LM head, and the KV reserve where the expert cache's minimum does not fit beside it (the
 warning names the largest `--kv-reserve-tokens` that does). The startup log lists what the preset set,
 what each setting did to the `--moe-cache-auto` plan, and the resulting expert slots and KV tokens.
+
+`--preset single` measures nothing: it serves with `offload` (or what `--moe-strategy auto` takes
+from an [`ft bench decode`](#ft-bench-decode) row) and 3 draft tokens. `--preset single-measured`
+is the same preset, and on its first start for a checkpoint, set of flags and machine it times the
+candidates the preset cannot choose between: `offload` and `hybrid`, each with no drafts, 3 and 5
+MTP draft tokens. Each candidate is one server start that decodes 512 tokens after 256 warm-up
+tokens on two built-in prompts (a math problem and a coding task), with the checkpoint's sampling.
+The candidate whose smaller lead over `offload` with 3 draft tokens across the two prompts is largest
+runs, if that lead is above 10%; otherwise the static preset's choice runs. This is measured on the
+first start, before the server loads; the log prints the time (`calibration took N s`): six model
+loads and about 9,000 decoded tokens, so expect several minutes. A strategy or a speculative setting
+given on the command line is not timed, and a checkpoint that drafts nothing is timed for the
+strategy alone.
+
+The timings are kept in the decode profile, next to the `ft bench decode` rows, and are read under
+the same conditions as those rows (same checkpoint and flags, same machine and release, and with an
+automatically sized cache no more free GPU memory than when they were taken), so later starts
+measure nothing and say which calibration they read. Where the calibration cannot be done or its
+static candidate does not start, the static preset runs and one log line says why; a candidate that
+does not start is not chosen. The 10% margin and the token counts are not tuned on measurements.
 
 ### API behaviour
 
@@ -371,6 +391,9 @@ It uses a row only if all of this holds, and logs which part differs when it doe
 
 A row keeps the tok/s of every pass of every start, and `auto` applies the rule above to them. A
 profile from a build whose rows held one number per column is not read, and the log says so.
+
+`--preset single-measured` keeps its own timings in the same file, under its own key: `auto`
+does not read them, and the preset does not read the rows of this command.
 
 Without such a row `auto` stays on `offload`. Rows are Linux only: the machine is read from `/proc`
 and `/sys`, and where that cannot be done no row is filed and `auto` stays on `offload`.

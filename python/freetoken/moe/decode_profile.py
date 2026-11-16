@@ -453,10 +453,11 @@ def _measured_passes(col) -> bool:
     return isinstance(col, list) and bool(col) and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in col)
 
 
-def lookup(key: str, *, gpu_name: str | None, gpu_uuid: str | None, now, path: str | None = None) -> tuple[dict | None, str]:
+def lookup(key: str, *, gpu_name: str | None, gpu_uuid: str | None, now, path: str | None = None, well_formed=None) -> tuple[dict | None, str]:
     """``(row, reason)``. A row comes back only for this GPU, exactly this key and an unchanged stamp. ``now`` is
     the current stamp or a function that makes it; it is only called once a row with this key is found.
-    Otherwise the reason names what differs or is stale, for the log line that says why auto stays on offload."""
+    Otherwise the reason names what differs or is stale, for the log line that says why auto stays on offload.
+    ``well_formed`` checks a row of another shape than a decode A/B's (moe/calibrate.py keeps its timings here too)."""
     src = _path(path, gpu_uuid)
     prof = _load(src)
     if prof is None:
@@ -474,7 +475,7 @@ def lookup(key: str, *, gpu_name: str | None, gpu_uuid: str | None, now, path: s
         if near is None:
             return None, "no decode row for this checkpoint"
         return None, "no decode row for these settings; the nearest row differs in " + ", ".join(key_diff(near, key))
-    if not _well_formed(row):
+    if not (well_formed or _well_formed)(row):
         return None, "the decode row holds no usable measurement"
     current = now() if callable(now) else now
     if current is None:

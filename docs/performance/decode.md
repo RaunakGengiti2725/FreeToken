@@ -102,6 +102,8 @@ The crossover moves with the CPU-to-PCIe bandwidth ratio and the model, so on
 another machine compare both strategies at your cache size:
 `ft bench decode --model <checkpoint>` runs that comparison, and
 `--moe-strategy auto` then takes the faster one for those flags.
+`--preset single-measured` ([cli.md](../cli.md#presets)) makes a shorter
+comparison of its own on its first start, together with the draft depth.
 
 ## Miss rate vs cache rate
 

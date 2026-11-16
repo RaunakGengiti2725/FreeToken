@@ -150,6 +150,12 @@ def launch_server(
             f"{', '.join(server_args.gpu_assigned) if server_args.gpu_assigned else 'resolved at CUDA init (no NVML)'}"
         )
 
+    if server_args.preset == "single-measured":
+        # before any worker: the candidates' servers need the GPU this server will take
+        from freetoken.moe.calibrate import measured_choice
+
+        server_args = replace(server_args, **measured_choice(server_args, list(sys.argv[1:] if argv is None else argv)))
+
     def start_subprocess() -> "BackendHandle":
         import multiprocessing as mp
 

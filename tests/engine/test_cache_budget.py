@@ -765,6 +765,77 @@ def test_preset_speculative_decoding_is_dropped_where_an_explicit_start_is_refus
     assert resolved(preset=True, model_path=str(decode_rows.tmp / "not-downloaded")).speculative_algorithm is None
 
 
+# ---- --preset single-measured (moe/calibrate.py): its rule, the timings it keeps in the decode profile, its fallback ----
+
+
+def test_calibration_takes_the_largest_worst_prompt_lead_above_the_margin():
+    from freetoken.moe.calibrate import MARGIN, choose
+
+    names = ["offload@3", "hybrid@3", "offload@0", "hybrid@0"]
+    static = {"offload@3": [100.0, 200.0]}
+    assert MARGIN == 0.10
+    assert choose(static, names) == ("offload@3", 0.0)  # no other candidate ran: a failed one has no timing and is not chosen
+    assert choose({**static, "hybrid@3": [150.0, 205.0]}, names)[0] == "offload@3"  # +50% on one prompt, +2.5% on the other
+    assert choose({**static, "hybrid@3": [109.0, 240.0]}, names)[0] == "offload@3"  # +9% on its worse prompt
+    assert choose({**static, "hybrid@3": [120.0, 250.0]}, names) == ("hybrid@3", pytest.approx(0.2))
+    assert choose({**static, "hybrid@3": [120.0, 240.0], "hybrid@0": [120.0, 240.0]}, names)[0] == "hybrid@3"  # a tie: the one named first
+    assert choose({**static, "hybrid@3": [120.0, 240.0], "hybrid@0": [126.0, 250.0]}, names)[0] == "hybrid@0"
+    assert choose({**static, "offload@0": [60.0, 90.0], "hybrid@0": [95.0, 230.0]}, names)[0] == "offload@3"  # slower ones change nothing
+
+
+def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_preset(decode_rows, monkeypatch):
+    from unittest.mock import patch
+
+    from freetoken.moe import calibrate
+    from freetoken.server.args import parse_args
+
+    def parsed(*flags):
+        argv = ["--model", str(decode_rows.model), "--preset", "single-measured", *flags]
+        hf = SimpleNamespace(to_dict=lambda: {"architectures": ["Qwen3MoeForCausalLM"], "torch_dtype": "bfloat16"})
+        with patch("freetoken.utils.cached_load_hf_config", lambda _path: hf):
+            return parse_args(argv)[0], argv
+
+    speeds = {("offload", 3): [100.0, 200.0], ("hybrid", 3): [130.0, 250.0], ("offload", 0): [60.0, 90.0],
+              ("hybrid", 0): [70.0, 120.0], ("offload", 5): [105.0, 190.0]}  # hybrid with 5 drafts does not start
+    started = []
+
+    def time_candidate(args, argv, strategy, depth, floors=None):
+        started.append((strategy, depth))
+        if (strategy, depth) not in speeds:
+            raise RuntimeError("server exited with code 1 during startup")
+        return {"tok_s": speeds[strategy, depth], "drafts": 100 * (depth or 0), "early": speeds[strategy, depth], "cache_slots": 40,
+                "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": _ROW_FREE, "ready_s": 1.0}
+
+    monkeypatch.setattr(calibrate, "_time_candidate", time_candidate)
+    monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (*_ROW_GPU, _ROW_FREE))
+    args, argv = parsed()
+    hybrid_3 = {"moe_strategy": "hybrid", "moe_cache_auto": True, "speculative_num_steps": 3}
+    assert calibrate.measured_choice(args, argv) == hybrid_3 and len(started) == 6
+    # the same checkpoint, flags, machine and release: the stored timings answer and no server is started
+    assert calibrate.measured_choice(args, argv) == hybrid_3 and len(started) == 6
+    # a strategy from the command line is not a candidate: the three depths of that strategy are another setup
+    assert calibrate.measured_choice(*parsed("--moe-strategy", "offload")) == {"speculative_num_steps": 3} and len(started) == 9
+    # another release, or more free memory than the cache was timed with: timed again
+    monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (*_ROW_GPU, _ROW_FREE + (8 << 30)))
+    assert calibrate.measured_choice(args, argv) == hybrid_3 and len(started) == 15
+    monkeypatch.setattr("freetoken.version.__version__", "9.9.10")
+    assert calibrate.measured_choice(args, argv) == hybrid_3 and len(started) == 21
+    # a checkpoint that drafts nothing: the depths are one server, so only the strategies are timed
+    speeds.update({("offload", 3): [60.0, 90.0], ("hybrid", 3): [80.0, 120.0]})
+    monkeypatch.setattr(calibrate, "_time_candidate", lambda args, argv, s, d, floors=None: {**time_candidate(args, argv, s, d), "drafts": 0})
+    other, other_argv = parsed("--memory-ratio", "0.9")
+    assert calibrate.measured_choice(other, other_argv) == hybrid_3 and len(started) == 23
+    # the static choice cannot be timed, or the GPU cannot be read: the static preset, and nothing is kept
+    monkeypatch.setattr(calibrate, "_time_candidate", time_candidate)
+    del speeds["offload", 3]
+    third, third_argv = parsed("--memory-ratio", "0.8")
+    assert calibrate.measured_choice(third, third_argv) == {} and len(started) == 24
+    speeds["offload", 3] = [100.0, 200.0]   # hybrid with 3 drafts is now the slower one: the static choice, measured
+    assert calibrate.measured_choice(third, third_argv) == {**hybrid_3, "moe_strategy": "offload"} and len(started) == 30
+    monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (_ for _ in ()).throw(RuntimeError("the GPU could not be read")))
+    assert calibrate.measured_choice(third, third_argv) == {} and len(started) == 30
+
+
 def test_auto_does_not_take_a_row_whose_hybrid_cache_is_below_the_models_floor(decode_rows):
     # the fake model has 8 experts a layer: a row edited to 4 slots would cap the cache under the floor and fail the start
     _file_row(decode_rows, _HYBRID_FASTER, slots=4)

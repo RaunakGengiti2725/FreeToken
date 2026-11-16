@@ -130,6 +130,8 @@ _PRESETS: dict[str, dict] = {
         "kv_reserve_tokens": None,  # the default max output tokens + PRESET_PROMPT_TOKENS (_apply_preset)
     },
 }
+# the same, and which of offload and hybrid and how many draft tokens are timed on the first start (moe/calibrate.py)
+_PRESETS["single-measured"] = {**_PRESETS["single"], "moe_strategy": "auto"}
 _UNSET = object()
 
 
@@ -145,11 +147,12 @@ def _apply_preset(kwargs: dict, left: set[str]) -> tuple[str, ...]:
     if kwargs["num_page_override"] is not None or kwargs["num_token_override"] is not None:
         theirs.add("kv_reserve_tokens")  # they sized the KV pool themselves
     filled = tuple(name for name in values if name not in theirs)
+    changed = [name for name in filled if kwargs[name] != values[name]]
     for name in filled:
         kwargs[name] = values[name]
     kept = ", ".join(f"{name}={kwargs[name]!r}" for name in values if name in theirs)
     logger.info(
-        f"--preset {kwargs['preset']} sets " + (", ".join(f"{name}={values[name]!r}" for name in filled) or "nothing")
+        f"--preset {kwargs['preset']} sets " + (", ".join(f"{name}={values[name]!r}" for name in changed) or "nothing")
         + (f"; the command line keeps {kept}" if kept else "")
     )
     return filled
@@ -1090,7 +1093,10 @@ def parse_args(
             "request at a time on a GPU smaller than the model: --max-running-requests 1, --embed-weights host, "
             "--memory-ratio 0.95, --moe-prefill-hit-d2d, mtp speculative decoding with 3 draft tokens where the "
             "checkpoint has the MTP layers, and a --kv-reserve-tokens that holds the default max output tokens and "
-            f"a {PRESET_PROMPT_TOKENS}-token prompt where the expert cache's minimum still fits. The log says what it set."
+            f"a {PRESET_PROMPT_TOKENS}-token prompt where the expert cache's minimum still fits. The log says what it set. "
+            "'single-measured' is 'single', and on its first start for a checkpoint, flags and machine it also times "
+            "offload against hybrid and 0, 3 and 5 draft tokens (one server start each), keeps the choice next to the "
+            "`ft bench decode` rows and logs how long that took; later starts read the choice."
         ),
     )
 
