@@ -718,6 +718,10 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        # before the host tables: a model sizes its own for the rows of a decode step, which the drafts decide
+        self._settle_preset_memory_ratio(config)
+        if is_offload_moe_strategy(config.moe_strategy):
+            self._settle_preset_drafts(config)
         # Host-side auxiliary stores (--embed-weights host tables, qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
@@ -731,9 +735,7 @@ class Engine:
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
-        self._settle_preset_memory_ratio(config)
         if is_offload_moe_strategy(config.moe_strategy):
-            self._settle_preset_drafts(config)
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
