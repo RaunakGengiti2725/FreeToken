@@ -312,7 +312,7 @@ def measured_choice(args, argv: list[str]) -> dict:
         else:
             took = f"read the calibration of {row.get('measured_at')}, which took {row.get('seconds')} s"
         name, lead = choose(row["tok_s"], names)
-    except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError) as exc:
         return static(f"the calibration failed: {type(exc).__name__}: {str(exc).splitlines()[0][:300] if str(exc) else ''}")
     _, strategy, depth = todo[names.index(name)]
     timed = ", ".join(f"{n} {'/'.join(f'{sum(col) / len(col):.0f}' for col in row['tok_s'][n])}" for n in names if n in row["tok_s"])

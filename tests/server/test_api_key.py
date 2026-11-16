@@ -124,6 +124,7 @@ def test_preset_single_changes_its_fields_and_nothing_without_the_flag():
         (("--memory-ratio", "0.9"), "memory_ratio", 0.9),
         (("--moe-prefill-hit-d2d",), "moe_prefill_hit_d2d", True),
         (("--speculative-algorithm", "off"), "speculative_algorithm", None),
+        (("--speculative-algorithm", "OFF"), "speculative_algorithm", None),
         (("--speculative-algorithm", "dflash"), "speculative_algorithm", "dflash"),
         (("--speculative-num-steps", "5"), "speculative_num_steps", 5),
         (("--kv-reserve-tokens", "8192"), "kv_reserve_tokens", 8192),

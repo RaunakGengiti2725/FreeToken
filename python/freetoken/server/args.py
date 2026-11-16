@@ -1136,7 +1136,7 @@ def parse_args(
 
     if kwargs["preset"] is not None:
         kwargs["preset_fields"] = _apply_preset(kwargs, left_alone)
-    if kwargs["speculative_algorithm"] == "off":
+    if (kwargs["speculative_algorithm"] or "").lower() == "off":
         kwargs["speculative_algorithm"] = None
 
     # the old flag stands in for one --quant-backend entry; next to the real flag it is a usage error
