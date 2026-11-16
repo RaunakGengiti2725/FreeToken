@@ -1124,10 +1124,12 @@ def test_preset_keeps_its_drafts_only_where_the_offload_cache_holds_a_fifth_of_t
     # a cache the command line sized (--moe-cache-rate 0.05 and 0.2 are 512 and 2048 slots), in slots or in bytes
     assert served(slots=512) and served(slots=2047) and not served(slots=2048)
     assert served(mem=2047 * slot) and not served(mem=2048 * slot)
-    assert any(PRESET_NO_DRAFTS in line and "512 of 10240" in line for line in lines)
+    assert any(PRESET_NO_DRAFTS in line and "sized has 512 expert slots for 10240 experts" in line for line in lines)
     # an automatic cache: the plan with the drafts at the preset's KV reserve, a slot more or less
     at_share = weights + 2048 * slot + (36864 // 16) * page
     assert not served(free=at_share) and served(free=at_share - 1)
+    # the line says what was counted: the plan before the KV reserve is settled, not the cache that is served
+    assert "the automatic plan with them, at a KV reserve of 36864 tokens and a slot's bytes from the bank layout, has 2047 expert slots" in lines[-1]
     assert served(free=weights + 100 * slot)  # no plan at all with them: not served with them
     # only offload's own drafts at the preset's own depth: hybrid, CPU layers and a typed depth keep them
     assert not served(slots=512, strategy="hybrid") and not served(slots=512, cpu_layers="2")

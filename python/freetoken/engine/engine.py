@@ -1073,15 +1073,16 @@ class Engine:
         object.__setattr__(config, "memory_ratio", EngineConfig.memory_ratio)
         _drop_preset_fields(config, "memory_ratio")
 
-    def _preset_draft_slots(self, config: EngineConfig) -> int | None:
-        """Expert slots of the cache a preset's server would serve its drafts from, counted before the expert banks load:
-        the size the command line gave, or the automatic plan at the preset's KV reserve with a slot's bytes taken from
-        the bank layout (0 where that plan does not fit). None where the bank layout's bytes are not known."""
+    def _preset_draft_slots(self, config: EngineConfig) -> tuple[int, str] | None:
+        """(expert slots, what was counted) of the cache a preset's server would serve its drafts from, counted before the
+        expert banks load: the size the command line gave, or the automatic plan at the preset's KV reserve as asked with a
+        slot's bytes taken from the bank layout (0 where that plan does not fit). The plan that is served can hold more:
+        the KV reserve may still be lowered. None where the bank layout's bytes are not known."""
         from freetoken.engine.cache_budget import _plan_or_short
         from freetoken.moe.expert_banks import is_mixed
 
         if config.moe_cache_size > 0:
-            return config.moe_cache_size
+            return config.moe_cache_size, "the expert cache the command line sized has"
         method, layer_methods = shared_offload_method(self.model), offload_layer_methods(self.model)
         bank_bytes = _bank_bytes(config, method, layer_methods if is_mixed(layer_methods) else None)
         if not bank_bytes:
@@ -1089,12 +1090,13 @@ class Engine:
         total = config.model_config.num_moe_layers * config.model_config.num_experts
         per_slot = -(-bank_bytes // total)
         if config.moe_cache_mem is not None:
-            return config.moe_cache_mem // per_slot
+            return config.moe_cache_mem // per_slot, "--moe-cache-mem holds, at a slot's bytes from the bank layout,"
         terms = self._auto_cache_terms(config, None, method, per_expert_bytes=per_slot)
         if "kv_reserve_tokens" in config.preset_fields:
             terms["kv_reserve_tokens"] = min(terms["kv_reserve_tokens"], _preset_kv_target(config))
         plan, _ = _plan_or_short(terms)
-        return plan[0] if plan is not None else 0
+        what = f"the automatic plan with them, at a KV reserve of {terms['kv_reserve_tokens']} tokens and a slot's bytes from the bank layout, has"
+        return (plan[0], what) if plan is not None else (0, what.replace(", has", ", does not fit:"))
 
     def _settle_preset_drafts(self, config: EngineConfig) -> None:
         """A preset's drafts stay only where the offload expert cache holds PRESET_DRAFT_SHARE of all experts or more:
@@ -1105,9 +1107,10 @@ class Engine:
         if self.spec is None or not drafts or config.moe_strategy != "offload" or config.moe_cpu_layers:
             return
         total = config.model_config.num_moe_layers * config.model_config.num_experts
-        slots = self._preset_draft_slots(config)
-        if slots is None or slots >= PRESET_DRAFT_SHARE * total:
+        counted = self._preset_draft_slots(config)
+        if counted is None or counted[0] >= PRESET_DRAFT_SHARE * total:
             return
+        slots, what = counted
         before = self._sync_get_memory()[0]
         self.spec = None
         for name in ("speculative_algorithm", "speculative_num_steps", "spec_slot_states"):
@@ -1120,7 +1123,7 @@ class Engine:
         self._weights_bytes -= freed
         self._post_weights_free += freed
         logger.info_rank0(
-            f"--preset {config.preset}: {PRESET_NO_DRAFTS}: with them the expert cache holds {slots} of {total} experts, "
+            f"--preset {config.preset}: {PRESET_NO_DRAFTS}: {what} {slots} expert slots for {total} experts, "
             f"under {PRESET_DRAFT_SHARE:.0%}, where offload decodes faster without ({mem_GB(freed)} of draft weights freed)"
         )
         if _preset_capture_bytes(config):
