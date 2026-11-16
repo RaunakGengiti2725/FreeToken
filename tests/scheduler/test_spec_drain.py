@@ -227,3 +227,37 @@ def test_drain_commits_a_forced_token_as_the_end_of_the_accepted_run():
     for req in reqs:
         stub._free_req_resources(req)
     cm.check_integrity()
+
+
+def test_a_step_commits_up_to_its_first_finishing_token():
+    """A multi-token step stops at the first token that ends the request: the reply, the host ids, the stop match and the tool-call anchor see the committed tokens and none after them."""
+    step = [11, 12, 13, 14]
+    # (eos ids, stop strings, anchor id, max_tokens) -> (committed, finish reason, matched stop, anchor length)
+    cases = [
+        ((set(), [], None, 16), ([11, 12, 13, 14], None, None, None)),
+        (({13}, [], None, 16), ([11, 12, 13], "stop", None, None)),
+        # matched on the ids up to the token under test: with the step's later tokens already on the host it would match early
+        ((set(), ["13 14"], None, 16), ([11, 12, 13, 14], "stop", "13 14", None)),
+        ((set(), ["12 13"], None, 16), ([11, 12, 13], "stop", "12 13", None)),
+        ((set(), [], 12, 16), ([11, 12, 13, 14], None, None, PROMPT + 3)),
+        ((set(), [], None, 3), ([11, 12], "length", None, None)),
+        # EOS wins over the length limit reached on the same token, and a finishing token sets no anchor
+        (({12}, [], 12, 3), ([11, 12], "stop", None, None)),
+    ]
+    for (eos, stops, anchor, max_tokens), (committed, reason, matched, anchor_len) in cases:
+        pool, cm, tm, dm, stub, events = _setup()
+        stub.eos_token_ids, stub.toolcall_anchor_id = eos, anchor
+        stub.tokenizer = SimpleNamespace(decode=lambda ids: " ".join(map(str, ids)))
+        stub._match_stop_str = lambda req: Scheduler._match_stop_str(stub, req)
+        req = _decoding_req(pool, cm, tm, 1, max_tokens)
+        req.sampling_params.ignore_eos = False
+        req.sampling_params.stop_strs = stops
+        before = req.input_ids.tolist()
+
+        msg, n = Scheduler._commit_tokens(stub, req, torch.tensor(step))
+
+        case = (eos, stops, anchor, max_tokens)
+        assert (msg.next_tokens, n) == (committed, len(committed)), case
+        assert (msg.finished, msg.finish_reason, msg.matched_stop) == (reason is not None, reason, matched), case
+        assert req.input_ids.tolist() == before + committed, case
+        assert req.toolcall_anchor_len == anchor_len, case

@@ -438,11 +438,12 @@ class Scheduler(SchedulerIOMixin):
         k = self.config.decode_rows_per_req - 1
         counts, finished = [], []
         now = time.perf_counter()
+        emitted_counts = output.emitted_cpu.tolist()
         for i, req in enumerate(batch.reqs):
             # spec forces normal_loop, which frees an aborted request between steps; overlap would need rollback_tail here and must not donate the GDN slot the verify rolled
             assert not req.aborted, "a verify batch drained an aborted request"
             cached = req.cached_len
-            emitted = int(output.emitted_cpu[i])
+            emitted = emitted_counts[i]
             msg, n = self._commit_tokens(req, output.next_tokens_cpu[i, : emitted + 1])
             # k drafts were proposed; the step hands _commit_tokens the emitted accepted
             # drafts plus the target's own token, so when a stop lands on a draft every
@@ -478,24 +479,31 @@ class Scheduler(SchedulerIOMixin):
     def _commit_tokens(self, req: Req, tokens: torch.Tensor) -> Tuple[DetokenizeMsg, int]:
         """Append sampled tokens in order until one finishes the request; returns the reply and how many tokens were committed."""
         params = req.sampling_params
-        committed: List[int] = []
+        ids: List[int] = tokens.tolist()
+        start = req.input_ids.numel()
+        # a stop string is matched on the host ids, so those requests append token by token
+        stepwise = bool(params.stop_strs)
         finished, finish_reason, matched_stop = False, None, None
-        for j in range(tokens.numel()):
-            req.append_host(tokens[j : j + 1])
-            token = int(tokens[j].item())
-            committed.append(token)
+        n = 0
+        for token in ids:
+            if stepwise:
+                req.append_host(tokens[n : n + 1])
+            n += 1
             # EOS / stop-string -> "stop", output budget exhausted -> "length";
             # EOS and stop strings win over length.
             # Overlap can advance device_len one token ahead of this host reply.
-            hit_length = req.input_ids.numel() >= req.max_device_len
+            hit_length = start + n >= req.max_device_len
             hit_eos = not params.ignore_eos and token in self.eos_token_ids
-            matched_stop = self._match_stop_str(req) if not hit_eos and params.stop_strs else None
+            matched_stop = self._match_stop_str(req) if not hit_eos and stepwise else None
             if hit_length or hit_eos or matched_stop is not None:
                 finished = True
                 finish_reason = "stop" if (hit_eos or matched_stop is not None) else "length"
                 break
             if token == self.toolcall_anchor_id and req.toolcall_anchor_len is None:
-                req.toolcall_anchor_len = req.input_ids.numel()
+                req.toolcall_anchor_len = start + n
+        if not stepwise:
+            req.append_host(tokens[:n])
+        committed = ids[:n]
         msg = DetokenizeMsg(
             uid=req.uid,
             next_tokens=committed,
