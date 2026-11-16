@@ -180,9 +180,10 @@ class SpecRunner:
 
         With prefill graphs (--prefill-graph-chunks) the steps are prefill forwards only, largest graph first, and what
         no graph fits runs eagerly: the result is that of eager prefill forwards cut at the same tokens. A request's
-        last chunk of two tokens or more is cut one token before its end and the state there is its snapshot, so the
-        same prompt sent again has one token left to run, whatever its length. Without prefill graphs the chunk runs
-        as verify steps, on the decode kernels.
+        last chunk is cut where its snapshot is most useful and the linear state there is the snapshot: at the turn
+        anchor (Req.turn_anchor_len) when the chunk crosses it, else one token before the end, so the same prompt sent
+        again has one token left to run, whatever its length. Without prefill graphs the chunk runs as verify steps,
+        on the decode kernels.
         """
         from freetoken.kernel.fla.chunk import CHUNK_SIZE
         from freetoken.scheduler.prefill import ChunkedReq
@@ -193,6 +194,11 @@ class SpecRunner:
         left = req.extend_len
 
         def cut(n: int) -> None:
+            if n > limit:
+                # the graphs take the last --prefill-graph-tokens tokens; what is before them is one eager forward
+                head = (n - limit + CHUNK_SIZE - 1) // CHUNK_SIZE * CHUNK_SIZE
+                steps.append(("eager", head))
+                n -= head
             for b in sizes:
                 while n >= b:
                     steps.append(("chunk", b))
@@ -203,22 +209,31 @@ class SpecRunner:
         if sizes:
             if isinstance(req, ChunkedReq) or not engine.chunk_graphs_usable():
                 return None
+            limit, start = engine.config.prefill_graph_tokens, req.cached_len
             tracked = fla is not None and fla.track_dst is not None
-            snapshot = left >= 2 and (tracked or getattr(req, "mamba_ping_pong", None) is not None)
-            if snapshot:
-                if not tracked:
-                    # a chunk of 64 tokens or fewer, which the forward's own tracking leaves without a snapshot
-                    slot = req.mamba_ping_pong[req.mamba_next_track_idx]
-                    req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
-                    batch.prefill_track_dst = torch.tensor([slot], dtype=torch.int64).to(self.device, non_blocking=True)
-                else:
-                    batch.prefill_track_dst = fla.track_dst
-                req.mamba_last_track_seqlen = req.cached_len + left - 1
-                cut(left - 1)
-                steps.append(("track", 0))
-                cut(1)
-            else:
+            at = None
+            if tracked or getattr(req, "mamba_ping_pong", None) is not None:
+                # where the snapshot goes: the turn anchor when this chunk crosses it (the next turn of the
+                # conversation reuses up to there), else one token before the end (the same prompt sent again does)
+                anchor = getattr(req, "turn_anchor_len", None)
+                if anchor is not None and start < anchor < start + left:
+                    at = anchor - start
+                elif left >= 2:
+                    at = left - 1
+            if at is None:
                 cut(left)
+                return steps
+            if not tracked:
+                # a chunk of 64 tokens or fewer, which the forward's own tracking leaves without a snapshot
+                slot = req.mamba_ping_pong[req.mamba_next_track_idx]
+                req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
+                batch.prefill_track_dst = torch.tensor([slot], dtype=torch.int64).to(self.device, non_blocking=True)
+            else:
+                batch.prefill_track_dst = fla.track_dst
+            req.mamba_last_track_seqlen = start + at
+            cut(at)
+            steps.append(("track", 0))
+            cut(left - at)
             return steps
         if fla is not None and fla.track_dst is not None:
             return None  # verify steps cannot stop at the tracked boundary

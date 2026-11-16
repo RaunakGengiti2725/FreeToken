@@ -1627,11 +1627,11 @@ class Engine:
         return logits
 
     def _prefill_runs_as_verify(self, batch: Batch) -> bool:
-        """Whether this prefill chunk runs as captured steps (SpecRunner.prefill_plan): one request, text only, at most --prefill-graph-tokens tokens, and a plan exists for it."""
+        """Whether this prefill chunk runs as the steps of a plan (SpecRunner.prefill_plan): one request, text only, and a plan exists for it; without prefill graphs, at most --prefill-graph-tokens tokens."""
         limit, runner = self.config.prefill_graph_tokens, self.graph_runner
         if limit <= 0 or batch.size != 1 or runner.phase != "verify" or batch.mm_gather_plan:
             return False
-        if not self.spec.can_prefill_as_verify or batch.reqs[0].extend_len > limit:
+        if not self.spec.can_prefill_as_verify or (not self.chunk_runners and batch.reqs[0].extend_len > limit):
             return False
         batch.prefill_plan = self.spec.prefill_plan(batch)
         return batch.prefill_plan is not None
