@@ -689,8 +689,10 @@ class Engine:
 
         # ======================= Graph capture initialization ========================
         self.graph_runner = self._make_graph_runner(config.cuda_graph_bs, init_free_memory, aligned_max_seq_len)
-        if config.attention_backend.split(",")[0] == "triton":
-            # Prefill runs on the first comma part; warm its autotune cache.
+        keeps = self.moe_offload_cache is not None and self.moe_offload_cache.keeps_streamed_experts
+        if config.attention_backend.split(",")[0] == "triton" or keeps:
+            # Prefill runs on the first comma part; warm its autotune cache. With a cache that keeps what a prefill
+            # streams, the warmup also loads the experts, whatever the backend.
             self._warmup_prefill()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
