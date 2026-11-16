@@ -1173,6 +1173,11 @@ class OffloadMoeCache:
             self._prefill_streamed[buffer_id] = None
         return self.stage_views(layer_id, buffer_id)
 
+    @property
+    def keeps_streamed_experts(self) -> bool:
+        """Whether a prefill keeps the experts it streams (see _keep_streamed_experts): hit-d2d prefills with GPU decode."""
+        return self.prefill_hit_d2d and self.prefill_overlap and self.decode_target == "gpu" and self.device.type == "cuda"
+
     def _keep_streamed_experts(self, layer_id: int, buffer_id: int, absent) -> None:
         """Copy the experts ``layer_id`` streamed from host, staging buffer -> empty slots, and register them.
 
