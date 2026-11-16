@@ -207,12 +207,15 @@ class SpecRunner:
                 steps.append(("eager", n))
 
         if sizes:
-            if isinstance(req, ChunkedReq) or not engine.chunk_graphs_usable():
+            if not engine.chunk_graphs_usable():
                 return None
             limit, start = engine.config.prefill_graph_tokens, req.cached_len
             tracked = fla is not None and fla.track_dst is not None
             at = None
-            if tracked or getattr(req, "mamba_ping_pong", None) is not None:
+            if isinstance(req, ChunkedReq):
+                # not the prompt's last chunk: its snapshot stays where the forward's own tracking marked it
+                at = req.mamba_last_track_seqlen - start if tracked else None
+            elif tracked or getattr(req, "mamba_ping_pong", None) is not None:
                 # where the snapshot goes: the turn anchor when this chunk crosses it (the next turn of the
                 # conversation reuses up to there), else one token before the end (the same prompt sent again does)
                 anchor = getattr(req, "turn_anchor_len", None)
