@@ -220,6 +220,49 @@ def test_prefill_hit_d2d_keeps_streamed_experts_in_empty_slots():
 
 
 @CUDA
+@JIT
+@BATCH_API
+def test_prefill_reads_slots_once_every_expert_is_resident():
+    dev = torch.device("cuda")
+    sources = {
+        "gate_up": [torch.randn(E, 32, 8, dtype=torch.bfloat16).pin_memory() for _ in range(NUM_LAYERS)],
+        "down": [torch.randn(E, 8, 16, dtype=torch.bfloat16).pin_memory() for _ in range(NUM_LAYERS)],
+    }
+    # a slot for every expert outside the two staging buffers
+    cache = OffloadMoeCache(
+        num_layers=NUM_LAYERS, num_experts=E, cache_size=(2 + NUM_LAYERS) * E, device=dev, prefill_overlap=True, prefill_hit_d2d=True
+    )
+    cache.set_bank_sources(sources)
+
+    def stream(layers):
+        cache.begin_prefill()
+        for layer in layers:
+            cache.prefetch_prefill_layer(layer)
+            cache.wait_prefill_layer(layer)
+            cache.release_prefill_layer(layer)
+
+    stream(range(NUM_LAYERS - 1))
+    cache.begin_prefill()
+    assert not cache.all_resident  # the last layer has not been streamed
+    stream([NUM_LAYERS - 1])
+    assert not cache.all_resident  # known only from the next prefill's snapshot
+    cache.begin_prefill()
+    assert cache.all_resident
+    ids = torch.arange(E, device=dev).flip(0)
+    for layer in range(NUM_LAYERS):
+        slots = cache.resident_slots(layer, ids).long()
+        assert int(slots.min()) >= 2 * E  # none in a staging buffer
+        for view, (name, per_layer) in zip(cache.pool_bank_views(layer), sources.items()):
+            assert torch.equal(view[slots].cpu(), per_layer[layer].flip(0)), name
+    # a prefill no longer stages anything
+    before = cache.id_of_slot.clone()
+    cache.begin_prefill()
+    assert torch.equal(cache.id_of_slot, before)
+    cache.reset()
+    assert not cache.all_resident
+
+
+@CUDA
 def test_prefill_hit_d2d_noop_without_spare_slots():
     dev = torch.device("cuda")
     sources = {
