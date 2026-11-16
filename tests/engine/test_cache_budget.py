@@ -914,6 +914,64 @@ def test_preset_serves_every_expert_resident_where_the_checkpoint_fits_and_the_s
     assert strategy(1 << 40) == "offload"
 
 
+def test_preset_single_fast_serves_as_single_where_its_captures_do_not_fit(decode_rows, monkeypatch):
+    from freetoken.engine.engine import PRESET_CAPTURE_BYTES, Engine
+
+    engine = decode_rows.engine
+    captures = ("prefill_graph_tokens", "prefill_graph_chunks")
+    monkeypatch.setattr(engine, "resolve_pool_class", lambda model: SimpleNamespace(kv_cost=lambda config: (16_000, 500, 16, 0)))
+    monkeypatch.setattr(engine, "state_pool_bytes", lambda config: 300)
+    monkeypatch.setattr(engine, "_prefill_working_bytes", lambda config, tokens: (7000, 0))
+    monkeypatch.setattr(engine, "_adjust_spec_config", lambda config, override, windowed_kv: None)
+    monkeypatch.setattr(engine, "_spec_runner", lambda: SimpleNamespace(budget=lambda config: (0, 0)))
+    need = 100 + 8192 * 1000 + 500 + 300 + 7000
+
+    def resolved(free, **flags):
+        monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: free)
+        flags = {"speculative_algorithm": "mtp", "speculative_num_steps": 3, "memory_ratio": 1.0, "preset_fields": ("moe_strategy", *captures), **flags}
+        return _resolved(
+            decode_rows, preset="single-fast", max_seq_len_override=40960, prefill_graph_tokens=448, prefill_graph_chunks="1-64,128-384:64", **flags,
+        )
+
+    def kept(config):
+        return (config.prefill_graph_tokens, config.prefill_graph_chunks) == (448, "1-64,128-384:64") and set(captures) <= set(config.preset_fields)
+
+    def single(config):
+        return (config.prefill_graph_tokens, config.prefill_graph_chunks) == (0, "") and not set(captures) & set(config.preset_fields)
+
+    # resident experts: the captures' memory counts; where only it does not fit the server is --preset single's, fused
+    config = resolved(need + PRESET_CAPTURE_BYTES)
+    assert config.moe_strategy == "fused" and kept(config)
+    config = resolved(need + PRESET_CAPTURE_BYTES - 1)
+    assert config.moe_strategy == "fused" and single(config)
+    # not even the experts fit: an expert cache, and its plan decides (below)
+    config = resolved(need - 1)
+    assert config.moe_strategy == "offload" and kept(config)
+    # no speculative decoding, no verify step to capture them beside
+    assert single(resolved(1 << 40, speculative_algorithm=None, speculative_num_steps=0))
+
+    # an automatic expert cache, Qwen3.6-35B-A3B's sizes: the captures stay where the plan, with their memory left free,
+    # has every expert outside the staging buffers and the preset's KV reserve; one byte less and they go
+    slot, weights, page = 1_780_000, int(4.44 * 2**30), 16 * 20_000
+
+    def planned(free, staging=512, **flags):
+        config = resolved(1 << 40, moe_strategy="offload", kv_reserve_tokens=36864, **flags)
+        terms = dict(
+            baseline_free=free, weights_bytes=weights, memory_ratio=1.0, cache_per_page=page, fixed_cache_size=PRESET_CAPTURE_BYTES,
+            per_expert_bytes=slot, num_experts=256, total_experts=10240, prefill_overlap=True, kv_reserve_tokens=36864, page_size=16,
+        )
+        stub = SimpleNamespace(_auto_cache_terms=lambda *a: dict(terms), _moe_slot_limit=None)
+        Engine._settle_preset_captures(stub, config, None, None, None, staging)
+        return config
+
+    fits = weights + PRESET_CAPTURE_BYTES + (10240 + 512) * slot + (36864 // 16) * page
+    assert kept(planned(fits)) and single(planned(fits - 1))
+    assert single(planned(16 << 30)) and single(planned(1 << 40, staging=0))  # a small card; several pools or CPU experts
+    # typed chunks are not the preset's to drop
+    typed = planned(16 << 30, preset_fields=("moe_strategy", "prefill_graph_tokens"))
+    assert typed.prefill_graph_chunks == "1-64,128-384:64" and typed.prefill_graph_tokens == 448
+
+
 def test_preset_plan_takes_the_staging_slots_only_where_every_expert_and_the_kv_reserve_still_fit():
     from freetoken.engine.cache_budget import plan_resident_staging
 

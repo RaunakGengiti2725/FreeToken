@@ -135,6 +135,9 @@ _PRESETS: dict[str, dict] = {
 }
 # the same, and the strategy and the number of draft tokens are timed on the first start (moe/calibrate.py)
 _PRESETS["single-measured"] = dict(_PRESETS["single"])
+# 'single' and the captured prefill forwards, which cut a chunk in other pieces than the eager forward: other text.
+# The engine drops them where not every expert is resident (engine._drop_preset_captures).
+_PRESETS["single-fast"] = {**_PRESETS["single"], "prefill_graph_tokens": 448, "prefill_graph_chunks": "1-64,128-384:64"}
 _UNSET = object()
 
 
@@ -1168,7 +1171,12 @@ def parse_args(
             "that a prefill streams nothing; a typed --moe-strategy is kept. The log says what it set. "
             "'single-measured' is 'single', and on its first start for a checkpoint, flags and machine it also times "
             "offload against hybrid and 0, 3 and 5 draft tokens (one server start each), keeps the choice next to the "
-            "`ft bench decode` rows and logs how long that took; later starts read the choice."
+            "`ft bench decode` rows and logs how long that took; later starts read the choice. "
+            "'single-fast' is 'single' with --prefill-graph-tokens 448 --prefill-graph-chunks 1-64,128-384:64: a prompt "
+            "that continues a cached one by up to 448 tokens starts sooner. Its replies are not always the text 'single' "
+            "gives: such a chunk is computed in one or two captured pieces instead of one forward, which changes the last "
+            "bits of the numbers and, where two tokens are nearly tied, the token. It needs every expert on the GPU and "
+            "leaves 2.25 GiB free for the captures; where that does not fit it serves as 'single' and the log says so."
         ),
     )
 

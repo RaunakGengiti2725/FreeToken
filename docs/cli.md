@@ -44,7 +44,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--port` | 1919 | Bind port |
 | `--api-key` | `$FREETOKEN_API_KEY`, else off | Require the key on every route except `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`; other requests get a 401 |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
-| `--preset` | — | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. See [Presets](#presets) |
+| `--preset` | — | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. `single-fast`: `single` with captured prefill forwards, whose replies can differ from `single`'s. See [Presets](#presets) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
@@ -101,6 +101,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does, [performa
 | `--moe-locked-max-fetch` | 8 | Most experts a locked layer fetches per step; sizes the staging (that many rows of the widest expert, per bank) |
 | `--moe-collect-stats` | off | Log decode MoE stats with each decode log line: hit rate, and per layer-step the misses, experts fetched and experts computed on CPU, for pinned, locked and CPU-only layers |
 | `--prefill-graph-tokens` | 0 | Prefill: with speculative decoding, a chunk of at most this many tokens on a cached prefix runs as captured verify steps instead of an eager forward; 0 = always eager |
+| `--prefill-graph-chunks` | none | Prefill: with `--prefill-graph-tokens`, token counts of the prefill forwards to capture, e.g. `1-64,128-384:64`; a chunk within the limit then runs as one or two captured forwards, cut at its last 64-token boundary, instead of one eager forward. Needs every expert resident |
 | `--prefill-graph-rows` | 0 | Prefill: rows of a wider verify step captured for `--prefill-graph-tokens` chunks longer than a decode step; 0 = only the decode step's rows |
 | `--moe-prefill-demand-tokens` | 0 | Prefill: a chunk of at most this many tokens loads only the experts it routes to, through the expert cache as decode does (GPU decode only); 0 streams whole layers |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
@@ -188,6 +189,29 @@ the calibration cannot be done or its
 static candidate does not start, the static preset runs and one log line says why; a candidate that
 does not start is not chosen, the log names it, and the next start times the candidates again (a
 candidate that fails on two starts in a row is left out from then on). The 10% margin and the token counts are not tuned on measurements.
+
+`--preset single-fast` is `--preset single` with `--prefill-graph-tokens 448` and
+`--prefill-graph-chunks 1-64,128-384:64`: when a prompt continues a cached one by at most 448
+tokens (a resend, the next turn of a conversation), those tokens run as one or two captured
+forwards instead of an eager one, and the first token comes sooner.
+
+It is a preset of its own because it does not always give the text `single` gives. `single`
+runs a prefill chunk as one eager forward, as a server without the preset does. A captured forward
+computes what an eager forward of the same tokens computes, bit for bit, but `single-fast` cuts a
+chunk in other pieces: a multiple of 64 tokens, then the rest. A prompt computed in other pieces
+differs in the last bits of its numbers, and where two tokens are nearly tied the reply takes
+another one and goes on differently. Each reply is still the model's, computed from the full
+prompt; it is not the same reply. Compare or cache replies across the two presets only with that
+in mind.
+
+The captures read the experts where they lie, so they need every expert on the GPU (resident, or
+an expert cache with a slot for each outside the prefill staging buffers), and speculative decoding,
+whose verify step they are captured beside. They take GPU memory, which the preset leaves free in
+addition to the prefill chunk: 2.25 GiB, from 2.1 GiB measured for 70 sizes of Qwen3.6-35B-A3B
+NVFP4 on an RTX 5090, and not measured elsewhere. Where the plan with that memory left free does not
+keep every expert resident and the KV reserve, or speculative decoding is off, the server runs as
+`--preset single` and one log line says why. `--prefill-graph-tokens` or `--prefill-graph-chunks`
+on the command line are kept as typed; typed chunks get no memory left free for them.
 
 ### API behaviour
 

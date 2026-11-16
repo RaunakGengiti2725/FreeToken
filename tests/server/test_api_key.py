@@ -147,6 +147,19 @@ def test_explicit_flag_wins_over_the_preset(flag, field, value):
         assert args.speculative_num_steps == 0
 
 
+def test_preset_single_fast_is_single_and_the_captured_prefill_forwards():
+    single, fast = _parse("--preset", "single"), _parse("--preset", "single-fast")
+    differ = {f.name for f in dataclasses.fields(single) if getattr(single, f.name) != getattr(fast, f.name)}
+    assert differ == {"preset", "preset_fields", "prefill_graph_tokens", "prefill_graph_chunks"}
+    assert (fast.prefill_graph_tokens, fast.prefill_graph_chunks) == (448, "1-64,128-384:64")
+    assert fast.preset_fields == (*single.preset_fields, "prefill_graph_tokens", "prefill_graph_chunks")
+    # typed chunks are the user's: the engine leaves no memory free for those, and never drops them
+    typed = _parse("--preset", "single-fast", "--prefill-graph-chunks", "1-64")
+    assert typed.prefill_graph_chunks == "1-64" and "prefill_graph_chunks" not in typed.preset_fields
+    # the other presets set neither
+    assert (single.prefill_graph_tokens, single.prefill_graph_chunks) == (0, "") == (ServerArgs.prefill_graph_tokens, ServerArgs.prefill_graph_chunks)
+
+
 def test_preset_kv_reserve_follows_the_output_limit_and_leaves_a_sized_kv_pool_alone():
     assert _parse("--preset", "single", "--max-output-tokens", "8192").kv_reserve_tokens == 8192 + 4096
     sized = _parse("--preset", "single", "--num-tokens", "65536")

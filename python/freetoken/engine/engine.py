@@ -246,6 +246,25 @@ def _drop_preset_fields(config, *names: str) -> None:
     object.__setattr__(config, "preset_fields", tuple(name for name in config.preset_fields if name not in names))
 
 
+# --preset single-fast: its prefill graphs took 2.1 GiB on the one checkpoint and card they were measured on (70 sizes,
+# Qwen3.6-35B-A3B NVFP4, RTX 5090); the margin on top is unmeasured
+PRESET_CAPTURE_BYTES = 2304 << 20
+
+
+def _preset_capture_bytes(config) -> int:
+    """GPU bytes a preset leaves free for the prefill graphs it asked for; a --prefill-graph-chunks from the command line gets none."""
+    return PRESET_CAPTURE_BYTES if "prefill_graph_chunks" in getattr(config, "preset_fields", ()) else 0
+
+
+def _drop_preset_captures(config, reason: str) -> None:
+    """Serve a preset without the prefill graphs it asked for, with one log line: what is left is --preset single."""
+    filled = [name for name in ("prefill_graph_tokens", "prefill_graph_chunks") if name in config.preset_fields]
+    for name in filled:
+        object.__setattr__(config, name, getattr(EngineConfig, name))
+    _drop_preset_fields(config, *filled)
+    logger.info_rank0(f"--preset {config.preset}: serving as --preset single, without the captured prefill forwards ({reason})")
+
+
 def _preset_kv_target(config) -> int:
     """The KV reserve a preset asks for, at most the model's context (no request holds more) and at least the default reserve."""
     return max(min(config.kv_reserve_tokens, config.max_seq_len), EngineConfig.kv_reserve_tokens)
@@ -325,9 +344,13 @@ def _preset_takes_fused(config) -> bool:
     need, free = _preset_resident_need(config), _gpu_free_bytes()
     if need is None or free is None:
         return False
-    fits = need <= int(config.memory_ratio * free)
+    allowed, captures = int(config.memory_ratio * free), _preset_capture_bytes(config)
+    if captures and need <= allowed < need + captures:
+        _drop_preset_captures(config, f"the experts fit on the GPU, but not beside the {mem_GB(captures)} the prefill graphs take")
+        captures = 0
+    fits = need + captures <= allowed
     logger.info_rank0(
-        f"--preset {config.preset}: every expert resident needs {mem_GB(need)} of the {mem_GB(int(config.memory_ratio * free))} "
+        f"--preset {config.preset}: every expert resident needs {mem_GB(need + captures)} of the {mem_GB(allowed)} "
         f"the memory ratio allows: {'fused' if fits else 'the expert cache'}"
     )
     return fits
@@ -668,6 +691,8 @@ class Engine:
             self.model.place_encoder_weights(config.mm.encoder_weights)
         # draft weights load before any pool is sized, so every free-memory read below counts them
         self.spec: SpecRuntime | None = _spec_runner()(config, self) if config.speculative_algorithm is not None else None
+        if _preset_capture_bytes(config) and not (self.spec is not None and self.spec.can_prefill_as_verify):
+            _drop_preset_captures(config, f"{config.speculative_algorithm} drafts cannot run a prefill chunk beside their verify step")
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -723,7 +748,7 @@ class Engine:
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
-        available_memory -= state_pool_bytes(config) + self._preset_prefill_reserve(config)
+        available_memory -= state_pool_bytes(config) + self._preset_prefill_reserve(config) + _preset_capture_bytes(config)
         if self.spec is not None:
             # the pool solves pages from its own cost; hand it the share its pages get next to the draft's
             spec_fixed, draft_page = self._spec_budget(config)
@@ -971,7 +996,7 @@ class Engine:
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         spec_fixed, draft_page = self._spec_budget(config)
-        fixed_cache_size += spec_fixed + self._preset_prefill_reserve(config)
+        fixed_cache_size += spec_fixed + self._preset_prefill_reserve(config) + _preset_capture_bytes(config)
         cache_per_page += draft_page
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
@@ -1050,6 +1075,23 @@ class Engine:
             return 0
         return 2 * config.model_config.num_experts
 
+    def _settle_preset_captures(self, config: EngineConfig, banks, method, max_slots, staging: int) -> None:
+        """A preset keeps its prefill graphs under an automatic expert cache only where the plan, with their memory
+        left free, still has the KV reserve the preset asks for and every expert in a slot outside the staging
+        buffers: the graphs read the slots, and are not captured on a cache that streams."""
+        from freetoken.engine.cache_budget import _plan_or_short, plan_resident_staging
+
+        if not _preset_capture_bytes(config):
+            return
+        terms = self._auto_cache_terms(config, banks, method, max_slots)
+        if "kv_reserve_tokens" in config.preset_fields:
+            terms["kv_reserve_tokens"] = min(terms["kv_reserve_tokens"], _preset_kv_target(config))
+        plan, _ = _plan_or_short(terms)
+        total = terms["total_experts"]
+        if plan is None or not staging or plan_resident_staging(plan, terms, staging, self._moe_slot_limit)[0] < total + staging:
+            held = f"{plan[0]} of {total} experts" if plan is not None else "no plan"
+            _drop_preset_captures(config, f"with {mem_GB(_preset_capture_bytes(config))} left free for them the expert cache holds {held}, and they need every expert resident")
+
     def _settle_preset_kv_reserve(self, config: EngineConfig, banks, method, max_slots) -> None:
         """A preset's KV reserve is at most the model's context, and stays only while the plan keeps the expert slots
         of a server without the preset: where it would not, the reserve is the largest that does, the default reserve
@@ -1111,10 +1153,13 @@ class Engine:
             steps.append((label, ("speculative_algorithm", "spec_slot_states")))
         if "kv_reserve_tokens" in filled:
             steps.append((f"--kv-reserve-tokens {config.kv_reserve_tokens}", ("kv_reserve_tokens",)))
-        if reserve := self._preset_prefill_reserve(config):
-            # the reserve is on wherever the staged config says the ratio is the preset's: right after the ratio's own step
-            at = next(i for i, (_, names) in enumerate(steps) if names == ("memory_ratio",)) + 1
-            steps.insert(at, (f"{mem_GB(reserve)} left free for a prefill chunk of {config.max_forward_len} tokens", ("preset_fields",)))
+        reserve, captures = self._preset_prefill_reserve(config), _preset_capture_bytes(config)
+        if reserve or captures:
+            # both are on wherever the staged config's preset_fields say so: right after the ratio's own step, where there is one
+            at = next((i + 1 for i, (_, names) in enumerate(steps) if names == ("memory_ratio",)), len(steps))
+            left = [f"{mem_GB(reserve)} left free for a prefill chunk of {config.max_forward_len} tokens"] if reserve else []
+            left += [f"{mem_GB(captures)} left free for the prefill graphs"] if captures else []
+            steps.insert(at, (" and ".join(left), ("preset_fields",)))
         staged = copy.copy(config)
         for _, names in steps:
             for name in names:
@@ -1152,6 +1197,8 @@ class Engine:
         parts.append(f"{num_tokens} KV tokens")
         if reserve := self._preset_prefill_reserve(config):
             parts.append(f"{mem_GB(reserve)} left free for a prefill chunk of {config.max_forward_len} tokens")
+        if captures := _preset_capture_bytes(config):
+            parts.append(f"{mem_GB(captures)} left free for the prefill graphs of chunks up to {config.prefill_graph_tokens} tokens")
         parts.append(f"{config.max_running_req} running request" + ("s" if config.max_running_req != 1 else ""))
         if config.speculative_algorithm is not None:
             parts.append(f"{config.speculative_algorithm} speculative decoding with {config.speculative_num_steps} draft tokens")
@@ -1264,11 +1311,13 @@ class Engine:
 
             # auto took hybrid on a row measured at one cache size: more slots than that were never compared with offload
             size_cap = decode_profile.slot_cap(config.moe_decode_row, size_cap)
+        spare = self._preset_staging_slots(config, decode_target, pools)
         if config.moe_cache_auto:
+            self._settle_preset_captures(config, banks, method, size_cap, spare)
             if "kv_reserve_tokens" in config.preset_fields:
                 self._settle_preset_kv_reserve(config, banks, method, size_cap)
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
-            if spare := self._preset_staging_slots(config, decode_target, pools):
+            if spare:
                 from freetoken.engine.cache_budget import plan_resident_staging
 
                 terms = self._auto_cache_terms(config, banks, method, size_cap)
@@ -1387,6 +1436,9 @@ class Engine:
             self._resolve_hybrid_fetch(config, cache)
         if locked_fetch:
             attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
+        if _preset_capture_bytes(config) and not (cache.keeps_streamed_experts and cache.holds_every_expert):
+            # a cache the command line sized, or one whose prefills cannot keep what they stream
+            _drop_preset_captures(config, f"the expert cache of {config.moe_cache_size} slots cannot hold every expert outside its prefill staging buffers, which they need")
         self.moe_offload_cache = cache
         return cache
 
@@ -2833,6 +2885,8 @@ def _adjust_config(config: EngineConfig):
     if getattr(config, "speculative_algorithm", None) is not None:
         adjust_spec = _adjust_preset_spec_config if "speculative_algorithm" in preset_fields else _adjust_spec_config
         adjust_spec(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
+    if _preset_capture_bytes(config) and getattr(config, "speculative_algorithm", None) is None:
+        _drop_preset_captures(config, "they are captured beside the verify step of speculative decoding, which is off")
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts
