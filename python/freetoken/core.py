@@ -116,6 +116,10 @@ class Req:
     # reaches it (snapshot_toolcall_anchor) and donated at finish. SWA: caps the proactive
     # out-of-window eviction so the window ending here stays resumable.
     toolcall_anchor_len: int | None = None
+    # The prompt length up to which a next turn of the conversation still shares this prompt (its end less the
+    # generation prompt's tail, see utils.hf.load_turn_anchor_tails); None for a prompt that does not end with one.
+    # A prefill that can stop there leaves its snapshot there.
+    turn_anchor_len: int | None = None
     # Abort arrived while this request's forward was in flight (overlap scheduling). The abort
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).

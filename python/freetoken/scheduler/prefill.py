@@ -236,6 +236,7 @@ class PrefillAdder:
         # final chunk commits it unless its own forward tracks a deeper boundary
         req.mamba_last_track_seqlen = last_track_seqlen
         req.mamba_restore_src = restore_src
+        req.turn_anchor_len = pending_req.turn_anchor_len
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
 
@@ -290,6 +291,15 @@ class PrefillManager:
     keep_images_whole: bool = False
     token_headroom: int = 0
     pending_list: List[PendingReq] = field(default_factory=list)
+    turn_anchor_tails: tuple = ()  # utils.hf.load_turn_anchor_tails, set by the scheduler
+
+    def _turn_anchor(self, input_ids: torch.Tensor) -> int | None:
+        for tail in self.turn_anchor_tails:
+            n = len(tail)
+            if len(input_ids) > n + 1 and input_ids[-n:].tolist() == list(tail):
+                # a node's last key holds the token after it under radix_lookahead: stop one token earlier
+                return len(input_ids) - n - int(self.cache_manager.radix_lookahead)
+        return None
 
     def add_one_req(self, req: UserMsg) -> None:
         stats = ReqStats(enqueued_at=time.perf_counter())
@@ -301,6 +311,7 @@ class PrefillManager:
                 mm_items=req.mm_items,
                 mrope_positions_full=req.mrope_positions,
                 mrope_delta=req.mrope_delta,
+                turn_anchor_len=self._turn_anchor(req.input_ids),
                 stats=stats,
             )
         )

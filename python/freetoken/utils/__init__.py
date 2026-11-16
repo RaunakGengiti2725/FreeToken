@@ -15,6 +15,7 @@ from .hf import (
     load_image_processor,
     load_tokenizer,
     load_toolcall_anchor_id,
+    load_turn_anchor_tails,
 )
 from .logger import init_logger
 from .misc import UNSET, Unset, align_ceil, align_down, call_if_main, div_ceil, div_even, mem_GB
@@ -36,6 +37,7 @@ __all__ = [
     "load_generation_sampling",
     "load_tokenizer",
     "load_toolcall_anchor_id",
+    "load_turn_anchor_tails",
     "init_logger",
     "is_arch_supported",
     "is_rocm",
