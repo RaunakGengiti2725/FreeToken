@@ -219,14 +219,17 @@ def model_fingerprint(model_path: str) -> str:
     return f"{os.path.basename(path.rstrip('/'))}@{h.hexdigest()[:8]}"
 
 
-def cache_spec(*, size: int = 0, mem: int | None = None, auto: bool = False, memory_ratio: float = 0.9) -> str:
-    """How the expert cache was asked for: ``auto:<memory ratio>``, ``mem:<bytes>`` or ``size:<slots>``.
+def cache_spec(*, size: int = 0, mem: int | None = None, auto: bool = False, memory_ratio: float = 0.9, rate: float | None = None) -> str:
+    """How the expert cache was asked for: ``auto:<memory ratio>``, ``mem:<bytes>``, ``size:<slots>``, or
+    ``rate:<--moe-cache-rate>`` where the rate is not a slot count yet (a key made from the command line alone).
 
     auto and mem come first: the engine writes their resolved slot count into moe_cache_size only after the model is loaded."""
     if auto:
         return f"auto:{memory_ratio:g}"
     if mem is not None:
         return f"mem:{int(mem)}"
+    if rate and size <= 0:
+        return f"rate:{rate:g}"
     return f"size:{int(size)}"
 
 

@@ -815,6 +815,13 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     assert calibrate.measured_choice(args, argv) == hybrid_3 and len(started) == 6
     # a strategy from the command line is not a candidate: the three depths of that strategy are another setup
     assert calibrate.measured_choice(*parsed("--moe-strategy", "offload")) == {"speculative_num_steps": 3} and len(started) == 9
+    # a cache rate or size from the command line is its own setup, not the automatic size: each is timed for itself
+    for flags in (("--moe-cache-rate", "0.2"), ("--moe-cache-rate", "0.05"), ("--moe-cache-size", "512")):
+        del started[9:]
+        sized = {"moe_strategy": "hybrid", "speculative_num_steps": 3}
+        assert calibrate.measured_choice(*parsed(*flags)) == sized and len(started) == 15, flags
+        assert calibrate.measured_choice(*parsed(*flags)) == sized and len(started) == 15
+    del started[9:]
     # another release, or more free memory than the cache was timed with: timed again
     monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (*_ROW_GPU, _ROW_FREE + (8 << 30)))
     assert calibrate.measured_choice(args, argv) == hybrid_3 and len(started) == 15

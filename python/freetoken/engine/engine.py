@@ -1952,8 +1952,9 @@ _DECODE_KEY_OWN = frozenset((
 
 
 def _moe_cache_is_auto(config: EngineConfig) -> bool:
-    # no sizing flag becomes --moe-cache-auto a few lines after auto resolves, so it counts as auto before that too
-    return config.moe_cache_auto or (config.moe_cache_size <= 0 and config.moe_cache_mem is None)
+    # no sizing flag becomes --moe-cache-auto a few lines after auto resolves, so it counts as auto before that too.
+    # A --moe-cache-rate is a size, also before _adjust_config has made it one.
+    return config.moe_cache_auto or (config.moe_cache_size <= 0 and config.moe_cache_mem is None and not config.moe_cache_rate)
 
 
 def _decode_decision_key(config: EngineConfig) -> str:
@@ -1963,7 +1964,10 @@ def _decode_decision_key(config: EngineConfig) -> str:
     spec = f"{config.speculative_algorithm}:{config.speculative_num_steps}" if config.speculative_algorithm is not None else "off"
     return decode_profile.decision_key(
         model=decode_profile.model_fingerprint(config.model_path),
-        cache=decode_profile.cache_spec(size=config.moe_cache_size, mem=config.moe_cache_mem, auto=_moe_cache_is_auto(config), memory_ratio=config.memory_ratio),
+        cache=decode_profile.cache_spec(
+            size=config.moe_cache_size, mem=config.moe_cache_mem, auto=_moe_cache_is_auto(config), memory_ratio=config.memory_ratio,
+            rate=config.moe_cache_rate,
+        ),
         cpu=decode_profile.cpu_spec(config.moe_cpu_threads),
         spec=spec,
         tp_size=config.tp_info.size,
