@@ -7,7 +7,9 @@ import torch
 
 import os
 
-from freetoken.engine.cache_budget import budget_advice, expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
+from freetoken.engine.cache_budget import (
+    budget_advice, expert_bytes_per_slot, plan_cache_budget, plan_changes, plan_kv_target, resolve_moe_cache_auto,
+)
 from freetoken.engine.engine import _pin_budget_bytes
 
 
@@ -105,6 +107,38 @@ def test_budget_advice_names_flags_the_resolver_accepts():
     over = {**terms, "weights_bytes": 1200}
     advice = budget_advice([("", over), ("--memory-ratio 0.95", {**over, "memory_ratio": 0.95})], min_reserve_tokens=200)
     assert advice.startswith("no fit") and "--kv-reserve-tokens 200 " in advice and "1146 B" in advice
+
+
+def test_kv_target_is_planned_only_where_the_slot_floor_fits_beside_it():
+    # 4-token pages of 10 B, slots of 100 B with a floor of 4; the reserve to fall back to is 64 tokens, the target 256
+    def terms(budget, reserve=64):
+        return dict(
+            baseline_free=budget, weights_bytes=0, memory_ratio=1.0, cache_per_page=10, fixed_cache_size=0,
+            per_expert_bytes=100, num_experts=4, total_experts=40, prefill_overlap=False,
+            kv_reserve_tokens=reserve, page_size=4,
+        )
+
+    # room for both: the target's plan, 5 slots below the plan of the default reserve
+    plan, kept, most = plan_kv_target(terms(2000), 256)
+    assert plan == resolve_moe_cache_auto(**terms(2000, 256)) == (13, 70, False)
+    assert kept == resolve_moe_cache_auto(**terms(2000)) == (18, 20, False) and most == (256, 13)
+    # 400 B of slot floor + 640 B of target is 140 B over 900 B: no plan, and 200 tokens is the largest reserve the resolver takes
+    plan, kept, most = plan_kv_target(terms(900), 256)
+    assert plan is None and kept == resolve_moe_cache_auto(**terms(900)) == (7, 20, False)
+    assert most == (200, resolve_moe_cache_auto(**terms(900, 200))[0]) == (200, 4)
+    with pytest.raises(ValueError, match="budget too small"):
+        resolve_moe_cache_auto(**terms(900, 204))
+    # not even the default reserve fits
+    assert plan_kv_target(terms(500), 256) == (None, None, (0, 0))
+
+    # what each stage did to the plan, from the resolver's own plans: none at 500 B, (7, 20) at 900 B, (4, 50) with the reserve at 200
+    stages = [("", terms(500)), ("more memory", terms(900)), ("--kv-reserve-tokens 200", terms(900, 200)), ("again", terms(900, 200))]
+    assert plan_changes(stages) == [
+        "more memory: the plan fits: 7 expert slots, 80 KV tokens",
+        "--kv-reserve-tokens 200: -3 expert slots, +120 KV tokens",
+        "again: no change",
+    ]
+    assert plan_changes([("", terms(900)), ("less memory", terms(500))])[0].startswith("less memory: the minimum plan is ")
 
 
 def test_prefill_overlap_false_is_honored():
@@ -382,6 +416,26 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     config.max_running_req = 1
     size, pages, _ = engine._resolve_auto_moe_cache_size(config, StubBanks())
     assert f"fits with --max-running-requests 1: {size} expert slots, {pages * 16} KV tokens" in str(refused.value)
+
+    # --preset's KV reserve, with 8 slots (6144 B) and 98304 B per 16-token page: kept where the slot floor fits beside it;
+    # where not, the default reserve is back and the field is no longer the preset's
+    from freetoken.engine.config import EngineConfig
+
+    default = EngineConfig.kv_reserve_tokens
+    for free, kept in ((200 << 20, 16384), (70 << 20, default)):
+        engine._baseline_free, engine._weights_bytes = free, 0
+        config.preset, config.preset_fields, config.kv_reserve_tokens = "single", ("max_running_req", "kv_reserve_tokens"), 16384
+        engine._settle_preset_kv_reserve(config, StubBanks(), None, None)
+        assert config.kv_reserve_tokens == kept
+        assert ("kv_reserve_tokens" in config.preset_fields) == (kept != default)
+        assert engine._resolve_auto_moe_cache_size(config, StubBanks())[1] * 16 >= kept
+    # the planner's account starts from the plan without the preset's fields and ends at the plan that runs
+    config.preset_fields, config.kv_reserve_tokens = ("max_running_req", "kv_reserve_tokens"), 16384
+    stages = engine._preset_stages(config, StubBanks(), None, None)
+    assert [label for label, _ in stages] == ["", "--max-running-requests 1", "--kv-reserve-tokens 16384"]
+    assert stages[-1][1] == engine._auto_cache_terms(config, StubBanks())
+    assert stages[0][1]["kv_reserve_tokens"] == stages[1][1]["kv_reserve_tokens"] == default
+    assert stages[0][1]["fixed_cache_size"] > stages[1][1]["fixed_cache_size"]  # the linear states of 4 requests, then of 1
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +739,30 @@ def test_explicit_strategy_never_reads_the_decode_profile(decode_rows, monkeypat
     for asked in ("hybrid", "offload"):
         config = _resolved(decode_rows, moe_strategy=asked, moe_cache_size=40)
         assert config.moe_strategy == asked and config.moe_decode_key is None  # nor is the key made for it
+
+
+def test_preset_speculative_decoding_is_dropped_where_an_explicit_start_is_refused(decode_rows, monkeypatch):
+    def resolved(preset: bool, model_path=str(decode_rows.model)):
+        fields = ("speculative_algorithm", "speculative_num_steps") if preset else ()
+        config = _offload_engine_config(
+            model_path=model_path, speculative_algorithm="mtp", speculative_num_steps=3, preset="single" if preset else None, preset_fields=fields,
+        )
+        # a checkpoint of a family that registers no MTP draft
+        object.__setattr__(config, "hf_config", SimpleNamespace(architectures=["FakeForCausalLM"]))
+        object.__setattr__(config, "model_spec", SimpleNamespace(spec_drafts=()))
+        decode_rows.engine._adjust_config(config)
+        return config
+
+    with pytest.raises(ValueError, match="MTP is not supported"):
+        resolved(preset=False)
+    config = resolved(preset=True)
+    assert (config.speculative_algorithm, config.speculative_num_steps, config.preset_fields) == (None, 0, ())
+    assert "|spec=off|" in config.moe_decode_key
+    # where the checks pass it stays, and a checkpoint that is not on disk cannot be checked
+    monkeypatch.setattr(decode_rows.engine, "_adjust_spec_config", lambda config, override, windowed_kv: None)
+    config = resolved(preset=True)
+    assert config.speculative_algorithm == "mtp" and "speculative_algorithm" in config.preset_fields
+    assert resolved(preset=True, model_path=str(decode_rows.tmp / "not-downloaded")).speculative_algorithm is None
 
 
 def test_auto_does_not_take_a_row_whose_hybrid_cache_is_below_the_models_floor(decode_rows):

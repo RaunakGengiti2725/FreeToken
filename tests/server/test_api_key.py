@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import stat
@@ -14,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from freetoken import launch
 from freetoken.server.api_server import install_api_key, install_cors
-from freetoken.server.args import parse_args
+from freetoken.server.args import ServerArgs, parse_args
 
 KEY = "sk-test"
 ORIGIN = "http://localhost:1420"
@@ -94,6 +95,55 @@ def test_flag_wins_over_env_and_empty_values_do_not_enable_auth(monkeypatch):
 def test_key_stays_out_of_the_logged_config(monkeypatch):
     monkeypatch.delenv("FREETOKEN_API_KEY", raising=False)
     assert KEY not in str(_parse("--api-key", KEY))
+
+
+# ---- --preset: fills only what the command line left alone (same parse_args, same stand-in checkpoint) ----
+
+_PRESET_SINGLE = {
+    "max_running_req": 1, "embed_weights": "host", "memory_ratio": 0.95, "moe_prefill_hit_d2d": True,
+    "speculative_algorithm": "mtp", "speculative_num_steps": 3, "kv_reserve_tokens": 32768 + 4096,
+}
+
+
+def test_preset_single_changes_its_fields_and_nothing_without_the_flag():
+    plain, preset = _parse(), _parse("--preset", "single")
+    changed = {f.name: getattr(preset, f.name) for f in dataclasses.fields(plain) if getattr(plain, f.name) != getattr(preset, f.name)}
+    assert changed == {**_PRESET_SINGLE, "preset": "single", "preset_fields": tuple(_PRESET_SINGLE)}
+    # without the flag: the class defaults, and a startup dump of the arguments that does not name it
+    assert all(getattr(plain, name) == getattr(ServerArgs, name) for name in _PRESET_SINGLE)
+    assert "preset" not in repr(plain)
+    with pytest.raises(SystemExit):
+        _parse("--preset", "no-such-preset")
+
+
+@pytest.mark.parametrize(
+    "flag, field, value",
+    [
+        (("--max-running-requests", "4"), "max_running_req", 4),  # a default typed out is still the user's
+        (("--embed-weights", "gpu"), "embed_weights", "gpu"),
+        (("--memory-ratio", "0.9"), "memory_ratio", 0.9),
+        (("--moe-prefill-hit-d2d",), "moe_prefill_hit_d2d", True),
+        (("--speculative-algorithm", "off"), "speculative_algorithm", None),
+        (("--speculative-algorithm", "dflash"), "speculative_algorithm", "dflash"),
+        (("--speculative-num-steps", "5"), "speculative_num_steps", 5),
+        (("--kv-reserve-tokens", "8192"), "kv_reserve_tokens", 8192),
+    ],
+)
+def test_explicit_flag_wins_over_the_preset(flag, field, value):
+    args = _parse("--preset", "single", *flag)
+    assert getattr(args, field) == value and field not in args.preset_fields
+    # a method the user chose keeps its own default k; every other field is still the preset's
+    theirs = {field, "speculative_num_steps"} if field == "speculative_algorithm" else {field}
+    assert set(args.preset_fields) == set(_PRESET_SINGLE) - theirs
+    assert all(getattr(args, name) == _PRESET_SINGLE[name] for name in args.preset_fields)
+    if field == "speculative_algorithm":
+        assert args.speculative_num_steps == 0
+
+
+def test_preset_kv_reserve_follows_the_output_limit_and_leaves_a_sized_kv_pool_alone():
+    assert _parse("--preset", "single", "--max-output-tokens", "8192").kv_reserve_tokens == 8192 + 4096
+    sized = _parse("--preset", "single", "--num-tokens", "65536")
+    assert sized.kv_reserve_tokens == ServerArgs.kv_reserve_tokens and "kv_reserve_tokens" not in sized.preset_fields
 
 
 @pytest.mark.parametrize("agent", sorted(launch.PREPARERS))

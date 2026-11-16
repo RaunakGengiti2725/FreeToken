@@ -158,6 +158,48 @@ def _plan_or_short(terms: dict) -> tuple[tuple[int, int, bool] | None, int]:
         return None, exc.short
 
 
+def plan_kv_target(terms: dict, target_tokens: int) -> tuple[tuple[int, int, bool] | None, tuple[int, int, bool] | None, tuple[int, int]]:
+    """resolve_moe_cache_auto's ``terms`` with the KV reserve raised to ``target_tokens``: (that plan, the plan of ``terms``,
+    (the largest reserve that fits, its expert slots)).
+
+    A plan is None where its minimum (the slot floor and the reserve) is over the budget. The largest reserve is the
+    target where that fits, and (0, 0) where not even the reserve of ``terms`` does.
+    """
+    kept, _ = _plan_or_short(terms)
+    target_tokens = max(target_tokens, terms["kv_reserve_tokens"])
+    plan, short = _plan_or_short({**terms, "kv_reserve_tokens": target_tokens})
+    if plan is not None:
+        return plan, kept, (target_tokens, plan[0])
+    if kept is None:
+        return None, None, (0, 0)
+    page = terms["page_size"]
+    # ``short`` bytes over at the target: the largest reserve that fits holds that many bytes of pages less
+    most = (div_ceil(target_tokens, page) - div_ceil(short, terms["cache_per_page"])) * page
+    at_most, _ = _plan_or_short({**terms, "kv_reserve_tokens": most})
+    return None, kept, (most, at_most[0])
+
+
+def plan_changes(stages: list[tuple[str, dict]]) -> list[str]:
+    """What each stage after the first did to the --moe-cache-auto plan, e.g. ``--memory-ratio 0.95: +140 expert slots``.
+
+    ``stages`` are (label, resolve_moe_cache_auto arguments) pairs, each adding to the one before, as in budget_advice.
+    """
+    out = []
+    before, _ = _plan_or_short(stages[0][1])
+    for label, terms in stages[1:]:
+        after, short = _plan_or_short(terms)
+        if after is None:
+            text = f"the minimum plan is {mem_GB(short)} short"
+        elif before is None:
+            text = f"the plan fits: {after[0]} expert slots, {after[1] * terms['page_size']} KV tokens"
+        else:
+            slots, tokens = after[0] - before[0], (after[1] - before[1]) * terms["page_size"]
+            text = ", ".join(([f"{slots:+d} expert slots"] if slots else []) + ([f"{tokens:+d} KV tokens"] if tokens else [])) or "no change"
+        out.append(f"{label}: {text}")
+        before = after
+    return out
+
+
 def budget_advice(stages: list[tuple[str, dict]], min_reserve_tokens: int) -> str:
     """The command-line flags that make a refused --moe-cache-auto plan fit, or how far off the last try is.
 

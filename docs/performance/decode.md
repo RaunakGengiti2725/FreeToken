@@ -157,6 +157,10 @@ gain scale with free VRAM; the other rows do not:
 | `--kv-reserve-tokens 2048` | +70 | KV holds about 2.1k tokens in all, which is also the longest prompt + output (longer prompts are refused with `prompt is too long`) |
 | `--speculative-algorithm mtp` | -983 | the draft layer and its caches take slots (MTP still ran about 1.4-1.5x faster here; see [Speculative decoding](#speculative-decoding)) |
 
+`--preset single` ([cli.md](../cli.md#presets)) takes the first three rows and
+MTP together, and spends part of the gain on a KV reserve of 36864 tokens; its
+startup log prints what each did to the plan on your card.
+
 - On models with linear attention (GDN) or sliding-window (SWA) layers, those
   layers keep no KV for the whole context: a GDN layer keeps one state per
   cached prefix point, a SWA layer keeps per-token KV only for the tokens inside
