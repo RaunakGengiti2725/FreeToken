@@ -237,7 +237,14 @@ class ChunkCaptureLinearBackend(LinearAttnBackend):
     prepare_metadata = _metadata
 
     def prepare_for_capture(self, batch: "Batch") -> None:
+        from freetoken.kernel.fla.index import prepare_chunk_indices, prepare_chunk_offsets, prepare_lens
+
         self._metadata(batch)
+        # the chunk kernels take their index tensors from an identity cache of a few entries, which later prefills
+        # evict; the capture reads the ones held here (16, 32 and 64 are the chunk sizes the kernels ask for)
+        self.chunk_index = [prepare_lens(self.cu_seqlens)]
+        for size in (16, 32, 64):
+            self.chunk_index += [prepare_chunk_indices(self.cu_seqlens, size), prepare_chunk_offsets(self.cu_seqlens, size)]
         # the LM head takes the chunk's last row from the attention metadata's query indptr inside the captured
         # forward; the per-batch tensor would be freed by the first replay, so the capture reads one that stays
         if hasattr(batch.attn_metadata, "cu_seqlens_q_gpu"):
