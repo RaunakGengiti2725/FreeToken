@@ -1,6 +1,7 @@
 """A k+1-row verify step commits exactly what k+1 decode steps would: with drafts taken from a plain greedy run and wrong at a different place each step (so every accept count occurs), speculative decoding must reproduce that run token for token.
 
 Tiny hybrid models with dummy weights, served end to end through the scheduler: qwen3_5 (GatedDeltaNet + attention) and qwen4_exp (GatedDeltaNet + QSA, PLE, hyper-connections). The drafts come from a stub proposer, so this pins the target side alone; a second run drafts with a DFlash 2 draft of random weights, whose wrong drafts must leave the target's output alone through its ring, window and graphs; a third drafts with the target's own MTP layer of random weights, which needs the tiny target materialized as a real checkpoint since MTP rejects dummy weights.
+The MTP run also pins its fused draft replay: a step whose batch is the last step's takes the drafts the extend graph of the verify before left, and they must be the ones the relay and the chain graph give for that step.
 A gemma4 target runs the same contract on a windowed KV pool: its oracle case asserts the out-of-window frees and the verify rollback fired, and its mtp case drafts from a tiny gemma4-assistant GGUF, which keeps no KV and reads the target's through the read-only view.
 A verify row and a decode step run different GEMM and attention shapes, so their logits can differ by an ulp: the runs may part at a near tie, and the test checks they part only there. fp16 keeps such ties rare (bf16 has 3 fewer mantissa bits), and fan-in scaled dummy weights keep the activations O(1), so ulp noise does not grow through the layers.
 """
@@ -170,6 +171,30 @@ def recording_propose(self, reqs, rows, pending):
 
 SharedKVMTPProposer.propose = recording_propose
 
+# the fused MTP replay: each step that takes its drafts is replayed the two-graph way and compared
+fused = {"taken": 0, "replayed": 0, "differ": 0, "entry_differs": 0, "unexpected": 0, "last": None}
+
+
+def check_fused_drafts(chain):
+    take = chain.take
+
+    def checking_take(reqs, cs):
+        drafts = take(reqs, cs)
+        uids = [r.uid for r in reqs]
+        # taken exactly when the batch is the last step's
+        fused["unexpected"] += (drafts is not None) != (uids == fused["last"])
+        fused["last"] = uids
+        if drafts is None:
+            fused["replayed"] += 1
+            return None
+        fused["taken"] += 1
+        # the entries the fused graph derived on the device are where the requests stand after the commit
+        fused["entry_differs"] += chain.inputs[1, : len(reqs)].tolist() != cs
+        fused["differ"] += not torch.equal(drafts, chain.replay(reqs, cs))
+        return drafts
+
+    chain.take = checking_take
+
 
 class RecordingSink:
     # copies the tapped layers' outputs into persistent buffers, so a captured verify graph writes them too
@@ -332,6 +357,8 @@ E.create_model = create_model_with_ple_rows
 if reference != "-":
     PROPOSERS.register("oracle")("__main__:OracleProposer")
 llm = LLM(model_path=model, dtype=torch.float16, use_dummy_weight=use_dummy_weight, max_running_req=4, **kwargs)
+if (chain := getattr(getattr(llm.engine.spec, "proposer", None), "chain_graphs", None)) is not None:
+    check_fused_drafts(chain)
 prompts = [llm.tokenizer.encode(p) for p in prompt_texts]
 penalties = (0.0, 0.6, 0.0)
 params = [SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True, presence_penalty=p, frequency_penalty=p)
@@ -344,7 +371,7 @@ json.dump({"outputs": [r["token_ids"] for r in res], "top3": [[u, i, *t] for (u,
            "taps": taps, "num_slots": None if pool is None else pool.num_slots, "window": window,
            "swa_window": cache.sliding_window_size, "swa": cache.swa_paged, "rows": llm.config.decode_rows_per_req,
            "prompt_lens": [len(p) for p in prompts], "penalties": list(penalties),
-           "evict": evict, "proposals": proposals,
+           "evict": evict, "proposals": proposals, "fused": fused,
            "draft": {"head_calls": draft["head_calls"], "reads": sorted(draft["reads"].items())}}, open(out, "w"))
 """
 
@@ -643,6 +670,12 @@ def test_verify_steps_reproduce_greedy_decode(tmp_path, plain_runs, monkeypatch,
     elif algorithm == "mtp":
         # MTPProposer installs its own prefill and verify sinks, so the recording sink must have seen no target forward
         assert spec["taps"]["prefill"] == 0 and spec["taps"]["verify"] == 0
+        if family == "qwen3_5":
+            # the requests end at different lengths, so both draft paths ran: one fused replay on a step whose batch
+            # is the last step's, the relay and the chain graph after a batch change, and they never disagreed
+            fused = spec["fused"]
+            assert fused["taken"] > 0 and fused["replayed"] > 0, fused
+            assert not (fused["differ"] or fused["entry_differs"] or fused["unexpected"]), fused
     elif family == "gemma4":
         # the window machinery ran: prompt longer than the window, slots freed out of window on verify steps
         # and the rejected verify rows' slots returned

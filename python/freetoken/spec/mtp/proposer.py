@@ -16,7 +16,7 @@ from freetoken.kvcache.format import NONE
 from freetoken.models.blocks import embed_input_ids
 from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 from freetoken.spec.mtp.relay import HiddenRelay
-from freetoken.utils import init_logger
+from freetoken.utils import div_ceil, init_logger
 
 if TYPE_CHECKING:
     from freetoken.core import Req
@@ -177,7 +177,17 @@ class MTPProposer(Proposer):
         fixed = rows * (config.speculative_num_steps + 3) * relay_bytes
         groups = draft_cls.draft_config(with_resident_moe(config.model_config)).kv_cache_group_specs()
         fmt = getattr(config, "kv_format", NONE)
-        return fixed, sum(spec_kv_bytes_per_token(group, config, fmt) for group in groups)
+        per_token = sum(spec_kv_bytes_per_token(group, config, fmt) for group in groups)
+        return fixed + cls._spill_pages(config) * config.page_size * per_token, per_token
+
+    @classmethod
+    def _spill_pages(cls, config) -> int:
+        """Draft KV pages past the dummy page for the chain steps of a fused replay, a slot per step and table row; 0 where it cannot run."""
+        k = config.speculative_num_steps
+        # QSA reads whole pages through a block table, so a single key cannot be pointed at a spill slot
+        if k < 2 or (cls._draft_class(config).attention_backend or "triton") != "triton":
+            return 0
+        return div_ceil((config.max_running_req + 1) * (k - 1), config.page_size)
 
     def __init__(self, config, target_model) -> None:
         super().__init__(config, target_model)
@@ -212,7 +222,8 @@ class MTPProposer(Proposer):
         # a rebuild that keeps the target KV pool keeps this one, which the prefix cache still indexes
         if self.kv is None:
             self.kv = create_kvcache_pool(
-                model_config=cfg, num_pages=ctx.num_pages + 1, page_size=self.config.page_size, dtype=self.dtype,
+                model_config=cfg, num_pages=ctx.num_pages + 1 + self._spill_pages(self.config),
+                page_size=self.config.page_size, dtype=self.dtype,
                 device=ctx.device, num_req_slots=rows, num_speculative_tokens=self.k,
                 kv_format=getattr(self.config, "kv_format", NONE),
             )
@@ -242,6 +253,8 @@ class MTPProposer(Proposer):
 
     def release(self, req: Req) -> None:
         self._prefill_state.pop(req.table_idx, None)
+        if self.chain_graphs is not None:
+            self.chain_graphs.forget(req)
 
     # ------------------------------------------------------------------ draft forwards
 
@@ -312,11 +325,18 @@ class MTPProposer(Proposer):
         )
         if self.k > 1 and ChainGraphs.supports(self.chain_backend):
             self.chain_graphs = ChainGraphs(self, bs_list, self.extend_graphs.graph_pool)
+            if self._spill_pages(self.config):
+                self.chain_graphs.fuse(self.extend_graphs, (ctx.num_pages + 1) * self.config.page_size)
 
     def propose(self, reqs: List[Req], rows: torch.Tensor, pending: torch.Tensor) -> SpecProposal:
         cs = [r.cached_len for r in reqs]
-        if self.chain_graphs is not None and (drafts := self.chain_graphs.replay(reqs, cs)) is not None:
-            return SpecProposal(drafts)
+        chain = self.chain_graphs
+        if chain is not None:
+            drafts = chain.take(reqs, cs)
+            if drafts is None:
+                drafts = chain.replay(reqs, cs)
+            if drafts is not None:
+                return SpecProposal(drafts)
         token = self.relay.d1[rows]
         hidden = self.relay.hidden[rows]
         drafts = [token]
@@ -359,9 +379,13 @@ class MTPProposer(Proposer):
         draft.active_table_idx = batch.active_table_idx
         self.picked_rows[:bs] = torch.arange(bs, device=self.device) * k1 + emitted
         self.extend_backend.prepare_metadata(draft)
-        graphs = self.extend_graphs
+        graphs, chain = self.extend_graphs, self.chain_graphs
         if graphs is not None and graphs.can_use_cuda_graph(draft) and padded in graphs.graph_map:
-            picked, d1 = graphs.replay(draft)
+            # with the batch of the last proposal staged, the same replay drafts the next step too
+            fused = chain is not None and chain.can_fuse(batch.reqs, padded)
+            picked, d1 = graphs.replay(draft, chain.fused if fused else None)
+            if fused:
+                chain.expect(batch.reqs)
         else:
             with get_global_ctx().forward_batch(draft, kv_cache=self.kv, attn_backend=self.extend_backend, hide_target_state=True):
                 picked, d1 = self._extend_forward()
