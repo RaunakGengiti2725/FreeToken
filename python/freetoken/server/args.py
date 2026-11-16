@@ -127,6 +127,8 @@ _PRESETS: dict[str, dict] = {
         "embed_weights": "host",
         "memory_ratio": 0.95,
         "moe_prefill_hit_d2d": True,
+        # only where the expert cache cannot hold every expert (engine._drop_preset_demand)
+        "moe_prefill_demand_tokens": 96,
         "speculative_algorithm": "mtp",
         "speculative_num_steps": 3,
         "kv_reserve_tokens": None,  # the default max output tokens + PRESET_PROMPT_TOKENS (_apply_preset)

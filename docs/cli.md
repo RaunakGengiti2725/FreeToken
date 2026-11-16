@@ -124,17 +124,19 @@ Speculative decoding needs `--tp 1` and runs without overlap scheduling; a targe
 ### Presets
 
 `--preset single` is for one user at a time on a GPU that cannot hold every expert. It sets
-`--max-running-requests 1`, `--embed-weights host`, `--memory-ratio 0.95` and `--moe-prefill-hit-d2d`,
-turns on `--speculative-algorithm mtp` with 3 draft tokens, and raises `--kv-reserve-tokens` to the
+`--max-running-requests 1`, `--embed-weights host`, `--memory-ratio 0.95`, `--moe-prefill-hit-d2d` and
+`--moe-prefill-demand-tokens 96`, turns on `--speculative-algorithm mtp` with 3 draft tokens, and raises `--kv-reserve-tokens` to the
 default max output tokens plus a 4096-token prompt (36864), so that an answer of the default length is
 not cut off with `finish_reason: length`. What each of these costs or buys in expert slots is in
 [performance/decode.md](performance/decode.md#getting-more-slots).
 
 A flag on the command line always wins, also when it repeats the default (`--memory-ratio 0.9`);
-`--speculative-algorithm off` keeps speculative decoding off. Three settings are dropped where they
+`--speculative-algorithm off` keeps speculative decoding off. Four settings are dropped where they
 cannot apply, each with one log line: speculative decoding where the checkpoint has no MTP layers (or
 an explicit `--speculative-algorithm mtp` would be refused), host embeddings where the table is tied
-to the LM head, and the KV reserve where the expert cache's minimum does not fit beside it (the
+to the LM head, the demand-loaded prefill chunks where every expert has a place on the GPU (resident,
+or a slot in the expert cache), the cache decodes on the CPU or `hybrid`, or one of its slot pools is
+smaller than a layer's experts, and the KV reserve where the expert cache's minimum does not fit beside it (the
 warning names the largest `--kv-reserve-tokens` that does). The KV reserve is never more than the
 model's context, and it is lowered, to the default at the least, where it would leave fewer expert
 slots than a server without the preset plans. The preset's memory ratio comes with the working memory
@@ -176,7 +178,8 @@ plan line says which. Both give the same output as the expert cache does.
   takes two layers' worth of slots more than there are experts, out of the KV tokens above the
   reserve. The prefill staging buffers lie over that many slots, and only with every expert in a
   slot outside them does a prefill read the slots as decode does. With fewer slots a prefill keeps
-  streaming what is not resident (`--moe-prefill-hit-d2d`).
+  streaming what is not resident (`--moe-prefill-hit-d2d`), and a chunk of at most 96 tokens (a
+  resend, a short turn) loads only the experts it routes to (`--moe-prefill-demand-tokens`).
 
 `--preset single` measures nothing: it serves with `fused` where every expert fits as described
 above, else with `offload` (or what `--moe-strategy auto` takes from an

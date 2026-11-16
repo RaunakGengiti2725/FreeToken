@@ -1175,6 +1175,45 @@ def test_preset_plan_takes_the_staging_slots_only_where_every_expert_and_the_kv_
     assert cache(8).holds_every_expert and not cache(7).holds_every_expert and not cache(0).holds_every_expert
 
 
+def test_preset_loads_short_prefill_chunks_on_demand_only_into_a_gpu_decoded_cache_that_cannot_hold_every_expert(decode_rows, monkeypatch):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    engine = decode_rows.engine
+    monkeypatch.setattr(OffloadMoeCache, "keeps_streamed_experts", property(lambda self: self.prefill_hit_d2d))
+
+    def settled(extra, decode_target="gpu", pool_sizes=None, fields=("moe_prefill_demand_tokens",), tokens=96):
+        config = SimpleNamespace(
+            preset="single", preset_fields=fields, moe_prefill_demand_tokens=tokens, model_config=SimpleNamespace(num_experts=4),
+        )
+        pool_sizes = pool_sizes or [40 + extra]
+        engine._settle_preset_demand(config, decode_target, pool_sizes)  # before the cache: it refuses demand chunks off the GPU
+        cache = OffloadMoeCache(
+            num_layers=10, num_experts=4, cache_size=40 + extra, device=torch.device("cpu"), prefill_overlap=True, prefill_hit_d2d=True,
+            prefill_demand_tokens=config.moe_prefill_demand_tokens, decode_target=decode_target,
+        )
+        cache.set_bank_sources({"gate_up": [torch.randn(4, 32, 8) for _ in range(10)], "down": [torch.randn(4, 8, 16) for _ in range(10)]})
+        engine._settle_preset_demand(config, decode_target, pool_sizes, cache)
+        assert cache.prefill_demand_tokens == config.moe_prefill_demand_tokens
+        assert ("moe_prefill_demand_tokens" in config.preset_fields) == (bool(fields) and config.moe_prefill_demand_tokens == 96)
+        return config.moe_prefill_demand_tokens
+
+    # 40 experts, 8 staging slots: a slot for every expert outside them, or one short of it
+    assert settled(7) == 96 and settled(0) == 96 and settled(8) == 0
+    assert settled(0, decode_target="hybrid") == 0 and settled(0, decode_target="cpu") == 0
+    assert settled(0, pool_sizes=[3, 37]) == 0  # a pool smaller than a layer: a chunk can route to every expert of one
+    # typed tokens are the command line's: kept on any cache, and refused by it as without the preset
+    assert settled(8, fields=()) == 96 and settled(8, fields=(), tokens=32) == 32
+    with pytest.raises(ValueError, match="needs GPU decode"):
+        settled(0, decode_target="hybrid", fields=())
+    # resident experts have no cache to load into
+    fields = ("max_running_req", "moe_prefill_demand_tokens")
+    fused = _resolved(decode_rows, preset="single", preset_fields=fields, moe_strategy="fused", moe_prefill_demand_tokens=96)
+    assert (fused.moe_prefill_demand_tokens, fused.preset_fields) == (0, ("max_running_req",))
+    offload = _resolved(decode_rows, preset="single", preset_fields=fields, moe_prefill_demand_tokens=96)
+    assert (offload.moe_strategy, offload.moe_prefill_demand_tokens, offload.preset_fields) == ("offload", 96, fields)
+    assert _resolved(decode_rows, moe_strategy="fused", moe_prefill_demand_tokens=96).moe_prefill_demand_tokens == 96
+
+
 # ---- --preset single-measured (moe/calibrate.py): its rule, the timings it keeps in the decode profile, its fallback ----
 
 

@@ -277,6 +277,29 @@ PRESET_DRAFT_SHARE = 0.20
 PRESET_NO_DRAFTS = "serving without the preset's draft tokens"
 
 
+def _drop_preset_demand(config, reason: str) -> None:
+    """Serve a preset without the short prefill chunks it loads on demand, with one log line: they stream as longer ones do."""
+    if "moe_prefill_demand_tokens" not in getattr(config, "preset_fields", ()):
+        return
+    object.__setattr__(config, "moe_prefill_demand_tokens", EngineConfig.moe_prefill_demand_tokens)
+    _drop_preset_fields(config, "moe_prefill_demand_tokens")
+    logger.info_rank0(f"--preset {config.preset}: no prefill chunk loads its experts on demand ({reason})")
+
+
+def _settle_preset_demand(config, decode_target: str, pool_sizes: list[int], cache=None) -> None:
+    """A preset's short prefill chunks load their experts on demand only through a GPU-decoded expert cache that cannot
+    hold every expert. Called before the cache is built, which refuses them on another decode target, and with the cache."""
+    if decode_target != "gpu":
+        _drop_preset_demand(config, f"the expert cache decodes on {decode_target}")
+    elif min(pool_sizes) < config.model_config.num_experts:
+        _drop_preset_demand(config, f"a slot pool of {min(pool_sizes)} slots cannot hold the experts a chunk routes to in one layer")
+    elif cache is not None and cache.keeps_streamed_experts and cache.holds_every_expert:
+        # a prefill reads the slots once they are filled, and until then it fills them by streaming
+        _drop_preset_demand(config, "the expert cache has a slot for every expert")
+    if cache is not None:
+        cache.prefill_demand_tokens = config.moe_prefill_demand_tokens
+
+
 def _preset_kv_target(config) -> int:
     """The KV reserve a preset asks for, at most the model's context (no request holds more) and at least the default reserve."""
     return max(min(config.kv_reserve_tokens, config.max_seq_len), EngineConfig.kv_reserve_tokens)
@@ -1337,6 +1360,8 @@ class Engine:
                 parts.append("a prefill reads the slots once every expert is loaded")
             elif config.moe_prefill_hit_d2d:
                 parts.append("a prefill streams the experts that are not resident (--moe-prefill-hit-d2d)")
+            if demand := self.moe_offload_cache.prefill_demand_tokens:
+                parts.append(f"a prefill chunk of at most {demand} tokens loads only the experts it routes to")
         elif getattr(config.model_config, "is_moe", False):
             parts.append(f"every expert resident ({config.moe_strategy})")
         parts.append(f"{num_tokens} KV tokens")
@@ -1545,6 +1570,7 @@ class Engine:
             # GGUF layers keep their own ggml types, so the cache reads each layer's layout off its banks
             layout = None if method.kind is QuantKind.GGUF else method.layout()
             max_slots = method.slot_limit()
+        _settle_preset_demand(config, decode_target, pool_sizes)
         cache = OffloadMoeCache(
             # Models with leading dense layers (GLM-4) only have experts on the MoE
             # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
@@ -1571,6 +1597,7 @@ class Engine:
             cache.locked_hybrid = cpu_layer_ids
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=layer_tags, row_tail_bytes=banks.row_tail_bytes)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        _settle_preset_demand(config, decode_target, pool_sizes, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
@@ -3151,6 +3178,7 @@ def _adjust_config(config: EngineConfig):
         )
 
     if is_moe and config.moe_strategy == "fused":
+        _drop_preset_demand(config, "every expert is resident")
         # An explicit 'fused' keeps the experts resident, so there is no slot cache to size. The
         # sizing flags no longer redirect the backend, so ignore them here and say so -- the
         # geometry the user asked for is what runs. Report the flag actually passed: --moe-cache-

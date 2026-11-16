@@ -101,7 +101,7 @@ def test_key_stays_out_of_the_logged_config(monkeypatch):
 
 _PRESET_SINGLE = {
     "max_running_req": 1, "embed_weights": "host", "memory_ratio": 0.95, "moe_prefill_hit_d2d": True,
-    "speculative_algorithm": "mtp", "speculative_num_steps": 3, "kv_reserve_tokens": 32768 + 4096,
+    "moe_prefill_demand_tokens": 96, "speculative_algorithm": "mtp", "speculative_num_steps": 3, "kv_reserve_tokens": 32768 + 4096,
 }
 
 
@@ -127,6 +127,7 @@ def test_preset_single_changes_its_fields_and_nothing_without_the_flag():
         (("--embed-weights", "gpu"), "embed_weights", "gpu"),
         (("--memory-ratio", "0.9"), "memory_ratio", 0.9),
         (("--moe-prefill-hit-d2d",), "moe_prefill_hit_d2d", True),
+        (("--moe-prefill-demand-tokens", "0"), "moe_prefill_demand_tokens", 0),
         (("--speculative-algorithm", "off"), "speculative_algorithm", None),
         (("--speculative-algorithm", "OFF"), "speculative_algorithm", None),
         (("--speculative-algorithm", "dflash"), "speculative_algorithm", "dflash"),
