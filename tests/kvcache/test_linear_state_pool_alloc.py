@@ -190,3 +190,25 @@ def test_slot_state_bytes_for_the_real_geometry():
     delta = linear_state_bytes_per_req(group, 1, torch.bfloat16, (spec,)) - \
         linear_state_bytes_per_req(group, 1, torch.bfloat16)
     assert delta == 4 * 2560 * 9 * 2 == 180 * 1024
+
+
+def test_a_decode_step_reads_the_slots_of_the_batch_in_front_of_it():
+    """The linear backend repeats the device copy of a decode batch's slots while they repeat: a reorder, a request leaving, a request keyed by its table row and a slot changing under a request must each reach the indices the GDN layers read."""
+    from freetoken.attention.linear import LinearAttnBackend, gdn_slot
+    from freetoken.core import Batch
+
+    pool = _pool()
+    backend = LinearAttnBackend(torch.device("cpu"), pool)
+    a, b = (SimpleNamespace(linear_slot_idx=slot, table_idx=6) for slot in pool.alloc(2))
+    by_table = SimpleNamespace(linear_slot_idx=None, table_idx=5)
+
+    def sent(reqs):
+        batch = Batch(reqs=reqs, phase="verify", rows_per_req=4)
+        batch.padded_reqs = reqs
+        backend.prepare_metadata(batch)
+        return batch.fla_metadata.cache_indices.tolist()
+
+    for reqs in ([a, b], [a, b], [b, a], [a], [b], [by_table, a], [a]):
+        assert sent(reqs) == [gdn_slot(r) for r in reqs]
+    a.linear_slot_idx = pool.alloc(1)[0]
+    assert sent([a]) == [a.linear_slot_idx]

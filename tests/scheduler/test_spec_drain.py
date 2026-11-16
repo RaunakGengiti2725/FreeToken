@@ -183,6 +183,27 @@ def test_drain_stamps_intermediate_timings_when_requested():
     assert reply[1].finished and reply[1].timings["predicted_n"] == 3
 
 
+def test_a_step_reads_the_table_rows_of_the_batch_in_front_of_it():
+    """The scheduler repeats the device copy of a decode batch's row mapping while its requests repeat: a reorder, a request leaving, a table row handed to another request, a different row count and a prefill in between must each reach the rows the step gathers its tokens and KV slots with."""
+    stub = SimpleNamespace(device=torch.device("cpu"), _sent_rows=None)
+
+    def rows(reqs, phase="verify"):
+        batch = Batch(reqs=reqs, phase=phase, rows_per_req=None if phase == "prefill" else reqs[0].extend_len)
+        batch.padded_reqs = reqs
+        batch.positions = torch.zeros(sum(r.extend_len for r in reqs), dtype=torch.int32)
+        return Scheduler._input_rows(stub, batch).tolist()
+
+    a, b = SimpleNamespace(table_idx=1, extend_len=K + 1), SimpleNamespace(table_idx=2, extend_len=K + 1)
+    for reqs in ([a, b], [a, b], [b, a], [a], [b]):
+        assert rows(reqs) == [r.table_idx for r in reqs for _ in range(K + 1)]
+    b.table_idx = 3
+    assert rows([b]) == [3] * (K + 1)
+    b.extend_len = 1
+    assert rows([b], "decode") == [3]
+    assert rows([SimpleNamespace(table_idx=0, extend_len=5)], "prefill") == [0] * 5
+    assert rows([b], "decode") == [3]
+
+
 def test_drain_commits_a_forced_token_as_the_end_of_the_accepted_run():
     """A request at its reasoning budget inside a verify step: the host plans the close tag for the row where the budget ends, the verify cuts the accepted drafts there, and the drain commits, rolls back and leaves pending exactly that prefix."""
     from freetoken.scheduler.reasoning import ReasoningTracker, ThinkTokens
@@ -227,3 +248,37 @@ def test_drain_commits_a_forced_token_as_the_end_of_the_accepted_run():
     for req in reqs:
         stub._free_req_resources(req)
     cm.check_integrity()
+
+
+def test_a_step_commits_up_to_its_first_finishing_token():
+    """A multi-token step stops at the first token that ends the request: the reply, the host ids, the stop match and the tool-call anchor see the committed tokens and none after them."""
+    step = [11, 12, 13, 14]
+    # (eos ids, stop strings, anchor id, max_tokens) -> (committed, finish reason, matched stop, anchor length)
+    cases = [
+        ((set(), [], None, 16), ([11, 12, 13, 14], None, None, None)),
+        (({13}, [], None, 16), ([11, 12, 13], "stop", None, None)),
+        # matched on the ids up to the token under test: with the step's later tokens already on the host it would match early
+        ((set(), ["13 14"], None, 16), ([11, 12, 13, 14], "stop", "13 14", None)),
+        ((set(), ["12 13"], None, 16), ([11, 12, 13], "stop", "12 13", None)),
+        ((set(), [], 12, 16), ([11, 12, 13, 14], None, None, PROMPT + 3)),
+        ((set(), [], None, 3), ([11, 12], "length", None, None)),
+        # EOS wins over the length limit reached on the same token, and a finishing token sets no anchor
+        (({12}, [], 12, 3), ([11, 12], "stop", None, None)),
+    ]
+    for (eos, stops, anchor, max_tokens), (committed, reason, matched, anchor_len) in cases:
+        pool, cm, tm, dm, stub, events = _setup()
+        stub.eos_token_ids, stub.toolcall_anchor_id = eos, anchor
+        stub.tokenizer = SimpleNamespace(decode=lambda ids: " ".join(map(str, ids)))
+        stub._match_stop_str = lambda req: Scheduler._match_stop_str(stub, req)
+        req = _decoding_req(pool, cm, tm, 1, max_tokens)
+        req.sampling_params.ignore_eos = False
+        req.sampling_params.stop_strs = stops
+        before = req.input_ids.tolist()
+
+        msg, n = Scheduler._commit_tokens(stub, req, torch.tensor(step))
+
+        case = (eos, stops, anchor, max_tokens)
+        assert (msg.next_tokens, n) == (committed, len(committed)), case
+        assert (msg.finished, msg.finish_reason, msg.matched_stop) == (reason is not None, reason, matched), case
+        assert req.input_ids.tolist() == before + committed, case
+        assert req.toolcall_anchor_len == anchor_len, case

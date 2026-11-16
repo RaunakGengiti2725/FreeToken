@@ -145,6 +145,26 @@ def test_min_p_filters_after_temperature_top_k_and_top_p(device, filters):
     assert (counts / n - want).abs().max() < 5 * (0.25 / n) ** 0.5
 
 
+def test_prepare_follows_every_change_of_the_sampling_values(device):
+    """One sampler prepares batch after batch and repeats the device tensors of a batch whose sampling values did not change: every field that does change, and a change of the batch itself, must reach the tensors the step samples with."""
+    params = dict(temperature=0.7, top_k=8, top_p=0.9, min_p=0.1)
+    steps = [[dict(params)], [dict(params)]]
+    # one field at a time, the others as the step before left them; the last three turn each filter off, which drops its tensor
+    for change in (dict(temperature=1.3), dict(top_k=5), dict(top_p=0.5), dict(min_p=0.3), dict(top_k=-1), dict(top_p=1.0), dict(min_p=0.0)):
+        params.update(change)
+        steps.append([dict(params)])
+    plain, greedy = dict(temperature=1.0), dict(temperature=0.0)
+    # a second request whose values are a greedy row's without and with the greedy flag, then the batch reordered and shrunk
+    steps += [[params, plain], [params, greedy], [greedy, params], [greedy], [params]]
+    sampler = Sampler(device, VOCAB)
+    for step in steps:
+        batch = Batch(reqs=_requests([SamplingParams(**p) for p in step], [1]), phase="decode")
+        got, want = sampler.prepare(batch), Sampler(device, VOCAB).prepare(batch)
+        for name in ("temperatures", "top_k", "top_p", "min_p", "greedy_mask"):
+            a, b = getattr(got, name), getattr(want, name)
+            assert (a is None) == (b is None) and (a is None or torch.equal(a, b)), (name, step)
+
+
 def test_repetition_penalty_scales_every_context_token_once(device):
     """The prompt's tokens, a repeated one once, and each token sampled since are penalized: a positive logit divided, a negative one multiplied. A request without the penalty in the same batch keeps its logits and gets no mask."""
     penalty, prompt = 1.8, [23, 0, 0, 7, 23]
