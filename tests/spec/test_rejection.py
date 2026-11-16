@@ -187,3 +187,65 @@ def test_reject_with_draft_probs_commits_the_target_distribution():
     assert torch.equal(emitted[greedy], (drafts[greedy] == argmax[:k]).cumprod(dim=1).sum(dim=1))
     committed = torch.arange(k + 1, device=device) <= emitted[greedy].unsqueeze(1)
     assert torch.equal(out[greedy][committed], argmax.expand(int(greedy.sum()), -1)[committed])
+
+
+def test_a_seeded_draw_is_keyed_by_the_token_position_not_by_the_step():
+    """Positions 5..10 of one request reached three ways: a decode step each, verify steps of 4 rows, one verify step of 6 rows. Each position must get one key whatever the split, the batch around it or the phase, and a key of its own."""
+    from freetoken.core import Batch, Req, SamplingParams
+    from freetoken.scheduler.prefill import ChunkedReq
+
+    sampler = _sampler(torch.device("cpu"))
+
+    def req(device_len, cls=Req, **params):
+        return cls(input_ids=torch.zeros(device_len, dtype=torch.int32), table_idx=0, cached_len=device_len - 1, output_len=64,
+                   uid=0, sampling_params=SamplingParams(**{"temperature": 1.0, **params}), cache_handle=None)
+
+    def keys(reqs, phase, rows=None):
+        return sampler.prepare(Batch(reqs=reqs, phase=phase, rows_per_req=rows)).keys
+
+    decode = [keys([req(n, seed=7)], "decode")[0] for n in range(5, 11)]
+    assert len(set(decode)) == 6
+    assert keys([req(5, seed=7)], "verify", 4) + keys([req(9, seed=7)], "verify", 4)[:2] == decode
+    assert keys([req(5, seed=7)], "verify", 6) == decode
+    # a prompt of 5 tokens draws its first token at position 5 too
+    assert keys([req(5, seed=7)], "prefill") == decode[:1]
+    # beside an unseeded request the rows keep their keys, and the neighbor gets none
+    assert keys([req(3), req(5, seed=7)], "verify", 4) == [None] * 4 + decode[:4]
+    assert not set(keys([req(5, seed=8)], "verify", 6)) & set(decode)
+    # no seed, a greedy request, and a prompt chunk whose token nobody keeps: the batch draws as it does without the field
+    for other in (req(5), req(5, seed=7, temperature=0.0), req(5, ChunkedReq, seed=7)):
+        assert keys([other, req(5)], "prefill") is None
+
+
+@cuda
+@pytest.mark.parametrize("params", [{}, {"top_k": 8, "top_p": 0.9}, {"min_p": 0.05}])
+def test_a_seeded_request_draws_the_same_token_at_a_position_in_any_step(params):
+    """The tokens a seed gives at positions 5..10, drawn a decode step at a time, must come back from verify steps of 4 and of 6 rows and from a step shared with another request; row n of ``table`` stands for the logits at position n."""
+    from freetoken.core import Batch, Req, SamplingParams
+
+    device = torch.device("cuda")
+    torch.manual_seed(3)
+    vocab = 64
+    sampler = _sampler(device, vocab)
+    table = torch.randn(16, vocab, device=device)
+
+    def req(device_len, seed=None):
+        return Req(input_ids=torch.zeros(device_len, dtype=torch.int32), table_idx=0, cached_len=device_len - 1, output_len=64,
+                   uid=0, sampling_params=SamplingParams(temperature=1.0, seed=seed, **params), cache_handle=None)
+
+    def verify(start, width, seed=7, neighbor=False):
+        """The seeded request's ``width`` rows from one verify step at ``start``, after an unseeded request's rows when ``neighbor``."""
+        reqs = [req(3), req(start, seed)] if neighbor else [req(start, seed)]
+        args = sampler.prepare(Batch(reqs=reqs, phase="verify", rows_per_req=width))
+        logits = torch.cat([table[r.device_len : r.device_len + width] for r in reqs])
+        drafts = torch.zeros(len(reqs), width - 1, dtype=torch.int64, device=device)
+        return sampler.sample_verify(logits, args, drafts)[-width:].tolist()
+
+    decode = []
+    for n in range(5, 11):
+        args = sampler.prepare(Batch(reqs=[req(n, seed=7)], phase="decode"))
+        decode.append(int(sampler.sample(table[n : n + 1], args)))
+    assert verify(5, 4) + verify(9, 4)[:2] == decode
+    assert verify(5, 6) == decode
+    assert verify(5, 6, neighbor=True) == decode
+    assert verify(5, 6, seed=8) != decode

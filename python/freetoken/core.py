@@ -36,6 +36,9 @@ class SamplingParams:
     # Tokens a response may spend inside its thinking span before the scheduler forces the
     # close tag; None = unset (the API layer fills the server default), 0 = off.
     reasoning_budget: int | None = None
+    # OpenAI `seed`: each sampled token is drawn from (seed, the token's position), see engine.sample.draw_key.
+    # None draws from the shared stream.
+    seed: int | None = None
 
     @property
     def is_greedy(self) -> bool:

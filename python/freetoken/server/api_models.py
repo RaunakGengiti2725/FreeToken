@@ -95,6 +95,8 @@ class ChatCompletionRequest(BaseModel):
     # reads the dict form and 400s only on an unknown "type" value.
     thinking: Any | None = None
     ignore_eos: bool = False
+    # fixes each sampled token's draw; the logits can still differ between runs where two tokens are nearly tied
+    seed: int | None = None
     tools: list[Tool] | None = None
     tool_choice: Literal["none", "auto", "required"] | ToolChoiceObject | None = None
     parallel_tool_calls: bool | None = None
@@ -132,6 +134,7 @@ class CompletionRequest(BaseModel):
     presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     ignore_eos: bool = False
+    seed: int | None = None
     logprobs: int | None = None
     echo: bool = False
     suffix: str | None = None

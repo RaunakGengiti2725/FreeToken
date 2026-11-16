@@ -36,6 +36,7 @@ from .generation import (
     generate_events,
     generate_full,
     prerender_error,
+    seed_ignored,
     render_messages,
     resolve_sampling,
     timings_block,
@@ -85,6 +86,7 @@ def chat_request_to_genspec(
         timings_per_token=timings_per_token,
         min_p=req.min_p,
         repetition_penalty=req.repetition_penalty,
+        seed=req.seed,
     )
     # --reasoning-budget fills it when it stays None (generation.resolve_reasoning_budget)
     sampling_params.reasoning_budget = req.reasoning_budget
@@ -260,6 +262,8 @@ async def handle_chat_completion(
     }
     if (timings := timings_block(state, result.timings)) is not None:
         response["timings"] = timings
+    if seed_ignored(state, req.seed):
+        response["seed_ignored"] = True
     return response
 
 
@@ -405,6 +409,8 @@ async def stream_chat_completion_chunks(
         elif isinstance(ev, GenDone):
             timings = ev.timings
             done = _chat_chunk(req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}])
+            if seed_ignored(state, req.seed):
+                done["seed_ignored"] = True
             if not include_usage and (t := timings_block(state, timings)) is not None:
                 done["timings"] = t
             yield emit(done)
@@ -516,6 +522,8 @@ async def handle_completion(
     }
     if (timings := timings_block(state, first_timings)) is not None:
         response["timings"] = timings
+    if seed_ignored(state, req.seed):
+        response["seed_ignored"] = True
     return response
 
 
@@ -574,6 +582,8 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
         "model": req.model,
         "choices": [{"text": "", "index": 0, "finish_reason": finish_reason, "logprobs": None}],
     }
+    if seed_ignored(state, req.seed):
+        done_chunk["seed_ignored"] = True
     if not include_usage and (t := timings_block(state, timings)) is not None:
         # as on the chat stream: the finish chunk is the last one only when no usage
         # chunk follows
@@ -634,6 +644,7 @@ def _resolve_sampling(
         timings_per_token=timings_per_token,
         min_p=req.min_p,
         repetition_penalty=req.repetition_penalty,
+        seed=req.seed,
     )
 
 

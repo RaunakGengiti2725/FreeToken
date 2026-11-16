@@ -242,10 +242,12 @@ _UGEN = {}
 def _gen_u(B, device, seed, offset):
     if torch.cuda.is_current_stream_capturing():
         return torch.rand(B, device=device, dtype=torch.float32)
-    g = _UGEN.get(device)
+    # a seeded draw has its own generator: reseeding the shared one would restart the stream every unseeded draw reads
+    slot = (device, seed is not None)
+    g = _UGEN.get(slot)
     if g is None:
         g = torch.Generator(device=device)
-        _UGEN[device] = g
+        _UGEN[slot] = g
     if seed is not None:
         s = int(seed if not isinstance(seed, torch.Tensor) else seed.view(-1)[0])
         o = 0 if offset is None else int(offset if not isinstance(offset, torch.Tensor) else offset.view(-1)[0])

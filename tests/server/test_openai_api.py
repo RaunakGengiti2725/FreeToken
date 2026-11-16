@@ -190,6 +190,19 @@ def test_chat_reasoning_effort_enables_thinking():
     assert chat_request_to_genspec(chat_request(), {}).chat_template_kwargs == {}
 
 
+def test_seed_reaches_the_sampling_params():
+    assert chat_request_to_genspec(chat_request(seed=7), {}).sampling_params.seed == 7
+    assert chat_request_to_genspec(chat_request(), {}).sampling_params.seed is None
+    state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    body = run(handle_completion(CompletionRequest(model="m", prompt="hi", seed=7), request=None, state=state, model_sampling={}))
+    assert state.sent.sampling_params.seed == 7 and "seed_ignored" not in body
+    # sampled drafts (dflash) draw from the shared stream: the response says the seed did not key the draws
+    state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    state.config.speculative_algorithm = "dflash"
+    body = run(handle_completion(CompletionRequest(model="m", prompt="hi", seed=7), request=None, state=state, model_sampling={}))
+    assert body["seed_ignored"] is True
+
+
 def test_chat_reasoning_effort_none_disables_thinking():
     # vLLM-compatible semantics: an explicit effort "none" DISABLES thinking.
     spec = chat_request_to_genspec(chat_request(reasoning_effort="none"), {})

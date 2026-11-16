@@ -27,6 +27,7 @@ from freetoken.message import TokenizeMsg
 from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
 from freetoken.tokenizer.inline_system import InlineSystemError
+from freetoken.utils import init_logger
 
 try:
     # Chat templates render through jinja2 (a transformers dependency): a TemplateError means
@@ -44,6 +45,8 @@ from .reasoning_parser import (
     strip_special_tokens,
     think_tags,
 )
+
+logger = init_logger(__name__)
 
 
 class GenerationError(ValueError):
@@ -158,6 +161,19 @@ class GenResult:
     reasoning_stats: dict[str, Any] | None = None
 
 
+def seed_ignored(state: Any, seed: int | None) -> bool:
+    """Whether a request's seed cannot key its draws on this server: with sampled drafts (dflash) the
+    drafts, the accept test and the resample all read the shared stream. Said once in the log."""
+    config = getattr(state, "config", None) if state is not None else None
+    if seed is None or getattr(config, "speculative_algorithm", None) != "dflash":
+        return False
+    logger.warning_once(
+        "a request's seed is not applied under --speculative-algorithm dflash (its sampled drafts and their "
+        "verify draw from the shared stream); the response carries seed_ignored"
+    )
+    return True
+
+
 def timings_block(state: Any, timings: dict[str, Any] | None) -> dict[str, Any] | None:
     """llama.cpp's per-request timings object (server_slot_stats::to_json, b10408+) as
     frontends like llama-swap read it, plus queue_ms as a FreeToken extension. The spans
@@ -240,6 +256,7 @@ def resolve_sampling(
     timings_per_token: bool = False,
     min_p: float | None = None,
     repetition_penalty: float | None = None,
+    seed: int | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -274,6 +291,7 @@ def resolve_sampling(
         timings_per_token=timings_per_token,
         min_p=min_p,
         repetition_penalty=repetition_penalty,
+        seed=seed,
     )
 
 

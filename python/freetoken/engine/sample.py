@@ -44,6 +44,8 @@ class BatchSamplingArgs:
     repetition: list[tuple[int, torch.Tensor, float]] = field(default_factory=list)
     # set by the scheduler between steps; None on every batch without a forced token
     forced: ForcedTokens | None = None
+    # draw_key per row for the rows of a sampled request with a seed, None for the other rows; None when no row has one
+    keys: list[int | None] | None = None
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -72,14 +74,25 @@ def repetition_penalize(logits: torch.Tensor, seen: torch.Tensor, penalty: float
     return torch.where(seen, torch.where(logits > 0, logits / penalty, logits * penalty), logits)
 
 
+def draw_key(seed: int, position: int) -> int:
+    """Seed of the draw that samples the token at ``position`` of a request with ``seed``.
+
+    It reads the token's position, not a step count, so the draw is the same in whichever step and batch the token is sampled.
+    The mix is the one kernel.triton.sampling applies to (seed, offset); 63 bits fit both backends' seed argument.
+    """
+    return (seed * 0x9E3779B97F4A7C15 + position) & 0x7FFFFFFFFFFFFFFF
+
+
 def sample_impl(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_k: torch.Tensor | int | None,
     top_p: torch.Tensor | float | None,
     min_p: torch.Tensor | None = None,
+    seed: int | None = None,
 ) -> torch.Tensor:
     sampling = sampling_module()
+    rng = {} if seed is None else {"seed": seed, "offset": 0}
     probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
     if min_p is not None:
         # min-p runs last: its cut is relative to the top token, which top-k and top-p always keep
@@ -87,20 +100,43 @@ def sample_impl(
             probs = sampling.top_k_renorm_probs(probs, top_k)
         if top_p is not None:
             probs = sampling.top_p_renorm_probs(probs, top_p)
-        return sampling.min_p_sampling_from_probs(probs, min_p)
+        return sampling.min_p_sampling_from_probs(probs, min_p, **rng)
     if top_k is None and top_p is None:
-        return sampling.sampling_from_probs(probs)
+        return sampling.sampling_from_probs(probs, **rng)
 
     if top_p is None:
         assert top_k is not None
-        return sampling.top_k_sampling_from_probs(probs, top_k)
+        return sampling.top_k_sampling_from_probs(probs, top_k, **rng)
 
     if top_k is None:
         assert top_p is not None
-        return sampling.top_p_sampling_from_probs(probs, top_p)
+        return sampling.top_p_sampling_from_probs(probs, top_p, **rng)
 
     assert top_k is not None and top_p is not None
-    return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
+    return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p, **rng)
+
+
+def sample_rows(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    min_p: torch.Tensor | None,
+    keys: list[int | None] | None,
+) -> torch.Tensor:
+    """sample_impl over the batch; a row with a key is then drawn again from that key."""
+    tokens = sample_impl(logits, temperatures, top_k, top_p, min_p)
+    for row, key in enumerate(keys or ()):
+        if key is None:
+            continue
+        # One row per call: a batched call takes one seed, and flashinfer mixes the row index into it. Alone, a row's
+        # softmax and draw also run the same arithmetic whatever else the step holds.
+        one = slice(row, row + 1)
+        tokens[one] = sample_impl(
+            logits[one], temperatures[one], None if top_k is None else top_k[one], None if top_p is None else top_p[one],
+            None if min_p is None else min_p[one], key,
+        )
+    return tokens
 
 
 @dataclass
@@ -136,6 +172,13 @@ class Sampler:
             )
         if all(is_greedy):
             return BatchSamplingArgs(temperatures=None, penalties=penalties, repetition=repetition)
+        # called before a verify batch is widened: device_len is where row 0's token goes, row j's goes j further
+        width = 1 if batch.is_prefill else batch.rows_per_req
+        keys = [
+            None if g or p.seed is None or not r.can_decode else draw_key(p.seed, r.device_len + j)
+            for r, p, g in zip(batch.reqs, params, is_greedy)
+            for j in range(width)
+        ]
 
         MIN_P = MIN_T = 1e-6
         # Greedy outputs are selected explicitly in sample(); use neutral sampling
@@ -168,6 +211,7 @@ class Sampler:
         return BatchSamplingArgs(
             temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, penalties=penalties,
             min_p=min_p, repetition=repetition,
+            keys=keys if any(k is not None for k in keys) else None,
         )
 
     @nvtx_annotate("Sampler")
@@ -183,7 +227,7 @@ class Sampler:
             if args.temperatures is None:  # greedy sampling
                 tokens = torch.argmax(logits, dim=-1)
             else:
-                tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p, args.min_p)
+                tokens = sample_rows(logits.float(), args.temperatures, args.top_k, args.top_p, args.min_p, args.keys)
                 if args.greedy_mask is not None:
                     # Mixed batches still run probability sampling for all rows, but
                     # greedy rows must follow argmax's deterministic tie-breaking.
@@ -216,7 +260,7 @@ class Sampler:
         def rows(t: torch.Tensor | None) -> torch.Tensor | None:
             return None if t is None else t.repeat_interleave(width)
 
-        tokens = sample_impl(logits.float(), rows(args.temperatures), rows(args.top_k), rows(args.top_p), rows(args.min_p))
+        tokens = sample_rows(logits.float(), rows(args.temperatures), rows(args.top_k), rows(args.top_p), rows(args.min_p), args.keys)
         if args.greedy_mask is not None:
             greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
             tokens = torch.where(rows(args.greedy_mask), greedy_tokens, tokens)
