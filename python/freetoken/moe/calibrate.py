@@ -144,6 +144,8 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
     try:
         ns, extra = benchdecode.parse_args(bench_argv, "ft serve --preset " + PRESET)
     except SystemExit as exc:
+        if _signalled:
+            raise  # the launcher's own exit on a signal, not the parser's
         raise RuntimeError(f"the bench refused the command line (exit {exc.code})") from None
     builtin = dict(benchdecode.BUILTIN_PROMPTS)
     sampling, _ = benchdecode.resolve_sampling(ns.model, ns.greedy)
@@ -160,6 +162,10 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
     }
 
 
+# the signal that is ending the launcher, while candidates are timed
+_signalled: list[int] = []
+
+
 @contextlib.contextmanager
 def _stopping_on_signals():
     """While candidates are timed, SIGTERM, SIGHUP and SIGINT end the launcher with exit code 128 + the signal.
@@ -170,7 +176,8 @@ def _stopping_on_signals():
     if threading.current_thread() is not threading.main_thread():
         yield  # handlers can only be set from the main thread
         return
-    seen: list[int] = []
+    seen = _signalled
+    del seen[:]
 
     def stop(signum, _frame):
         if seen:

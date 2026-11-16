@@ -1022,6 +1022,14 @@ def test_a_signal_during_calibration_stops_the_candidates_server_and_ends_the_la
             for proc in servers:
                 if proc.poll() is None:
                     proc.kill()
+    # a signal that lands in the bench's argument parser ends the launcher too: it is not taken for a refused command line
+    from freetoken.moe import benchdecode as bench
+
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(bench, "parse_args", lambda argv, prog: signal.raise_signal(signal.SIGTERM))
+        with pytest.raises(SystemExit) as stopped:
+            calibrate.measure(SimpleNamespace(model_path="/models/anon"), ["--preset", "single-measured"], todo)
+    assert stopped.value.code == 128 + signal.SIGTERM
     # a signal the launcher ignores (SIGHUP under nohup) stays ignored while the candidates are timed
     row = {"tok_s": [[100.0, 100.0], [200.0, 200.0]], "drafts": 300, "early": [100.0, 200.0], "cache_slots": 40, "total_slots": 80,
            "slot_bytes": 1 << 20, "gpu_free_bytes": _ROW_FREE, "ready_s": 1.0}

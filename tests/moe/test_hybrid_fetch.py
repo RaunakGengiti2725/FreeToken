@@ -209,6 +209,15 @@ def test_bench_stops_the_whole_server_group_even_when_the_frontend_exits_at_once
     benchdecode.stop_server(SimpleNamespace(pid=7, wait=lambda timeout: 0))
     assert sent == [signal.SIGTERM, signal.SIGKILL]
 
+    # an exit raised inside the wait (a signal to the launcher) still kills the group
+    def interrupted(timeout):
+        raise SystemExit(143)
+
+    del sent[:]
+    with pytest.raises(SystemExit):
+        benchdecode.stop_server(SimpleNamespace(pid=7, wait=interrupted))
+    assert sent == [signal.SIGTERM, signal.SIGKILL]
+
 
 def test_bench_counts_an_arm_lost_in_a_later_round_as_not_faster(monkeypatch):
     """hybrid runs 30% faster in round 1, then its round-2 server stops answering: the verdict must not take it on the one start."""

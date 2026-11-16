@@ -356,20 +356,23 @@ def tail(log_path: str, n: int = 25) -> str:
 
 def stop_server(proc: subprocess.Popen) -> None:
     """SIGTERM the whole session (frontend and workers), then SIGKILL; as benchmarks/bench_decode_moe.py does."""
-    for sig, wait_s in ((signal.SIGTERM, 90), (signal.SIGKILL, 30)):
+    try:
+        for sig, wait_s in ((signal.SIGTERM, 90), (signal.SIGKILL, 30)):
+            try:
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=wait_s)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        # also when a signal's exit ends the wait. The frontend can exit on SIGTERM while a worker of its group still holds the GPU
         try:
-            os.killpg(proc.pid, sig)
+            os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        try:
-            proc.wait(timeout=wait_s)
-            break
-        except subprocess.TimeoutExpired:
-            continue
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)   # the frontend can exit on SIGTERM while a worker of its group still holds the GPU
-    except ProcessLookupError:
-        pass
 
 
 def mean_ci(vals: list[float]) -> tuple[float, float | None]:
