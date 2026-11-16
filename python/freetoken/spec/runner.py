@@ -102,8 +102,8 @@ class SpecRunner:
 
     def propose_into(self, reqs: List[Req], token_pool: torch.Tensor) -> None:
         """Draft k tokens per request into token_pool after its pending token at cached_len."""
-        rows = make_device_tensor([r.table_idx for r in reqs], torch.int64, self.device)
-        cols = make_device_tensor([r.cached_len for r in reqs], torch.int64, self.device)
+        # both index rows in one host-to-device copy
+        rows, cols = make_device_tensor([[r.table_idx for r in reqs], [r.cached_len for r in reqs]], torch.int64, self.device).unbind(0)
         self._proposal = self.proposer.propose(reqs, rows, token_pool[rows, cols])
         cols = cols.unsqueeze(1) + 1 + torch.arange(self.k, device=self.device)
         token_pool[rows.unsqueeze(1), cols] = self._proposal.draft_token_ids.to(token_pool.dtype)
