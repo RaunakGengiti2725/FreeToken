@@ -1202,11 +1202,12 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
               ("offload", 4): [102.0, 195.0], ("hybrid", 4): [100.0, 190.0]}
     started = []
 
-    def time_candidate(args, argv, strategy, depth, floors=None, ready_s=None):
+    def time_candidate(args, argv, strategy, depth, floors=None, ready_s=None, token_map=None):
+        depth = f"{depth}map" if token_map else depth
         started.append((strategy, depth))
         if (strategy, depth) not in speeds:
             raise RuntimeError("server exited with code 1 during startup")
-        return {"tok_s": [[v, v] for v in speeds[strategy, depth]], "drafts": 100 * (depth or 0), "early": speeds[strategy, depth], "cache_slots": 40,
+        return {"tok_s": [[v, v] for v in speeds[strategy, depth]], "drafts": 100 if depth else 0, "early": speeds[strategy, depth], "cache_slots": 40,
                 "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": _ROW_FREE, "ready_s": 1.0}
 
     def starts(args, argv):
@@ -1301,6 +1302,38 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     # a typed strategy is not asked about and stays, and typed drafts leave nothing to time
     assert starts(*parsed("--moe-strategy", "hybrid", "--memory-ratio", "0.75"))[1] == 4 and started[-1] == ("hybrid", 0)
     assert starts(*parsed("--speculative-algorithm", "off", "--memory-ratio", "0.75")) == ({}, 0)
+    # a draft token map for this checkpoint in the store, with the manifest its builder wrote: 5 drafts with it are a
+    # candidate, timed right after the static choice, and the choice carries the map
+    import hashlib
+
+    map_path = calibrate.token_map_path(str(decode_rows.model))
+    assert os.path.dirname(os.path.dirname(map_path)) == str(decode_rows.tmp) and not map_path.startswith(str(decode_rows.model))
+    os.makedirs(os.path.dirname(map_path))
+
+    def store_map(data, recorded=None):
+        with open(map_path, "wb") as f:
+            f.write(data)
+        with open(map_path + ".json", "w") as f:
+            json.dump({"map_sha256": recorded or hashlib.sha256(data).hexdigest()}, f)
+
+    store_map(b"\x01\x00\x00\x00\x02\x00\x00\x00")
+    speeds["fused", "5map"] = [140.0, 240.0]
+    mapped, mapped_argv = parsed("--memory-ratio", "0.76")
+    with_map = {"moe_strategy": "fused", "speculative_num_steps": 5, "preset_fields": measured_depth, "speculative_token_map": map_path}
+    assert starts(mapped, mapped_argv) == (with_map, 5)
+    assert started[-5:] == [("fused", 3), ("fused", "5map"), ("fused", 4), ("fused", 5), ("fused", 0)]
+    assert starts(mapped, mapped_argv) == (with_map, 0)
+    flags = calibrate.child_flags(mapped_argv, 5, map_path)
+    assert flags[-6:] == ["--preset", "single", "--speculative-num-steps", "5", "--speculative-token-map", map_path]
+    # another map is another candidate, timed again; a file that is not the one its manifest describes is not timed,
+    # and a map on the command line is every server's, not a candidate
+    store_map(b"\x01\x00\x00\x00\x03\x00\x00\x00")
+    assert starts(mapped, mapped_argv) == (with_map, 5)
+    store_map(b"\x01\x00\x00\x00\x04\x00\x00\x00", recorded="0" * 64)
+    assert starts(*parsed("--memory-ratio", "0.77"))[1] == 4 and ("fused", "5map") not in started[-4:]
+    store_map(b"\x01\x00\x00\x00\x04\x00\x00\x00")
+    assert starts(*parsed("--memory-ratio", "0.78", "--speculative-token-map", map_path))[1] == 4
+    os.rename(map_path, map_path + ".off")  # no map from here on
     static_strategy[0] = "offload"
     # a calibration has 300 s. A candidate is started only while 1.1 times the longest one so far still fits: at 100 s a
     # candidate that is two, the static choice and the other strategy; what was not started is not timed on a later start
@@ -1342,6 +1375,84 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     assert starts(third, third_argv) == ({}, 0)
 
 
+def test_token_map_builder_refuses_benchmark_text_and_records_what_it_counted(tmp_path, monkeypatch):
+    import hashlib
+    import importlib.util
+    from pathlib import Path
+
+    import numpy as np
+
+    from freetoken.moe import calibrate
+
+    spec = importlib.util.spec_from_file_location("make_token_map", Path(__file__).parents[2] / "scripts" / "make_token_map.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    for path, text, marked in (
+        ("notes/gsm8k_train.txt", "", "gsm8k"), ("data/test.jsonl", "", "named test"), ("src/math.py", "", "math"),
+        ("benchmarks/prompts.txt", "", "benchmarks"), ("a.txt", "From AIME 2025, problem 3", "AIME"), ("a.txt", "the MMLU score", "MMLU"),
+        ("a.txt", "so she has 42 left\n#### 42\n", "answer mark"), ("a.txt", "see cais/mmlu", "mmlu"),
+        # words that only contain a name, test code, and the built-in prompt's kind are not marks
+        ("tests/test_plan.py", "we claimed it and aimed high", None), ("src/mathutils.py", "#### a heading", None),
+        ("answers.jsonl", '{"kind": "math", "content": "x"}', None),
+    ):
+        why = tool.benchmark_mark(path, text)
+        assert (why is None) if marked is None else (marked in why), (path, text, why)
+
+    class Tokenizer:  # one token a character, 64 ids, three of them special
+        all_special_ids = [0, 1]
+
+        def __len__(self):
+            return 64
+
+        def get_added_vocab(self):
+            return {"<think>": 2}
+
+        def encode(self, text, add_special_tokens=False):
+            return [3 + ord(c) % 61 for c in text]
+
+    monkeypatch.setattr(tool, "load_tokenizer", lambda model: Tokenizer())
+    model = tmp_path / "model"
+    model.mkdir()
+    answers, prose, corpus = tmp_path / "answers.jsonl", tmp_path / "prose.txt", tmp_path / "corpus"
+    answers.write_text('{"name": "p1", "content": "zz", "reasoning_content": "z"}\n{"name": "p2", "error": "timeout"}\n')
+    prose.write_text("a" * 50)
+    (corpus / "pkg").mkdir(parents=True)
+    (corpus / "pkg" / "clean.py").write_text("bbb")
+    (corpus / "pkg" / "aime.py").write_text("ccccccc")  # a benchmark's by its name: left out and listed
+    (corpus / "pkg" / "notes.md").write_text("as in GSM8K")  # and by its text
+    out = tmp_path / "map.bin"
+    run = [str(model), "--strategy", "topk", "--size", "7", "--answers", str(answers), "--text", str(prose), "--corpus", str(corpus)]
+    assert tool.main([*run, "-o", str(out)]) == 0
+    ids = np.fromfile(out, dtype="<i4").tolist()
+    tok = Tokenizer().encode
+    # the special ids, then the tokens of the checkpoint's own replies (z, and the line break between its two strings)
+    # before any other text, however much of that there is
+    assert ids == [0, 1, 2, tok("z")[0], tok("\n")[0], tok("a")[0], tok("b")[0]]
+    manifest = json.loads((tmp_path / "map.bin.json").read_text())
+    assert manifest["map_sha256"] == hashlib.sha256(out.read_bytes()).hexdigest() and manifest["size"] == 7
+    assert [(Path(f["path"]).name, f["role"], f["tokens"]) for f in manifest["corpus"]] == [("answers.jsonl", "answers", 4), ("prose.txt", "text", 50), ("clean.py", "corpus", 3)]
+    assert all(f["sha256"] == hashlib.sha256(Path(f["path"]).read_bytes()).hexdigest() for f in manifest["corpus"])
+    assert sorted(Path(r["path"]).name for r in manifest["refused"]) == ["aime.py", "notes.md"] and manifest["checks"] == tool.CHECKS
+    before = manifest["corpus_sha256"]
+    prose.write_text("a" * 51)
+    tool.main([*run, "-o", str(out)])
+    assert json.loads((tmp_path / "map.bin.json").read_text())["corpus_sha256"] != before  # another corpus, another hash
+    # a file named on the command line that is a benchmark's ends the run, and no map is written
+    marked = tmp_path / "gsm8k_sample.txt"
+    marked.write_text("Natalia sold clips")
+    with pytest.raises(SystemExit):
+        tool.main([str(model), "--strategy", "topk", "--size", "6", "--text", str(marked), "-o", str(tmp_path / "bad.bin")])
+    assert not (tmp_path / "bad.bin").exists()
+    # --store writes where the calibration looks, with the manifest it asks for
+    monkeypatch.setenv("FREETOKEN_BENCHDECODE_PATH", str(tmp_path / "store" / "profile.json"))
+    args = SimpleNamespace(speculative_token_map=None, model_path=str(model))
+    assert calibrate.stored_token_map(args) is None
+    assert tool.main([*run, "--store"]) == 0
+    stored = calibrate.token_map_path(str(model))
+    assert calibrate.stored_token_map(args) == (stored, hashlib.sha256(Path(stored).read_bytes()).hexdigest())
+    assert Path(stored).parent == tmp_path / "store" / "token_maps"
+
+
 def test_a_signal_during_calibration_stops_the_candidates_server_and_ends_the_launcher():
     import signal
     import subprocess
@@ -1368,7 +1479,7 @@ def test_a_signal_during_calibration_stops_the_candidates_server_and_ends_the_la
     def theirs(signum, frame):
         outer.append(signum)
 
-    todo = [("offload@3", "offload", 3), ("hybrid@3", "hybrid", 3)]
+    todo = [("offload@3", "offload", 3, None), ("hybrid@3", "hybrid", 3, None)]
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         del servers[:]
         before = signal.signal(sig, theirs)  # what the launcher had: it is back afterwards, and pytest outlives a launcher without the fix

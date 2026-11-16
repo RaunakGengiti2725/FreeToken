@@ -115,7 +115,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does, [performa
 | `--speculative-algorithm`, `--spec-algo` | off | Draft method; `off` keeps it off under a [preset](#presets). `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF or GGUF checkpoints, and Qwen3.8-Flash-Next HF or GGUF; Gemma-4 (dense, E2B / E4B and MoE) keeps no draft in the target file and drafts from an `mtp-*.gguf` assistant sidecar (architecture `gemma4-assistant`) given with `--speculative-draft-model-path` / `--spec-draft-model`. `dflash` drafts a block of tokens per step with a DFlash 2 draft checkpoint over the target's layer outputs, for the Qwen3.5 / Qwen3.6 / Qwen3.8 family and Qwen3.8-Flash-Next: `incoai/Qwen3.8-27B-DFlash2` for Qwen3.8-27B, `incoai/Qwen3.6-35B-A3B-DFlash2` for Qwen3.6-35B-A3B, `incoai/Qwen3.8-Flash-Next-DFlash2` for Qwen3.8-Flash-Next |
 | `--speculative-num-steps`, `--spec-num-steps` | the method's default (3 for `mtp`, the draft's `block_size` - 1 for `dflash`) | Draft tokens per decode step, 1 to 8 for `mtp`; 1 to the draft's `block_size` - 1 for `dflash` |
 | `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from. A Qwen3.8-Flash-Next target also takes a Strata MTP pack (a GGUF that keeps the checkpoint's `mtp.*` tensors under their HF names), and a Qwen3.8-Flash-Next GGUF target needs one; a Qwen3.5 / Qwen3.6 GGUF target drafts from its own `nextn` MTP block (the block llama.cpp keeps after the last decoder layer), or from an `mtp-*.gguf` sidecar of the same model (unsloth's `MTP/` releases) given here; for `mtp`, a separate checkpoint folder is an HF-target option, read with the target's quantization config, and a GGUF target refuses a folder draft. `dflash` requires it: the DFlash 2 draft checkpoint (bf16 safetensors with its `config.json`), whose `target_layer_ids`, `num_target_layers`, hidden size and vocabulary must match the target |
-| `--speculative-token-map`, `--spec-token-map` | off | `mtp` only. A file of distinct little-endian int32 token ids (`python scripts/make_token_map.py MODEL` writes one): the draft computes its logits over those LM head rows alone, from a copy made at startup whose size is logged. That VRAM comes out of the expert cache when `--moe-cache-auto` sizes it (the default for hybrid and offload without a cache size), and out of the KV cache otherwise. The target still verifies over the whole vocabulary, so the output distribution does not depend on the file, only the acceptance rate does. A tied or block-FP8 LM head is refused |
+| `--speculative-token-map`, `--spec-token-map` | off | `mtp` only. A file of distinct little-endian int32 token ids (`python scripts/make_token_map.py MODEL` writes one, from token ids in order or from text: the checkpoint's own replies, text files, a directory of code and prose; it writes a manifest of what it counted beside the map and refuses a file whose name or text marks it as a benchmark's, since a map built from a test set's tokens raises the acceptance on that test set only): the draft computes its logits over those LM head rows alone, from a copy made at startup whose size is logged. That VRAM comes out of the expert cache when `--moe-cache-auto` sizes it (the default for hybrid and offload without a cache size), and out of the KV cache otherwise. The target still verifies over the whole vocabulary, so the output distribution does not depend on the file, only the acceptance rate does. A tied or block-FP8 LM head is refused |
 
 Speculative decoding needs `--tp 1` and runs without overlap scheduling; a target with sliding-window KV is served only by the Gemma-4 assistant, which reads the target's cache through a read-only view; every other target with sliding-window KV is refused at startup, and so is every target with DSV4 window-tier KV. The Gemma-4 assistant keeps no KV of its own: it reads the target's cache, so it adds nothing to the KV budget and its weights cost about 149 MiB for the E4B draft, about 425-428 MiB for the 12b and 26B-A4B Q8_0 ones. `mtp` refuses an FTW checkpoint as the draft source, since FTW drops the `mtp.*` tensors, and a Qwen3.5 / Qwen3.6 GGUF converted without its MTP layer (llama.cpp `--no-mtp`) when no `mtp-*.gguf` sidecar is given: such a trunk has no draft of its own to read, while a `--no-mtp` trunk plus a sidecar works (the trunk config's shapes, the sidecar's weights).
 
@@ -189,18 +189,25 @@ otherwise the static preset's choice runs, with `--moe-strategy` as the command 
 strategy and the number of draft tokens are chosen together by that one rule; a depth is not chosen
 per prompt.
 
+A draft token map is one more candidate where the calibration's store holds one for the checkpoint:
+5 draft tokens with the map, per strategy. The store is the directory of the decode profile, and
+`python scripts/make_token_map.py MODEL --store ...` writes the map there under the checkpoint's
+fingerprint with its manifest; a file whose manifest is missing or names another sha256 is not timed.
+A `--speculative-token-map` on the command line is not a candidate: every server then has that map.
+No map is shipped: one has to be built for the checkpoint, from text that no benchmark uses.
+
 The calibration runs before the server loads and has 300 seconds. Every candidate is a model load,
 because a running server cannot change its strategy or its draft depth, so the candidates are timed
 in a fixed order and only as many as fit: the static choice, the other strategy with 3 draft
-tokens, then 4, 5 and no draft tokens for the strategy that is ahead of those two, then for the
-other one. A candidate is started only while 1.1 times the longest candidate so far still fits in
+tokens, then 5 draft tokens with the map (where there is one), 4, 5 and no draft tokens for the
+strategy that is ahead of those two, then for the other one. A candidate is started only while 1.1 times the longest candidate so far still fits in
 what is left, and its server is stopped if it is not ready with time left for its requests. On a machine that loads the model in 80
 seconds that is two or three candidates; the log names the ones that were not started, and prints
 the time (`calibration took N s`). A candidate that was not started is not chosen and is not timed
 on a later start. A strategy or a speculative setting given on the command line is not
 timed, and a checkpoint that drafts nothing is timed for the strategy alone (two model loads).
 Where the static preset serves the experts resident, `fused` is every candidate's strategy and only
-the four draft settings are timed: with every expert on the GPU `hybrid` has
+the draft settings are timed: with every expert on the GPU `hybrid` has
 nothing to compute on the CPU. Where the static preset dropped its drafts for the size of an
 `offload` cache (above), that is the static choice, and `offload` is not timed with drafts.
 SIGTERM, SIGHUP or Ctrl-C during the calibration stops the candidate's server and ends the launcher

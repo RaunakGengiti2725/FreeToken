@@ -9,19 +9,23 @@ With t(c, p, k) the tok/s of candidate c on prompt p in pass k, and s the static
     lead(c) is none where t(c, p, k) < t(s, p, k) for any prompt p and pass k
 
 The candidate with the largest lead runs, if that lead is above MARGIN; otherwise the static choice runs; of two equal
-leads the candidate timed first has it. The strategy and the draft depth are chosen together by this one rule: a
+leads the candidate that comes first in candidates() has it. The strategy and the draft depth are chosen together by this one rule: a
 depth is not chosen per prompt. (The lead was first the smallest single pass's: on a 16 GB card that kept offload
 over a hybrid that led by 25% to 36% in three passes and 9.7% in one.)
 
+A draft token map is one more candidate where a file for this checkpoint is in the store (token_map_path, written
+by scripts/make_token_map.py --store with a manifest that names its corpus): MAP_DEPTH draft tokens with the map,
+per strategy. A --speculative-token-map on the command line is not a candidate: every server then has that map.
+
 The candidates are timed in a fixed order, inside BUDGET_S seconds: the static choice, the other strategy at the
-static choice's depth, then the other depths (4, 5, none) of the strategy that is ahead of the two, then those of
-the other strategy. One strategy is ahead of the other by the rule above with a margin of 0. A candidate is started
-only if the time used so far plus SLACK times the longest candidate so far is within the budget, and its server
-must be ready while the longest time a candidate so far took after its load still fits; the candidates not started
-or not ready in time are not chosen, and a later start does not time them (--calibrate-again does, inside a budget
-of its own). The draft depth cannot be changed in a running
-server (its verify graphs and buffers are built for one depth), so every candidate is a model load, and on a box
-that loads in 80 s the budget holds two or three of them.
+static choice's depth, then the other settings (5 with the map, 4, 5, none) of the strategy that is ahead of the
+two, then those of the other strategy. One strategy is ahead of the other by the rule above with a margin of 0. A
+candidate is started only if the time used so far plus SLACK times the longest candidate so far is within the
+budget, and its server must be ready while the longest time a candidate so far took after its load still fits; the
+candidates not started or not ready in time are not chosen, and a later start does not time them
+(--calibrate-again does, inside a budget of its own). The draft depth cannot be changed in a running server (its
+verify graphs and buffers are built for one depth), so every candidate is a model load, and on a box that loads in
+80 s the budget holds two or three of them.
 
 A dimension the command line fixed (--moe-strategy, --speculative-algorithm) is not a candidate. Where the static
 preset serves every expert resident (fused: they fit on the GPU), fused is the only strategy and the depths are what
@@ -38,6 +42,7 @@ runs and one log line says why. The servers are started and timed by `ft bench d
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -68,6 +73,7 @@ MARGIN = 0.10
 READY_S = 900             # the longest a candidate's server may take to load
 PROMPTS = ("math", "code")
 DEPTHS = (3, 4, 5, 0)     # the static preset's first
+MAP_DEPTH = 5             # draft tokens of the candidate with a draft token map
 _VERSION = 4
 _now, _sleep = time.monotonic, time.sleep
 
@@ -75,18 +81,50 @@ _now, _sleep = time.monotonic, time.sleep
 _DROPPED = ("--model-path", "--model", "--host", "--port", "--api-key", "--moe-strategy", "--moe-backend", "--preset")
 
 
-def candidates(args, fused: bool = False) -> list[tuple[str, str, int | None]]:
-    """(name, strategy, depth) of every candidate, the static preset's choice first. A depth of None leaves
-    speculative decoding as the command line set it. ``fused``: the static preset takes fused (_static_strategy)."""
+def token_map_path(model_path: str) -> str:
+    """Where the calibration looks for a draft token map of this checkpoint: in the directory of the decode profile,
+    under the checkpoint's fingerprint. Not in the checkpoint's folder, where a .bin file would change that fingerprint."""
+    store = os.path.dirname(decode_profile._path(None, None))
+    return os.path.join(store, "token_maps", decode_profile.model_fingerprint(model_path) + ".bin")
+
+
+def stored_token_map(args) -> tuple[str, str] | None:
+    """(path, sha256) of the draft token map to time as a candidate, or None: the command line names a map itself, the
+    store holds none for this checkpoint, or the file is not the one its manifest (<path>.json) describes."""
+    if args.speculative_token_map:
+        return None
+    path = token_map_path(args.model_path)
+    try:
+        with open(path, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+        with open(path + ".json") as f:
+            recorded = json.load(f).get("map_sha256")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if recorded != sha:
+        logger.warning(f"--preset {PRESET}: {path} is not the map its manifest describes (sha256 {sha[:12]}, recorded {str(recorded)[:12]}): not timed")
+        return None
+    return path, sha
+
+
+def candidates(args, fused: bool = False, token_map: str | None = None) -> list[tuple[str, str, int | None, str | None]]:
+    """(name, strategy, depth, token map) of every candidate, the static preset's choice first. A depth of None leaves
+    speculative decoding as the command line set it. ``fused``: the static preset takes fused (_static_strategy).
+    ``token_map``: the store's map for this checkpoint (stored_token_map), timed at MAP_DEPTH draft tokens."""
     left = args.preset_fields
     if "moe_strategy" not in left:
         strategies = [args.moe_strategy]
     else:
         strategies = ["fused"] if fused else ["offload", "hybrid"]
     depths = DEPTHS if "speculative_algorithm" in left and "speculative_num_steps" in left else (None,)
-    # the order they are timed in when the first strategy stays ahead (_measure): the strategies at the static depth first
-    pairs = [(s, depths[0]) for s in strategies] + [(s, d) for s in strategies for d in depths[1:]]
-    return [(f"{s}@{'set' if d is None else d}", s, d) for s, d in pairs]
+    # the order they are timed in when the first strategy stays ahead (_measure): the strategies at the static depth
+    # first; then the map, the one setting seen ahead of the static choice before (5 drafts and a 32K map, on a full card)
+    out = [(f"{s}@{'set' if d is None else d}", s, d, None) for s in strategies for d in depths[:1]]
+    for s in strategies:
+        if token_map and len(depths) > 1:
+            out.append((f"{s}@{MAP_DEPTH}map", s, MAP_DEPTH, token_map))
+        out += [(f"{s}@{d}", s, d, None) for d in depths[1:]]
+    return out
 
 
 def choose(tok_s: dict, names: list[str], margin: float = MARGIN) -> tuple[str, float]:
@@ -170,8 +208,9 @@ def _static_strategy(args, argv: list[str]) -> str | None:
         return None
 
 
-def child_flags(argv: list[str], depth: int | None) -> list[str]:
-    """The flags of a candidate's server: the command line without what the bench sets, as the static preset, at ``depth``."""
+def child_flags(argv: list[str], depth: int | None, token_map: str | None = None) -> list[str]:
+    """The flags of a candidate's server: the command line without what the bench sets, as the static preset, at
+    ``depth``, with ``token_map`` as its draft token map."""
     out, skip = [], False
     for arg in argv:
         if skip:
@@ -185,8 +224,10 @@ def child_flags(argv: list[str], depth: int | None) -> list[str]:
     out += ["--preset", "single"]
     if depth == 0:
         out += ["--speculative-algorithm", "off"]
-    elif depth is not None and depth != DEPTHS[0]:
+    elif depth is not None and (depth != DEPTHS[0] or token_map):
         out += ["--speculative-num-steps", str(depth)]
+    if token_map:
+        out += ["--speculative-token-map", token_map]
     return out
 
 
@@ -205,7 +246,8 @@ class _Slower(RuntimeError):
     """The bench stopped a candidate that started under half the static choice's speed: a result, not a failure."""
 
 
-def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, floors: list[float] | None = None, ready_s: float = READY_S) -> dict:
+def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, floors: list[float] | None = None, ready_s: float = READY_S,
+                    token_map: str | None = None) -> dict:
     """One server start of a candidate through the bench's own code: its tok/s per prompt and pass, and what it ran with.
     Raises RuntimeError when the server does not start within ``ready_s`` seconds or does not answer, or when a request
     starts below its prompt's tok/s in ``floors`` (the bench then stops it: such a candidate cannot be the one chosen)."""
@@ -216,7 +258,7 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
         # the rounding mode the real server will run (moe/offload_kernels.py reads the same variable)
         arm = f"hybrid:{(os.getenv('FREETOKEN_HYBRID_FETCH_ROUND') or 'min-wait').strip().lower()}"
     bench_argv = ["--model", args.model_path, "--seeds", str(PASSES), "--warm", str(WARM), "--decode", str(DECODE), "--streams", "1",
-                  "--no-write", "--server-timeout", str(int(ready_s)), "--", *child_flags(argv, depth)]
+                  "--no-write", "--server-timeout", str(int(ready_s)), "--", *child_flags(argv, depth, token_map)]
     try:
         ns, extra = benchdecode.parse_args(bench_argv, "ft serve --preset " + PRESET)
     except SystemExit as exc:
@@ -275,27 +317,27 @@ def _stopping_on_signals():
             signal.signal(sig, signal.SIG_DFL if handler is None else handler)
 
 
-def measure(args, argv: list[str], todo: list[tuple[str, str, int | None]]) -> dict:
+def measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str | None]]) -> dict:
     """Time ``todo`` (the static choice first) and return the row. Raises RuntimeError when the static choice cannot be timed."""
     with _stopping_on_signals():
         return _measure(args, argv, todo)
 
 
-def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None]]) -> dict:
+def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str | None]]) -> dict:
     t0 = _now()
     # failed: did not start or answer, timed again on the next start. skipped: left out for a reason that holds then too
     tok_s, failed, skipped, wall = {}, {}, {}, {}
     first, tail = None, 0.0  # tail: the longest a candidate took after its server was ready (its requests and its stop)
     # the strategies at the static choice's depth, then the other depths, those of the strategy that is ahead first
-    heads = [c for c in todo if c[2] == todo[0][2]]
-    queue, rest = list(heads), [c for c in todo if c[2] != todo[0][2]]
+    heads = [c for c in todo if c[2] == todo[0][2] and c[3] is None]
+    queue, rest = list(heads), [c for c in todo if c not in heads]
     while queue or rest:
         if not queue:
             ahead = choose(tok_s, [c[0] for c in heads], margin=0.0)[0]
             leader = next(c[1] for c in heads if c[0] == ahead)
             queue, rest = sorted(rest, key=lambda c: c[1] != leader), []
-        name, strategy, depth = queue.pop(0)
-        if first is not None and not first["drafts"] and depth != todo[0][2] and not first.get("no_drafts"):
+        name, strategy, depth, token_map = queue.pop(0)
+        if first is not None and not first["drafts"] and (depth != todo[0][2] or token_map) and not first.get("no_drafts"):
             # the static choice drafted nothing: this checkpoint has no MTP layers, and every depth is the same server
             skipped[name] = "the checkpoint drafts nothing"
             continue
@@ -314,7 +356,7 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None]]) -> 
             floors = [0.5 * e for e in first["early"]] if first is not None and all(first.get("early") or [None]) else None
             # the static choice may take as long as any server to load; the others must be ready with time left for their requests
             ready_s = READY_S if first is None else max(1.0, min(READY_S, BUDGET_S - (began - t0) - tail))
-            r = _time_candidate(args, argv, strategy, depth, floors, ready_s=ready_s)
+            r = _time_candidate(args, argv, strategy, depth, floors, ready_s=ready_s, **({"token_map": token_map} if token_map else {}))
         except RuntimeError as exc:
             if first is None:
                 raise
@@ -372,7 +414,7 @@ def _memory_objection(row: dict, free: int | None, memory_ratio: float) -> str |
     return None
 
 
-def _overrides(args, strategy: str, depth: int | None, static: bool = False) -> dict:
+def _overrides(args, strategy: str, depth: int | None, static: bool = False, token_map: str | None = None) -> dict:
     """The fields of ``args`` that make it run the candidate. The ``static`` choice leaves the strategy as the
     command line did: --moe-strategy auto then resolves as it does for --preset single (a filed decode row, a
     unified-memory GPU), which an explicit offload would bypass."""
@@ -392,6 +434,8 @@ def _overrides(args, strategy: str, depth: int | None, static: bool = False) -> 
         if depth != DEPTHS[0] and not static:
             # timed with the depth on its command line, which the static preset's rule for small caches leaves alone
             out["preset_fields"] = tuple(n for n in args.preset_fields if n != "speculative_num_steps")
+    if token_map:
+        out["speculative_token_map"] = token_map
     return out
 
 
@@ -404,8 +448,10 @@ def measured_choice(args, argv: list[str]) -> dict:
         logger.info(f"--preset {PRESET}: running the static preset ({reason})")
         return {}
 
-    todo = candidates(args)
-    names = [name for name, _, _ in todo]
+    stored = stored_token_map(args)
+    token_map, map_sha = stored or (None, None)
+    todo = candidates(args, token_map=token_map)
+    names = [c[0] for c in todo]
     if len(todo) == 1:
         return static("the command line sets the strategy and the speculative decoding: nothing to measure")
     if args.tp_info.size > 1 or args.shell_mode:
@@ -415,12 +461,15 @@ def measured_choice(args, argv: list[str]) -> dict:
     try:
         gpu_name, gpu_uuid, free = _probe_gpu(args)
         if "moe_strategy" in args.preset_fields and _static_strategy(args, argv) == "fused":
-            todo = candidates(args, fused=True)
-            names = [name for name, _, _ in todo]
+            todo = candidates(args, fused=True, token_map=token_map)
+            names = [c[0] for c in todo]
             if len(todo) == 1:
                 return static("every expert fits on the GPU and the command line sets the speculative decoding: nothing to measure")
         # the candidates are part of the setup: a command line that fixes one of them is timed for itself
         key = f"{_decode_decision_key(args)}|calibration={_VERSION}:{','.join(names)}"
+        if any(c[3] for c in todo):
+            key += f"|map={map_sha[:12]}"  # another map is another candidate
+            logger.info(f"--preset {PRESET}: {MAP_DEPTH} draft tokens with the draft token map {token_map} (sha256 {map_sha[:12]}) are a candidate")
         stamp = decode_profile.stamp(gpu_name, gpu_uuid)
         row, reason = decode_profile.lookup(key, gpu_name=gpu_name, gpu_uuid=gpu_uuid, now=stamp, well_formed=_usable)
         failed_before = set(row.get("failed", {})) if row is not None else set()
@@ -435,6 +484,8 @@ def measured_choice(args, argv: list[str]) -> dict:
             )
             # the launcher's own reading of the free memory: a later start compares its reading with this one
             row = {**measure(args, argv, todo), "stamp": stamp, "gpu_free_bytes": free}
+            if any(c[3] for c in todo):
+                row["token_map"] = {"path": token_map, "sha256": map_sha}
             for again in failed_before & set(row["failed"]):
                 # a second failure in a row is not a passing one: later starts do not time for it again
                 row["skipped"][again] = "failed twice: " + row["failed"].pop(again)
@@ -454,7 +505,7 @@ def measured_choice(args, argv: list[str]) -> dict:
         name, lead = choose(row["tok_s"], names)
     except (RuntimeError, OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError) as exc:
         return static(f"the calibration failed: {type(exc).__name__}: {str(exc).splitlines()[0][:300] if str(exc) else ''}")
-    _, strategy, depth = todo[names.index(name)]
+    _, strategy, depth, token_map = todo[names.index(name)]
     timed = ", ".join(f"{n} {'/'.join(f'{sum(col) / len(col):.0f}' for col in row['tok_s'][n])}" for n in names if n in row["tok_s"])
     if name != names[0]:
         why = f"its lead over {names[0]} on its worse prompt (the passes' mean) is {lead:+.1%}"
@@ -466,4 +517,4 @@ def measured_choice(args, argv: list[str]) -> dict:
     if untimed := "; ".join(f"{n} ({left[n]})" for n in names if n in left):
         timed += f"; not timed: {untimed}"
     logger.info(f"--preset {PRESET}: {took}; mean tok/s on {'/'.join(PROMPTS)}: {timed}; taking {name}: {why}")
-    return _overrides(args, strategy, depth, static=name == names[0])
+    return _overrides(args, strategy, depth, static=name == names[0], token_map=token_map)
