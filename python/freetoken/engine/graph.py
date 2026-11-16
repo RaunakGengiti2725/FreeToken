@@ -221,14 +221,7 @@ class GraphRunner:
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
             graph = torch.cuda.CUDAGraph()
-            batch = Batch(reqs=[self.dummy_req] * bs, phase=self.phase, rows_per_req=self.rows_per_req)
-            batch.padded_reqs = batch.reqs
-            if self.batch_hook is not None:
-                self.batch_hook(batch)
-            self.attn_backend.prepare_for_capture(batch)
-            self.buffer.set_batch(batch)
-            if self.linear_backend is not None:
-                self.linear_backend.prepare_for_capture(batch)
+            batch = self._capture_batch(bs)
             with get_global_ctx().forward_batch(batch, **self.ctx_override):
                 self._store_output(bs, self.forward())
                 # Keep the offload cache warmed for capture. Resetting here forces
@@ -246,6 +239,39 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
+    def _capture_batch(self, bs: int) -> Batch:
+        """The batch a graph of ``bs`` requests is captured on: the dummy request in every row, on the static buffers."""
+        batch = Batch(reqs=[self.dummy_req] * bs, phase=self.phase, rows_per_req=self.rows_per_req)
+        batch.padded_reqs = batch.reqs
+        if self.batch_hook is not None:
+            self.batch_hook(batch)
+        self.attn_backend.prepare_for_capture(batch)
+        self.buffer.set_batch(batch)
+        if self.linear_backend is not None:
+            self.linear_backend.prepare_for_capture(batch)
+        return batch
+
+    def capture_with_tail(self, tail: Callable[[int, Any], None]) -> Dict[int, torch.cuda.CUDAGraph]:
+        """A second graph per captured batch size: ``forward`` on this runner's buffers and outputs, then ``tail(bs, out)`` outside the forward's batch context. ``replay`` takes the returned map."""
+        graphs: Dict[int, torch.cuda.CUDAGraph] = {}
+        for bs in sorted(self.graph_map, reverse=True):
+            batch = self._capture_batch(bs)
+            # once outside the graph, as the forward's own capture runs it
+            self._forward_then(batch, tail)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self.graph_pool, stream=self.stream):
+                self._forward_then(batch, tail)
+            _upload_graph(graph, self.stream)
+            self._reset_moe_offload_cache()
+            graphs[bs] = graph
+        return graphs
+
+    def _forward_then(self, batch: Batch, tail: Callable[[int, Any], None]) -> None:
+        with get_global_ctx().forward_batch(batch, **self.ctx_override):
+            out = self.forward()
+            self._store_output(batch.size, out)
+        tail(batch.size, out)
+
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return (
             batch.phase == self.phase
@@ -253,11 +279,12 @@ class GraphRunner:
             and batch.size <= self.max_graph_bs
         )
 
-    def replay(self, batch: Batch) -> Any:
+    def replay(self, batch: Batch, graph_map: Dict[int, torch.cuda.CUDAGraph] | None = None) -> Any:
+        """``graph_map``: the graphs of ``capture_with_tail`` to replay in place of the forward's own."""
         assert self.can_use_cuda_graph(batch) and self._out is not None
         self.buffer.copy_from(batch)
         padded = batch.padded_size
-        g = self.graph_map[padded]
+        g = (graph_map or self.graph_map)[padded]
         self.attn_backend.prepare_for_replay(batch)
         if self.linear_backend is not None:
             self.linear_backend.prepare_for_replay(batch)

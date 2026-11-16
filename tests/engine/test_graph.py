@@ -1,4 +1,4 @@
-"""GraphRunner capture: the forwards run on the dummy request's page, and the MoE offload cache stays warm from the eager run into the capture."""
+"""GraphRunner capture: the forwards run on the dummy request's page, and the MoE offload cache stays warm from the eager run into the capture. A graph with a tail is captured the same way, its tail outside the forward's batch."""
 
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -43,9 +43,14 @@ def test_capture_runs_on_the_dummy_page_with_a_warm_offload_cache(monkeypatch):
 
     dummy = Req(input_ids=torch.zeros(1, dtype=torch.int32), table_idx=1, cached_len=0, output_len=1, uid=-1,
                 sampling_params=None, cache_handle=None)
-    GraphRunner(stream=None, device=torch.device("cpu"), forward=forward,
-                attn_backend=SimpleNamespace(init_capture_graph=noop, prepare_for_capture=noop),
-                cuda_graph_bs=[2], cuda_graph_max_bs=None, free_memory=0, max_seq_len=1, dummy_req=dummy,
-                moe_offload_cache=SimpleNamespace(reset=lambda: events.append("reset")))
+    runner = GraphRunner(stream=None, device=torch.device("cpu"), forward=forward,
+                         attn_backend=SimpleNamespace(init_capture_graph=noop, prepare_for_capture=noop),
+                         cuda_graph_bs=[2], cuda_graph_max_bs=None, free_memory=0, max_seq_len=1, dummy_req=dummy,
+                         moe_offload_cache=SimpleNamespace(reset=lambda: events.append("reset")))
 
     assert events == ["reset", [9, 9], "capture", [9, 9], "captured", "reset", "reset"]
+
+    events.clear()
+    graphs = runner.capture_with_tail(lambda bs, out: events.append(("tail", bs, get_global_ctx()._batch is None)))
+    assert list(graphs) == [2]
+    assert events == [[9, 9], ("tail", 2, True), "capture", [9, 9], ("tail", 2, True), "captured", "reset"]
