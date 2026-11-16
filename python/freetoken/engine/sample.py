@@ -107,6 +107,8 @@ def sample_impl(
 class Sampler:
     device: torch.device
     vocab_size: int
+    # the sampling values of the last batch that had a sampled request and their device tensors: decode steps repeat them, so only a change is copied again
+    _sent: tuple | None = field(default=None, init=False, repr=False)
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
@@ -148,17 +150,21 @@ class Sampler:
             for p, g in zip(params, is_greedy)
         ]
         min_ps = [0.0 if g else p.min_p for p, g in zip(params, is_greedy)]
-        temperatures = make_device_tensor(ts, torch.float32, self.device)
-        top_k, top_p, min_p = None, None, None
-        if any(k != self.vocab_size for k in top_ks):
-            top_k = make_device_tensor(top_ks, torch.int32, self.device)
-        if any(p < 1.0 for p in top_ps):
-            top_p = make_device_tensor(top_ps, torch.float32, self.device)
-        if any(m > 0.0 for m in min_ps):
-            min_p = make_device_tensor(min_ps, torch.float32, self.device)
-        greedy_mask = (
-            make_device_tensor(is_greedy, torch.bool, self.device) if any(is_greedy) else None
-        )
+        values = (ts, top_ks, top_ps, min_ps, is_greedy)
+        if self._sent is None or self._sent[0] != values:
+            temperatures = make_device_tensor(ts, torch.float32, self.device)
+            top_k, top_p, min_p = None, None, None
+            if any(k != self.vocab_size for k in top_ks):
+                top_k = make_device_tensor(top_ks, torch.int32, self.device)
+            if any(p < 1.0 for p in top_ps):
+                top_p = make_device_tensor(top_ps, torch.float32, self.device)
+            if any(m > 0.0 for m in min_ps):
+                min_p = make_device_tensor(min_ps, torch.float32, self.device)
+            greedy_mask = (
+                make_device_tensor(is_greedy, torch.bool, self.device) if any(is_greedy) else None
+            )
+            self._sent = (values, (temperatures, top_k, top_p, min_p, greedy_mask))
+        temperatures, top_k, top_p, min_p, greedy_mask = self._sent[1]
         return BatchSamplingArgs(
             temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, penalties=penalties,
             min_p=min_p, repetition=repetition,
