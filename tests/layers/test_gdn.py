@@ -152,6 +152,25 @@ def test_prefill_decode_and_verify_match_reference(monkeypatch, ratio, output_ga
         torch.testing.assert_close(dec[i].float(), want, rtol=RTOL, atol=ATOL)
 
 
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_prefill_head_norm_is_the_per_head_norm_bit_for_bit(activation, dtype):
+    """A prefill norms the heads of a row as groups of one call and reads the gate where it lies, a column slice of the
+    input projection; decode norms [rows * heads, size] rows of a copy. The row counts cover every row tile of the kernel."""
+    from freetoken.layers import GatedRMSNorm
+
+    heads, lead = 16, 3 * HEAD_DIM
+    norm = GatedRMSNorm(HEAD_DIM, eps=EPS, activation=activation)
+    torch.manual_seed(5)
+    norm.weight = torch.randn(HEAD_DIM, device=DEV).to(dtype)
+    for rows in (1, 2, 3, 16, 37, 128, 1000):
+        x = torch.randn(rows, heads * HEAD_DIM, device=DEV).to(dtype)
+        proj = torch.randn(rows, lead + heads * HEAD_DIM + 2, device=DEV).to(dtype)
+        z = proj[:, lead:lead + heads * HEAD_DIM]
+        per_head = norm.forward(x.reshape(-1, HEAD_DIM), z.reshape(-1, HEAD_DIM)).reshape(rows, -1)
+        assert torch.equal(norm.forward_heads(x, z, heads), per_head), rows
+
+
 def _track_snapshot_and_recomputed(monkeypatch, cached_len: int):
     """A 150-token prefill after ``cached_len`` cached tokens that snapshots its state at its last chunk boundary (128 tokens in), and the state of a request that prefills exactly those 128 tokens from the same cached state.
 

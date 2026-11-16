@@ -235,7 +235,10 @@ class GatedDeltaNet(BaseOP):
             if fla.track_dst is not None:
                 self._write_track_snapshot(pool, li, conv_in, track_state, fla)
 
-        if out is None:
+        if out is None and batch.is_prefill:
+            # z is a column slice of the input projection: per-head rows of it would be a copy of [total, value_dim]
+            out = self.norm.forward_heads(core_out.reshape(total, -1), z.reshape(total, -1), self.num_v_heads)
+        elif out is None:
             core_out = core_out.reshape(-1, self.head_v_dim)
             z = z.reshape(-1, self.head_v_dim)
             out = self.norm.forward(core_out, z).reshape(total, -1)

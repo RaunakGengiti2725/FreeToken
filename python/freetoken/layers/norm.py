@@ -192,6 +192,18 @@ class GatedRMSNorm(BaseOP):
             is_rms_norm=True, norm_before_gate=True, activation=self.activation,
         )
 
+    def forward_heads(self, x: torch.Tensor, z: torch.Tensor, heads: int) -> torch.Tensor:
+        """``forward`` over ``heads`` heads a row: ``x`` and ``z`` are [M, heads * size] and ``z`` keeps any row stride.
+
+        Each head is a group of the same kernel on the same row tile, so a gate that is a column slice of a wider
+        projection is read where it lies; ``forward`` would first copy it into [M * heads, size] rows."""
+        from freetoken.kernel.fla import rms_norm_gated
+
+        return rms_norm_gated(
+            x=x, weight=self.weight.repeat(heads), bias=None, z=z, eps=self.eps, group_size=self.weight.shape[0],
+            is_rms_norm=True, norm_before_gate=True, activation=self.activation, tile_rows=x.shape[0] * heads,
+        )
+
 
 class LayerNorm(BaseOP):
     """LayerNorm with bias on torch's fused kernel; the decoders use the RMSNorm family."""
