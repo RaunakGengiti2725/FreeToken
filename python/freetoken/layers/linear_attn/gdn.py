@@ -6,12 +6,37 @@ import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen, causal_conv1d_verify
+from freetoken.kvcache.linear_state_pool import gdn_rule_tokens
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
 
 # A prefill's chunk kernel reads the values out of the conv output where they lie, a row a value dim, with the
 # operations it runs on a token-major copy. Set FREETOKEN_GDN_VALUES_IN_PLACE=0 to hand it the copy again.
 _VALUES_IN_PLACE = os.getenv("FREETOKEN_GDN_VALUES_IN_PLACE", "1") != "0"
+
+# cu_seqlens of one sequence, a tensor a length: the chunk kernels look their index tensors up by its identity
+_SPAN_CU: dict[tuple[int, torch.device], torch.Tensor] = {}
+
+
+def _span_cu(tokens: int, device: torch.device) -> torch.Tensor:
+    cu = _SPAN_CU.get((tokens, device))
+    if cu is None:
+        if len(_SPAN_CU) >= 64:
+            _SPAN_CU.pop(next(iter(_SPAN_CU)))
+        cu = _SPAN_CU[(tokens, device)] = torch.tensor([0, tokens], dtype=torch.int64, device=device)
+    return cu
+
+
+def _rule_spans(total: int, rule: int, chunk: int) -> list[tuple[int, int]]:
+    """[start, end) of each call of the chunk rule over ``total`` tokens of one request: ``rule`` tokens each (whole
+    kernel chunks, so every call cuts the chunks one call over all of them cuts), the rest in a last call, or joined
+    to the call before it when it is shorter than a kernel chunk: the output kernel tiles a call that short otherwise."""
+    ends = list(range(rule, total + 1, rule))
+    if total - ends[-1] >= chunk:
+        ends.append(total)
+    else:
+        ends[-1] = total
+    return list(zip([0, *ends[:-1]], ends))
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -141,6 +166,23 @@ class GatedDeltaNet(BaseOP):
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
+    def _rule_inputs(self, mixed: torch.Tensor, start: int, end: int, dtype: torch.dtype):
+        """The chunk rule's q, k and values for rows [start, end) of the conv output ``mixed`` [total, conv_dim]: the
+        values as ``v``, or in the conv's own layout as ``value_rows`` (then ``v`` is None)."""
+        n = end - start
+        # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
+        qf, kf, vf = torch.split(mixed[start:end], [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = qf.reshape(1, n, self.num_k_heads, self.head_k_dim).to(dtype)
+        k = kf.reshape(1, n, self.num_k_heads, self.head_k_dim).to(dtype)
+        # the conv output as it is stored, [conv_dim, total]: its last value_dim rows are the values
+        value_rows = mixed.transpose(0, 1)[2 * self.key_dim:] if _VALUES_IN_PLACE else None
+        if value_rows is not None and (value_rows.dtype != dtype or not value_rows.is_contiguous()):
+            value_rows = None
+        if value_rows is not None and n != mixed.shape[0]:
+            value_rows = value_rows[:, start:end].contiguous()
+        v = vf.reshape(1, n, self.num_v_heads, self.head_v_dim).to(dtype) if value_rows is None else None
+        return q, k, v, value_rows
+
     def _norm_in_kernel(self, total: int, dtype: torch.dtype, device: torch.device) -> bool:
         """Whether a decode step of ``total`` rows runs the output norm inside the kernel that updates
         the state, which gives the norm kernel's bits where ``gated_norm_row_tile`` holds."""
@@ -212,18 +254,10 @@ class GatedDeltaNet(BaseOP):
                 core_out = core_out[0]  # [total, num_v, V]
         else:
             from freetoken.kernel.fla import chunk_gated_delta_rule
+            from freetoken.kernel.fla.chunk import CHUNK_SIZE
 
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
-            # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            # the conv output as it is stored, [conv_dim, total]: its last value_dim rows are the values
-            value_rows = mixed.transpose(0, 1)[2 * self.key_dim:] if _VALUES_IN_PLACE else None
-            if value_rows is not None and (value_rows.dtype != dtype or not value_rows.is_contiguous()):
-                value_rows = None
-            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype) if value_rows is None else None
             g, beta = self._gate_params(a, b)
             g = g.reshape(1, total, self.num_v_heads)
             beta = beta.float().reshape(1, total, self.num_v_heads)
@@ -235,13 +269,36 @@ class GatedDeltaNet(BaseOP):
             if fla.track_dst is not None:
                 rec = pool.recurrent_states[li]
                 track_state = torch.empty((fla.cu_seqlens.numel() - 1, *rec.shape[1:]), dtype=torch.float32, device=rec.device)
-            o, _, _ = chunk_gated_delta_rule(
-                q=q, k=k, v=v, g=g, beta=beta, scale=self.head_k_dim ** -0.5,
-                initial_state=pool.recurrent_states[li], initial_state_indices=fla.cache_indices.to(torch.int32),
-                cu_seqlens=fla.cu_seqlens.to(torch.int64), head_first=False,
-                use_qk_l2norm_in_kernel=True, track_state=track_state, value_rows=value_rows,
+            rule = gdn_rule_tokens()
+            # One request, an fp32 state and no graph capture: the rule runs in calls of ``rule`` tokens, so that its
+            # temporaries are a call's and not the forward's. Each call reads the state the one before left in the
+            # slot, unrounded, and cuts the same kernel chunks, so the output and the states are the one call's.
+            sliced = (
+                0 < rule < total and fla.cu_seqlens.numel() == 2 and pool.recurrent_states.dtype == torch.float32
+                and not torch.cuda.is_current_stream_capturing()
             )
-            core_out = o[0]  # [total, num_v_heads, head_v_dim]
+            spans = _rule_spans(total, rule, CHUNK_SIZE) if sliced else [(0, total)]
+            core_out = None
+            for start, end in spans:
+                q, k, v, value_rows = self._rule_inputs(mixed, start, end, dtype)
+                whole = len(spans) == 1
+                o, _, _ = chunk_gated_delta_rule(
+                    q=q, k=k, v=v, g=g if whole else g[:, start:end], beta=beta if whole else beta[:, start:end],
+                    scale=self.head_k_dim ** -0.5,
+                    initial_state=pool.recurrent_states[li], initial_state_indices=fla.cache_indices.to(torch.int32),
+                    cu_seqlens=fla.cu_seqlens.to(torch.int64) if whole else _span_cu(end - start, mixed.device),
+                    head_first=False, use_qk_l2norm_in_kernel=True,
+                    # every call writes the state entering its last kernel chunk: the last call's is the request's
+                    track_state=track_state, value_rows=value_rows,
+                )
+                if whole:
+                    core_out = o[0]  # [total, num_v_heads, head_v_dim]
+                else:
+                    if core_out is None:
+                        core_out = torch.empty((total, *o.shape[2:]), dtype=o.dtype, device=o.device)
+                    core_out[start:end] = o[0]
+                    # freed before the next call makes its own
+                    del q, k, v, value_rows, o
             if fla.track_dst is not None:
                 self._write_track_snapshot(pool, li, conv_in, track_state, fla)
 

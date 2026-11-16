@@ -323,12 +323,15 @@ def _prefill_working_bytes(config) -> tuple[int, int]:
     if group is None or group.variant != "gdn":
         return tokens, 0
     from freetoken.kernel.fla.chunk import CHUNK_SIZE
+    from freetoken.kvcache.linear_state_pool import gdn_rule_tokens
 
     _, _, value_heads, key_heads = _linear_local_dims(group, config.tp_info.size)
     return tokens, prefill_working_bytes(
         tokens, hidden=model.hidden_size, key_dim=key_heads * group.key_head_dim,
         value_dim=value_heads * group.value_head_dim, value_heads=value_heads, head_dim=group.value_head_dim,
         chunk=CHUNK_SIZE, itemsize=config.dtype.itemsize,
+        # the layer cuts the rule into calls only for a forward of one request
+        rule_tokens=gdn_rule_tokens() if config.max_running_req == 1 else 0,
     )
 
 

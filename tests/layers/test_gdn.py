@@ -203,6 +203,127 @@ def test_prefill_values_read_in_place_are_the_copied_values_bit_for_bit(monkeypa
         assert torch.equal(in_place, copied), what
 
 
+def _count_rule_calls(monkeypatch) -> list[int]:
+    """The tokens of every call of the chunk rule from here on."""
+    import freetoken.kernel.fla as fla
+
+    calls, rule = [], fla.chunk_gated_delta_rule
+
+    def counted(**kwargs):
+        calls.append(kwargs["q"].shape[1])
+        return rule(**kwargs)
+
+    monkeypatch.setattr(fla, "chunk_gated_delta_rule", counted)
+    return calls
+
+
+@pytest.mark.parametrize("rule", [64, 192, 2048])
+def test_prefill_chunk_rule_in_calls_of_whole_kernel_chunks_is_the_one_call_bit_for_bit(monkeypatch, rule):
+    """A prefill of one request runs the chunk rule in calls of ``rule`` tokens (gdn_rule_tokens) where it has more.
+    The output, the recurrent and the conv state and the tracked snapshot must be those of one call over all the
+    tokens, for a fresh request and for one continued from its state, at lengths on and off the kernel's chunk and
+    the rule's tokens."""
+    import freetoken.layers.linear_attn.gdn as gdn
+
+    op, _ = _make_layer(2, "silu", seed=11)
+    live, dst = 1, 5
+    calls = _count_rule_calls(monkeypatch)
+
+    def run(per_call: int, length: int, more: int):
+        monkeypatch.setattr(gdn, "gdn_rule_tokens", lambda: per_call)
+        ctx = _ctx(monkeypatch, 2)
+        pool = ctx.linear_state_pool
+        if pool.recurrent_states.dtype != torch.float32:
+            pytest.skip("the recurrent state is not fp32 (FREETOKEN_MAMBA_SSM_DTYPE): the rule stays one call")
+        got, cached = [], 0
+        for step, n in enumerate((length, more)):
+            req = Req(input_ids=torch.zeros(cached + n, dtype=torch.int32), table_idx=live, cached_len=cached,
+                      output_len=1, uid=0, sampling_params=SamplingParams(), cache_handle=None)
+            req.mamba_ping_pong = (dst, dst + 1)
+            batch = Batch(reqs=[req], phase="prefill")
+            batch.padded_reqs = [req]
+            torch.manual_seed(100 + step)
+            calls.clear()
+            with ctx.forward_batch(batch):
+                out = op.forward(torch.randn(n, HIDDEN, device=DEV, dtype=torch.bfloat16))
+            want = [end - start for start, end in gdn._rule_spans(n, per_call, 64)] if 0 < per_call < n else [n]
+            assert calls == want, (per_call, n)
+            got += [out, pool.recurrent_states[0, live].clone(), pool.conv_states[0, live].clone(),
+                    pool.recurrent_states[0, dst:dst + 2].clone(), pool.conv_states[0, dst:dst + 2].clone()]
+            cached += n
+        return got
+
+    names = ("output", "state", "conv state", "tracked state", "tracked conv state")
+    for length in (1, 63, 64, 65, 127, 128, 129, 200, 1000, 2047, 2048, 2049, 2111, 2112, 4160, 5000, 8191, 8192):
+        more = length // 2 + 70
+        one_call, in_calls = run(0, length, more), run(rule, length, more)
+        assert float(one_call[6].float().norm()) > 0
+        for i, (a, b) in enumerate(zip(one_call, in_calls)):
+            assert torch.equal(a, b), (length, "continued " * (i >= 5) + names[i % 5])
+
+
+def test_prefill_chunk_rule_stays_one_call_under_graph_capture_and_the_replay_is_the_eager_forward(monkeypatch):
+    """A captured prefill forward runs the chunk rule as one call whatever its length: the calls' index tensors are
+    made per forward, and a graph replays only what a persistent object holds. Its replay must still give the eager
+    forward's output and states, which is cut into calls."""
+    import freetoken.layers.linear_attn.gdn as gdn
+    from freetoken.attention.linear import ChunkCaptureLinearBackend
+
+    op, _ = _make_layer(2, "silu", seed=12)
+    ctx = _ctx(monkeypatch, 2)
+    pool = ctx.linear_state_pool
+    if pool.recurrent_states.dtype != torch.float32:
+        pytest.skip("the recurrent state is not fp32 (FREETOKEN_MAMBA_SSM_DTYPE): the rule stays one call")
+    monkeypatch.setattr(gdn, "gdn_rule_tokens", lambda: 64)
+    calls = _count_rule_calls(monkeypatch)
+    live, prefix, tokens = 1, 100, 200
+
+    def req(n: int, cached: int) -> Req:
+        return Req(input_ids=torch.zeros(cached + n, dtype=torch.int32), table_idx=live, cached_len=cached,
+                   output_len=1, uid=0, sampling_params=SamplingParams(), cache_handle=None)
+
+    def forward(r: Req, rows: torch.Tensor, backend=None) -> torch.Tensor:
+        batch = Batch(reqs=[r], phase="prefill")
+        batch.padded_reqs = [r]
+        if backend is not None:
+            backend.prepare_metadata(batch)
+        with ctx.forward_batch(batch):
+            return op.forward(rows)
+
+    torch.manual_seed(31)
+    forward(req(prefix, 0), torch.randn(prefix, HIDDEN, device=DEV, dtype=torch.bfloat16))
+    state = pool.recurrent_states[0, live].clone(), pool.conv_states[0, live].clone()
+    rows = torch.randn(tokens, HIDDEN, device=DEV, dtype=torch.bfloat16)
+
+    def restore() -> None:
+        pool.recurrent_states[0, live].copy_(state[0])
+        pool.conv_states[0, live].copy_(state[1])
+
+    calls.clear()
+    eager = forward(req(tokens, prefix), rows).clone()
+    assert calls == [64, 64, 72]
+    eager_state = pool.recurrent_states[0, live].clone(), pool.conv_states[0, live].clone()
+
+    backend = ChunkCaptureLinearBackend(DEV, pool, tokens)
+    batch = Batch(reqs=[req(tokens, prefix)], phase="prefill")
+    batch.padded_reqs = batch.reqs
+    backend.prepare_for_capture(batch)
+    restore()
+    torch.cuda.synchronize()
+    calls.clear()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        with ctx.forward_batch(batch):
+            captured = op.forward(rows)
+    assert calls == [tokens]
+    for _ in range(2):
+        restore()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, eager)
+        assert torch.equal(pool.recurrent_states[0, live], eager_state[0]) and torch.equal(pool.conv_states[0, live], eager_state[1])
+
+
 def _track_snapshot_and_recomputed(monkeypatch, cached_len: int):
     """A 150-token prefill after ``cached_len`` cached tokens that snapshots its state at its last chunk boundary (128 tokens in), and the state of a request that prefills exactly those 128 tokens from the same cached state.
 

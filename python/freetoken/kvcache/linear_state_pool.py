@@ -21,6 +21,16 @@ def ssm_state_dtype() -> torch.dtype:
     return _SSM_DTYPES.get(str(ENV.MAMBA_SSM_DTYPE).lower(), torch.float32)
 
 
+def gdn_rule_tokens() -> int:
+    """Tokens of one request that one call of a prefill's GatedDeltaNet chunk rule covers (FREETOKEN_GDN_RULE_TOKENS,
+    in whole kernel chunks), or 0 where a forward's tokens run in one call: the variable is 0, or the recurrent state
+    is not fp32. The state passes from one call to the next through its pool slot, which only fp32 holds unrounded."""
+    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+    tokens = int(ENV.GDN_RULE_TOKENS.value) // CHUNK_SIZE * CHUNK_SIZE
+    return tokens if tokens > 0 and ssm_state_dtype() == torch.float32 else 0
+
+
 def _linear_local_dims(
     group: LinearGatedDeltaGroupConfig, tp_size: int
 ) -> tuple[int, int, int, int]:

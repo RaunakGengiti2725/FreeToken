@@ -54,27 +54,41 @@ def net_cache_budget_bytes(
 
 
 def prefill_working_bytes(
-    tokens: int, *, hidden: int, key_dim: int, value_dim: int, value_heads: int, head_dim: int, chunk: int, itemsize: int
+    tokens: int, *, hidden: int, key_dim: int, value_dim: int, value_heads: int, head_dim: int, chunk: int, itemsize: int,
+    rule_tokens: int = 0,
 ) -> int:
     """GPU bytes the temporaries of a prefill of ``tokens`` tokens hold at their peak, on a model with GatedDeltaNet layers.
 
     The peak is in one of those layers, where the chunk kernel allocates its output (layers/linear_attn/gdn.py,
     kernel/fla/chunk.py): every term below is a tensor alive there, in elements per token. The count is from tensor
     shapes. Other architectures are not counted here; the caller plans without a reserve for them.
+    ``rule_tokens``: the layer runs the chunk rule in calls of that many tokens of the one request in the forward
+    (kvcache.linear_state_pool.gdn_rule_tokens), 0 in one call. The tensors of a call are then counted for its tokens
+    and those of the layer for all of them. Nothing outside a GatedDeltaNet layer is counted either way.
     """
     conv = 2 * key_dim + value_dim
-    per_token = (
+    layer = (
         4 * hidden  # the layer's input and residual, and the normed input and summed residual made from them
         + conv + value_dim  # in_proj: q, k, v before the conv, and the output gate z
         + conv  # the conv's output
-        + conv  # q, k, v copied out of it head by head
+    )
+    call = (
+        conv  # q, k, v copied out of the conv's output head by head
         + 2 * key_dim  # q and k l2-normalised
         + value_heads * chunk  # A, the solved chunk-local matrix
         + value_heads * head_dim + value_dim  # w and u
         + 2 * value_dim  # v_new and the output o
     )
-    states = div_ceil(tokens, chunk) * value_heads * head_dim * head_dim  # h: the recurrent state entering each kernel chunk
-    return (tokens * per_token + states) * itemsize
+    in_call = tokens
+    if 0 < rule_tokens < tokens:
+        in_call = min(tokens, rule_tokens + chunk - 1)  # a last call takes a rest shorter than a kernel chunk with it
+        layer += value_dim  # the calls' outputs, gathered
+    states = div_ceil(in_call, chunk) * value_heads * head_dim * head_dim  # h: the recurrent state entering each kernel chunk
+    peak = tokens * layer + in_call * call + states
+    if in_call < tokens:
+        # past the rule the layer also holds its normed output and the projection of it, which short calls fall under
+        peak = max(peak, tokens * (layer + value_dim + hidden))
+    return peak * itemsize
 
 
 def required_bytes(

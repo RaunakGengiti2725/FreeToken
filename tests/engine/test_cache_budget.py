@@ -442,7 +442,7 @@ def test_mha_kv_cost_simple_full_attention():
     assert fixed == 0
 
 
-def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
+def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
     import torch
 
     from freetoken.engine.engine import Engine
@@ -582,8 +582,25 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     assert stages[-1][1] == engine._auto_cache_terms(config, StubBanks())
     engine._settle_preset_memory_ratio(config)
     assert config.memory_ratio == 0.95
+    # a forward of one request cuts the GatedDeltaNet chunk rule into calls (kvcache.linear_state_pool.gdn_rule_tokens):
+    # what is alive only inside a call is counted for a call's tokens. Of the 1280 elements a token, 704 belong to a call,
+    # here of 64 tokens and the 63 a rest can add; 4 kernel chunks of state become 2, and the gathered output adds 64
+    shapes = dict(hidden=64, key_dim=32, value_dim=64, value_heads=4, head_dim=16, chunk=64, itemsize=2)
+    assert need == (256 * (576 + 704) + 4 * 1024) * 2
+    in_calls = prefill_working_bytes(256, **shapes, rule_tokens=64)
+    assert in_calls == (256 * (576 + 64) + 127 * 704 + 2 * 1024) * 2
+    # a long prefill in short calls: the layer's tensors after the rule, with its normed and projected output, are the peak
+    assert prefill_working_bytes(4096, **shapes, rule_tokens=64) == 4096 * (576 + 64 + 64 + 64) * 2
+    assert prefill_working_bytes(256, **shapes, rule_tokens=256) == prefill_working_bytes(256, **shapes, rule_tokens=0) == need
+    with monkeypatch.context() as m:
+        m.setattr("freetoken.kvcache.linear_state_pool.gdn_rule_tokens", lambda: 64)
+        assert engine._preset_prefill_reserve(config) == in_calls
+        m.setattr(config, "max_running_req", 4)  # a forward of several requests runs the rule as one call
+        assert engine._preset_prefill_reserve(config) == need
     # the chunk's working memory comes before the preset's raised KV reserve: a budget of the slot floor, some KV pages and
-    # some bytes more. The reserve gives way page by page, to a chunk-long prompt and 1024 tokens of answer at the least
+    # some bytes more. The reserve gives way page by page, to a chunk-long prompt and 1024 tokens of answer at the least.
+    # The chunk is counted as the layer runs it for one request, in calls of 2048 tokens: the planner's reserve, the
+    # lowered KV reserve and the warning's prompt length all come from that count
     from unittest.mock import patch
 
     from freetoken.engine import engine as eng
@@ -591,8 +608,9 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
 
     config.max_forward_len = 8192
     need, fields = engine._preset_prefill_reserve(config), config.preset_fields
-    shapes = dict(hidden=64, key_dim=32, value_dim=64, value_heads=4, head_dim=16, chunk=64, itemsize=2)
-    assert need == prefill_working_bytes(8192, **shapes) and eng.PRESET_CHUNK_ANSWER_TOKENS == 1024
+    cut = dict(shapes, rule_tokens=2048)
+    assert need == prefill_working_bytes(8192, **cut) < prefill_working_bytes(8192, **shapes) and eng.PRESET_CHUNK_ANSWER_TOKENS == 1024
+    assert engine._auto_cache_terms(config, StubBanks())["reserve_bytes"] == need
     t = engine._auto_cache_terms(config, StubBanks())
     page_bytes, engine._weights_bytes = t["cache_per_page"], 0
 
@@ -613,11 +631,11 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     reserve, kept, warned = settled(576, need // 2)  # not even at 8192 + 1024 tokens: the reserve stops there, and the log says what is kept
     assert reserve == 9216 and need // 2 <= kept < need // 2 + page_bytes and len(warned) == 1
     longest = int(warned[0].split("a prompt longer than ")[1].split(" tokens")[0])
-    assert prefill_working_bytes(longest, **shapes) <= kept < prefill_working_bytes(longest + 1, **shapes) and 0 < longest < 8192
+    assert prefill_working_bytes(longest, **cut) <= kept < prefill_working_bytes(longest + 1, **cut) and 2048 < longest < 8192
     assert " of the " in engine._preset_left_free(config) and f"--max-prefill-length {longest} or less" in warned[0]
     # nothing kept at all: the advice is not a chunk length of 0
     reserve, kept, warned = settled(576, 0)
-    assert reserve == 9216 and kept < prefill_working_bytes(1, **shapes) and "no prefill chunk fits" in warned[0] and "length 0" not in warned[0]
+    assert reserve == 9216 and kept < prefill_working_bytes(1, **cut) and "no prefill chunk fits" in warned[0] and "length 0" not in warned[0]
     # a typed --kv-reserve-tokens is not the preset's to lower: the chunk is shorted and the warning says so
     reserve, kept, warned = settled(1024, need // 2, preset=("max_running_req", "memory_ratio"))
     assert reserve == 16384 and kept < need and len(warned) == 1
@@ -643,13 +661,18 @@ def test_prefill_working_bytes_counts_gdn_models_only():
     )
     shapes = dict(hidden=2048, key_dim=2048, value_dim=4096, value_heads=32, head_dim=128, chunk=64, itemsize=2)
 
-    def config(group, chunk=8192, context=262144):
+    def config(group, chunk=8192, context=262144, requests=4):
         model = SimpleNamespace(hidden_size=2048, linear_attention_group=lambda: group)
         return SimpleNamespace(
-            model_config=model, max_forward_len=chunk, max_seq_len=context, dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1)
+            model_config=model, max_forward_len=chunk, max_seq_len=context, dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
+            max_running_req=requests,
         )
 
     assert _prefill_working_bytes(config(group)) == (8192, prefill_working_bytes(8192, **shapes))
+    # one running request: the layer runs the chunk rule in calls of 2048 tokens, and the count is a call's (0.65 GiB, not 1.03)
+    one = _prefill_working_bytes(config(group, requests=1))
+    assert one == (8192, prefill_working_bytes(8192, **shapes, rule_tokens=2048)) and round(one[1] / 2**30, 2) == 0.65
+    assert round(prefill_working_bytes(8192, **shapes) / 2**30, 2) == 1.03
     # no chunk is longer than the context
     assert _prefill_working_bytes(config(group, context=4096)) == (4096, prefill_working_bytes(4096, **shapes))
     # two ranks hold half the heads each

@@ -140,8 +140,11 @@ smaller than a layer's experts, and the KV reserve where the expert cache's mini
 warning names the largest `--kv-reserve-tokens` that does). The KV reserve is never more than the
 model's context, and it is lowered, to the default at the least, where it would leave fewer expert
 slots than a server without the preset plans. The preset's memory ratio comes with the working memory
-of one prefill chunk of `--max-prefill-length` tokens left free on top of its headroom (1.03 GiB for
-8192 tokens on Qwen3.6-35B-A3B, counted from the GatedDeltaNet layer's tensor shapes): `--memory-ratio
+of one prefill chunk of `--max-prefill-length` tokens left free on top of its headroom (0.65 GiB for
+8192 tokens on Qwen3.6-35B-A3B, counted from the GatedDeltaNet layer's tensor shapes; the layer runs
+its chunk rule over one request in calls of 2048 tokens, `FREETOKEN_GDN_RULE_TOKENS`, with the output
+of one call over all of them, and as one call, which a value of 0 or several running requests give,
+the count is 1.03 GiB): `--memory-ratio
 0.95` alone leaves less than that on a 16 GB card, and a long prompt then ends the server with a CUDA
 out-of-memory error. An automatically sized expert cache takes that memory from the KV tokens above
 `--kv-reserve-tokens` first and from expert slots after, and neither cache goes under its minimum.

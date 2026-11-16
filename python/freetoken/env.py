@@ -75,6 +75,9 @@ class EnvClassSingleton:
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
     MAMBA_SSM_DTYPE = EnvStr("float32")
+    # Tokens of one request that one call of a prefill's GatedDeltaNet chunk rule covers; 0 runs a forward's
+    # tokens in one call, whose temporaries then grow with the whole prefill chunk.
+    GDN_RULE_TOKENS = EnvInt(2048)
 
     def __new__(cls):
         # single instance
