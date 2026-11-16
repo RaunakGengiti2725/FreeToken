@@ -13,6 +13,14 @@ from ..scheme import QuantKind
 from .base import LinearConfig, LinearKernel, LinearMethod
 
 FP8 = torch.float8_e4m3fn
+# the most rows a decode step of this server can have; None until an engine says
+_MAX_DECODE_ROWS: int | None = None
+
+
+def set_max_decode_rows(rows: int | None) -> None:
+    """Install the server's widest decode step; the engine sets it once before create_model."""
+    global _MAX_DECODE_ROWS
+    _MAX_DECODE_ROWS = rows
 
 
 class TorchFp8TensorLinearKernel(LinearKernel):
@@ -52,6 +60,33 @@ class TorchFp8TensorLinearKernel(LinearKernel):
         )
 
 
+class TritonW8A8Fp8TensorLinearKernel(TorchFp8TensorLinearKernel):
+    """Static W8A8 with every decode step in one Triton split-K launch; wider (prefill) calls through torch._scaled_mm."""
+
+    name = "triton-w8a8"
+
+    def unusable_reason(self, cfg: LinearConfig) -> str | None:
+        reason = super().unusable_reason(cfg)
+        if reason:
+            return reason
+        from freetoken.kernel.triton.fp8_pertensor_linear import SMALL_M_MAX
+
+        # the two kernels round differently, so a server whose steps could cross the limit keeps torch for all of them
+        if _MAX_DECODE_ROWS is None:
+            return "no server has set its decode batch"
+        if _MAX_DECODE_ROWS > SMALL_M_MAX:
+            return f"decode steps reach {_MAX_DECODE_ROWS} rows, the split-K kernel takes {SMALL_M_MAX}"
+        return None
+
+    def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
+
+        return fp8_pertensor_linear(
+            x, layer.weight, layer.weight_scale, layer.bias,
+            layer.input_scale, layer._fp8_uniform_scale, scale_segments=layer._fp8_scale_segments, small_m=True,
+        )
+
+
 class TritonFp8TensorLinearKernel(LinearKernel):
     """W8A16: split-K GEMV at M=1, GEMM above."""
 
@@ -75,7 +110,7 @@ class EmulationFp8TensorLinearKernel(LinearKernel):
 
 @register_method(QuantKind.FP8_TENSOR, LayerKind.LINEAR)
 class Fp8TensorLinearMethod(LinearMethod):
-    candidates = (TorchFp8TensorLinearKernel, TritonFp8TensorLinearKernel, EmulationFp8TensorLinearKernel)
+    candidates = (TritonW8A8Fp8TensorLinearKernel, TorchFp8TensorLinearKernel, TritonFp8TensorLinearKernel, EmulationFp8TensorLinearKernel)
 
     def create_weights(self, layer: Any) -> None:
         g = self.cfg
