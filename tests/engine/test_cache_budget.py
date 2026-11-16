@@ -1205,7 +1205,7 @@ def test_calibration_takes_the_largest_worst_lead_above_the_margin_and_times_two
     # a candidate's server, through the bench's own code: a warm-up that fills the cache, then two or more timed passes a prompt
     seen = {}
 
-    def run_arm(ns, extra, arm, rate, single, together, sampling, floors=None, passes=None, warm_after=None):
+    def run_arm(ns, extra, arm, rate, single, together, sampling, floors=None, passes=None, warm_after=None, deadline=None, grace=30.0):
         seen.update(passes=ns.seeds, warm=ns.warm, warm_after=warm_after, timeout=ns.server_timeout, extra=extra,
                     prompts=[name for name, _ in single], together=together)
         cols = [{"tok_s": (a + b) / 2, "seeds": [{"tok_s": a}, {"tok_s": b}], "draft_n": 4, "early": a, "gave_up": False} for a, b in ((90.0, 110.0), (180.0, 220.0))]
@@ -1241,7 +1241,7 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
               ("offload", 4): [102.0, 195.0], ("hybrid", 4): [100.0, 190.0]}
     started = []
 
-    def time_candidate(args, argv, strategy, depth, floors=None, ready_s=None, token_map=None):
+    def time_candidate(args, argv, strategy, depth, floors=None, ready_s=None, token_map=None, left_s=None):
         depth = f"{depth}map" if token_map else depth
         started.append((strategy, depth))
         if (strategy, depth) not in speeds:
@@ -1301,11 +1301,11 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     assert starts(args, argv) == (hybrid_3, 8)
     # a checkpoint that drafts nothing: the depths are one server, so only the strategies are timed
     speeds.update({("offload", 3): [60.0, 90.0], ("hybrid", 3): [80.0, 120.0]})
-    monkeypatch.setattr(calibrate, "_time_candidate", lambda args, argv, s, d, floors=None, ready_s=None: {**time_candidate(args, argv, s, d), "drafts": 0})
+    monkeypatch.setattr(calibrate, "_time_candidate", lambda args, argv, s, d, floors=None, ready_s=None, left_s=None: {**time_candidate(args, argv, s, d), "drafts": 0})
     assert starts(*parsed("--memory-ratio", "0.9")) == (hybrid_3, 2)
     # the static preset dropped its drafts for the size of the cache: that is the static choice, the other depths of its
     # strategy are not timed against it, and hybrid's are
-    def no_drafts(args, argv, s, d, floors=None, ready_s=None):
+    def no_drafts(args, argv, s, d, floors=None, ready_s=None, left_s=None):
         return {**time_candidate(args, argv, s, d), "drafts": 0 if (s, d) == ("offload", 3) else 100, "no_drafts": (s, d) == ("offload", 3)}
 
     monkeypatch.setattr(calibrate, "_time_candidate", no_drafts)
@@ -1379,12 +1379,19 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     clock = [0.0]
     monkeypatch.setattr(calibrate, "_now", lambda: clock[0])
 
-    def taking(seconds, late=()):
-        def timed(args, argv, s, d, floors=None, ready_s=None):
+    lefts = []
+
+    def taking(seconds, late=(), hung=()):
+        def timed(args, argv, s, d, floors=None, ready_s=None, left_s=None):
+            lefts.append(left_s)
             if (s, d) in late:  # still loading when its time is up
                 started.append((s, d))
                 clock[0] += ready_s
                 raise RuntimeError("server not ready")
+            if (s, d) in hung:  # a request that never ends: the bench ends it at the deadline it was given
+                started.append((s, d))
+                clock[0] += left_s
+                raise RuntimeError("the request ran past its deadline")
             clock[0] += seconds
             return time_candidate(args, argv, s, d)
         return timed
@@ -1409,6 +1416,19 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0, late={("hybrid", 3)}))
     late, late_argv = parsed("--memory-ratio", "0.88")
     assert starts(late, late_argv) == ({"speculative_num_steps": 3}, 2) and starts(late, late_argv)[1] == 0
+    # every candidate is given the seconds the budget has left, and is ended there: one that hangs in a request is not
+    # chosen, and nothing after it is started
+    del lefts[:]
+    clock[0] = 0.0
+    monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0, hung={("hybrid", 3)}))
+    assert starts(*parsed("--memory-ratio", "0.89")) == ({"speculative_num_steps": 3}, 2) and lefts == [300.0, 200.0]
+    # the static choice itself hangs: it is ended at the budget, the static preset runs untimed, and nothing is stored
+    monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0, hung={("offload", 3)}))
+    stuck, stuck_argv = parsed("--memory-ratio", "0.84")
+    before = clock[0]
+    assert starts(stuck, stuck_argv) == ({}, 1) and clock[0] - before == calibrate.BUDGET_S
+    monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0))
+    assert starts(stuck, stuck_argv)[1] == 2
     monkeypatch.setattr(calibrate, "_now", time.monotonic)
     monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (_ for _ in ()).throw(RuntimeError("the GPU could not be read")))
     assert starts(third, third_argv) == ({}, 0)
@@ -1492,6 +1512,70 @@ def test_token_map_builder_refuses_benchmark_text_and_records_what_it_counted(tm
     assert Path(stored).parent == tmp_path / "store" / "token_maps"
 
 
+def test_a_request_and_a_server_end_at_their_deadline_whatever_the_server_does():
+    import subprocess
+    import sys
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from freetoken.moe import benchdecode
+
+    done = threading.Event()
+
+    class Server(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            chunk = b'data: {"choices": [{"delta": {"content": "x"}}]}\n\n'
+            try:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                while not done.wait(0.05):
+                    if self.path.endswith("trickle"):  # tokens keep coming, forever
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+            except OSError:
+                pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Server)
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    real = benchdecode.urllib.request.Request
+    try:
+        for kind in ("silent", "trickle"):
+            with pytest.MonkeyPatch.context() as m:
+                # the bench posts to /v1/chat/completions; this server tells its two failures apart by the path
+                m.setattr(benchdecode.urllib.request, "Request", lambda url, **kw: real(f"http://127.0.0.1:{httpd.server_port}/{kind}", **kw))
+                t0 = time.monotonic()
+                with pytest.raises((RuntimeError, OSError)):
+                    benchdecode.stream_chat("http://unused", {"stream": True}, deadline=t0 + 0.5)
+                assert 0.4 < time.monotonic() - t0 < 5.0, kind
+        with pytest.raises(RuntimeError, match="deadline had passed"):
+            benchdecode.stream_chat("http://unused", {}, deadline=time.monotonic() - 1.0)
+    finally:
+        done.set()
+        httpd.shutdown()
+        httpd.server_close()
+    # a server that ignores SIGTERM is killed once its time to stop is up, not after the bench's 90 s
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('up', flush=True); time.sleep(600)"],
+        stdout=subprocess.PIPE, start_new_session=True,
+    )
+    try:
+        assert proc.stdout.readline().strip() == b"up"
+        t0 = time.monotonic()
+        benchdecode.stop_server(proc, term_s=0.3)
+        assert proc.poll() is not None and time.monotonic() - t0 < 10.0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
 def test_a_signal_during_calibration_stops_the_candidates_server_and_ends_the_launcher():
     import signal
     import subprocess
@@ -1500,7 +1584,7 @@ def test_a_signal_during_calibration_stops_the_candidates_server_and_ends_the_la
 
     servers, outer = [], []
 
-    def time_candidate(args, argv, strategy, depth, floors=None, ready_s=None):
+    def time_candidate(args, argv, strategy, depth, floors=None, ready_s=None, left_s=None):
         # as benchdecode.run_arm runs a candidate: a session of its own, which a signal to the launcher does not reach
         proc = subprocess.Popen(["sleep", "600"], start_new_session=True)
         servers.append(proc)

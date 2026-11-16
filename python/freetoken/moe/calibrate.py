@@ -21,9 +21,12 @@ The candidates are timed in a fixed order, inside BUDGET_S seconds: the static c
 static choice's depth, then the other settings (5 with the map, 4, 5, none) of the strategy that is ahead of the
 two, then those of the other strategy. One strategy is ahead of the other by the rule above with a margin of 0. A
 candidate is started only if the time used so far plus SLACK times the longest candidate so far is within the
-budget, and its server must be ready while the longest time a candidate so far took after its load still fits; the
-candidates not started or not ready in time are not chosen, and a later start does not time them
-(--calibrate-again does, inside a budget of its own). The draft depth cannot be changed in a running server (its
+budget, and its server must be ready while the longest time a candidate so far took after its load still fits. The
+budget's end is also a deadline for every candidate, the static choice included: a load or a request still running
+then is ended, and the server is gone GRACE_S seconds later at the latest, whatever it does. The candidates not
+started, not ready or not done in time are not chosen, and a later start does not time them (--calibrate-again
+does, inside a budget of its own); where the static choice itself is not done in time, the static preset runs
+untimed and the log says so. The draft depth cannot be changed in a running server (its
 verify graphs and buffers are built for one depth), so every candidate is a model load, and on a box that loads in
 80 s the budget holds two or three of them.
 
@@ -68,6 +71,7 @@ PASSES = 2                # per prompt, in one server start
 BUDGET_S, SLACK = 300, 1.1
 OUT_OF_TIME = f"not timed: the {BUDGET_S} s of a calibration were used"
 SETTLE_S = 3.0            # after a server that was stopped before it answered, for the driver to give its memory back
+GRACE_S = 30.0            # a candidate's server is gone this long after the budget's end at the latest (benchdecode.run_arm)
 # unmeasured: about twice the noise of a lead between two single passes, whose tok/s had an SD of up to 3.8% (decode_profile.py); asked of a prompt's mean over its passes
 MARGIN = 0.10
 READY_S = 900             # the longest a candidate's server may take to load
@@ -247,10 +251,11 @@ class _Slower(RuntimeError):
 
 
 def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, floors: list[float] | None = None, ready_s: float = READY_S,
-                    token_map: str | None = None) -> dict:
+                    token_map: str | None = None, left_s: float | None = None) -> dict:
     """One server start of a candidate through the bench's own code: its tok/s per prompt and pass, and what it ran with.
-    Raises RuntimeError when the server does not start within ``ready_s`` seconds or does not answer, or when a request
-    starts below its prompt's tok/s in ``floors`` (the bench then stops it: such a candidate cannot be the one chosen)."""
+    Raises RuntimeError when the server does not start within ``ready_s`` seconds or does not answer, when a request
+    starts below its prompt's tok/s in ``floors`` (the bench then stops it: such a candidate cannot be the one chosen),
+    or when it is not done ``left_s`` seconds from now: its load and every request end there, whatever the server does."""
     from freetoken.moe import benchdecode
 
     arm = strategy
@@ -268,7 +273,8 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
     builtin = dict(benchdecode.BUILTIN_PROMPTS)
     sampling, _ = benchdecode.resolve_sampling(ns.model, ns.greedy)
     ns.eos = benchdecode.eos_strings(ns.model)
-    r = benchdecode.run_arm(ns, extra, arm, None, [(name, builtin[name]) for name in PROMPTS], [], sampling, floors, warm_after=WARM_AGAIN)
+    r = benchdecode.run_arm(ns, extra, arm, None, [(name, builtin[name]) for name in PROMPTS], [], sampling, floors, warm_after=WARM_AGAIN,
+                            deadline=None if left_s is None else time.monotonic() + left_s, grace=GRACE_S)
     if any(x.get("gave_up") for x in r["results"]):
         raise _Slower("stopped early: under half the static choice's speed")
     return {
@@ -355,13 +361,16 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
             # a candidate that starts at under half the static choice's speed is stopped after its first tokens
             floors = [0.5 * e for e in first["early"]] if first is not None and all(first.get("early") or [None]) else None
             # the static choice may take as long as any server to load; the others must be ready with time left for their requests
-            ready_s = READY_S if first is None else max(1.0, min(READY_S, BUDGET_S - (began - t0) - tail))
-            r = _time_candidate(args, argv, strategy, depth, floors, ready_s=ready_s, **({"token_map": token_map} if token_map else {}))
+            left = BUDGET_S - (began - t0)
+            ready_s = min(READY_S, left) if first is None else max(1.0, min(READY_S, left - tail))
+            r = _time_candidate(args, argv, strategy, depth, floors, ready_s=ready_s, left_s=left, **({"token_map": token_map} if token_map else {}))
         except RuntimeError as exc:
-            if first is None:
-                raise
             wall[name] = _now() - began
-            if ready_s < READY_S and wall[name] >= ready_s:
+            if first is None:
+                if wall[name] >= left:
+                    raise RuntimeError(f"the static choice was not timed inside the {BUDGET_S} s of a calibration, so it runs untimed") from exc
+                raise
+            if wall[name] >= min(ready_s, left):
                 skipped[name] = OUT_OF_TIME  # still loading when its time was up: not a server that cannot start
             else:
                 (skipped if isinstance(exc, _Slower) else failed)[name] = str(exc).splitlines()[0][:300]

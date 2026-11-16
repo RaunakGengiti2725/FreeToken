@@ -205,7 +205,11 @@ because a running server cannot change its strategy or its draft depth, so the c
 in a fixed order and only as many as fit: the static choice, the other strategy with 3 draft
 tokens, then 5 draft tokens with the map (where there is one), 4, 5 and no draft tokens for the
 strategy that is ahead of those two, then for the other one. A candidate is started only while 1.1 times the longest candidate so far still fits in
-what is left, and its server is stopped if it is not ready with time left for its requests. On a machine that loads the model in 80
+what is left, and its server is stopped if it is not ready with time left for its requests. The end
+of the 300 seconds is also a deadline for every load and every request, the static choice's
+included: what is still running then is ended, and that server is gone at most 30 seconds later,
+by SIGKILL if it does not stop. If the static choice itself is not timed by then, the static preset
+runs untimed and the log says so. On a machine that loads the model in 80
 seconds that is two or three candidates; the log names the ones that were not started, and prints
 the time (`calibration took N s`). A candidate that was not started is not chosen and is not timed
 on a later start. A strategy or a speculative setting given on the command line is not
