@@ -989,6 +989,7 @@ class OffloadMoeCache:
 
     def resident_slots(self, layer_id: int, topk_ids: torch.Tensor) -> torch.Tensor:
         """``topk_ids`` as slot ids of ``layer_id``'s pool; only while ``all_resident``."""
+        assert self.all_resident, "an expert without a slot would be read as slot -1"
         return self.slot_for_id[layer_id][topk_ids.long()]
 
     def prefetch_prefill_layer(self, layer_id: int) -> None:
