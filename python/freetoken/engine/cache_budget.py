@@ -188,6 +188,28 @@ def resolve_moe_cache_auto(
     )
 
 
+def _reserve_room(terms: dict, kv_pages: int) -> int:
+    """Bytes resolve_moe_cache_auto's budget for ``terms`` has beyond the slot floor and ``kv_pages`` KV pages: what
+    plan_cache_budget can leave out of the caches for a reserve at that KV floor."""
+    budget = net_cache_budget_bytes(terms["memory_ratio"], terms["baseline_free"], terms["weights_bytes"], terms["fixed_cache_size"])
+    total = terms["total_experts"]
+    hi = total if terms.get("max_slots") is None else min(terms["max_slots"], total)
+    lo = terms["num_experts"] * (2 if terms["prefill_overlap"] and hi >= 2 * terms["num_experts"] else 1)
+    return budget - lo * terms["per_expert_bytes"] - max(kv_pages, 2) * terms["cache_per_page"]
+
+
+def reserve_kept(terms: dict) -> int:
+    """Bytes of ``terms``' reserve that its plan leaves out of the caches: all of it, or what the floors leave."""
+    room = _reserve_room(terms, div_ceil(terms["kv_reserve_tokens"], terms["page_size"]))
+    return max(0, min(terms.get("reserve_bytes", 0), room))
+
+
+def kv_reserve_keeping(terms: dict) -> int:
+    """The largest KV reserve, in tokens of whole pages, at which the plan for ``terms`` keeps its whole reserve; it can
+    be negative, where no KV reserve does."""
+    return (_reserve_room(terms, 0) + 2 * terms["cache_per_page"] - terms.get("reserve_bytes", 0)) // terms["cache_per_page"] * terms["page_size"]
+
+
 def _plan_or_short(terms: dict) -> tuple[tuple[int, int, bool] | None, int]:
     """resolve_moe_cache_auto's plan for ``terms``, or None and the bytes its minimum plan is over the budget."""
     try:

@@ -269,6 +269,9 @@ def _drop_preset_captures(config, reason: str) -> None:
 # more. Chosen from four decode cells of Qwen3.6-35B-A3B NVFP4 on RTX 5090s, the preset with 3 drafts against a
 # server with no flags: under it at 512 and 701 of 10240 slots (5.0% and 6.8%), over it at 2048 and 2991 (20.0%
 # and 29.2%). No cell lies between 6.8% and 20%, and the share is the lowest at which the drafts were seen to win.
+# unmeasured: the answer a preset's KV pool still holds after a prompt as long as a prefill chunk, where the pool is
+# lowered to make room for the chunk's working memory. A pool of exactly the chunk refuses a prompt of that length.
+PRESET_CHUNK_ANSWER_TOKENS = 1024
 PRESET_DRAFT_SHARE = 0.20
 # the log line of a start that drops them; moe/calibrate.py reads it from the server of its static candidate
 PRESET_NO_DRAFTS = "serving without the preset's draft tokens"
@@ -1210,6 +1213,61 @@ class Engine:
             f"where a longer prompt and answer end with finish_reason length. {more}"
         )
 
+    def _prefill_tokens_within(self, config: EngineConfig, room: int) -> int:
+        """The longest prefill chunk whose working memory (_prefill_working_bytes) is at most ``room`` bytes."""
+        probe = copy.copy(config)
+
+        def fits(tokens: int) -> bool:
+            object.__setattr__(probe, "max_forward_len", tokens)
+            return _prefill_working_bytes(probe)[1] <= room
+
+        low, high = 0, _prefill_working_bytes(config)[0]
+        while low < high:
+            mid = (low + high + 1) // 2
+            low, high = (mid, high) if fits(mid) else (low, mid - 1)
+        return low
+
+    def _settle_preset_chunk_reserve(self, config: EngineConfig, banks, method, max_slots) -> None:
+        """A prefill chunk's working memory comes before a preset's raised KV reserve: where the plan cannot leave the
+        whole chunk free, the reserve is lowered to the largest that can, at the least to a chunk-long prompt and
+        PRESET_CHUNK_ANSWER_TOKENS of answer (and never under the default). What the plan then leaves free is kept for
+        the plan line, and where that is still under the chunk's working memory one warning names the prompt length
+        it holds."""
+        from freetoken.engine.cache_budget import kv_reserve_keeping, reserve_kept
+
+        need = self._preset_prefill_reserve(config)
+        if not need:
+            return
+        chunk = _prefill_working_bytes(config)[0]
+        terms = self._auto_cache_terms(config, banks, method, max_slots)
+        if reserve_kept(terms) < need and "kv_reserve_tokens" in config.preset_fields:
+            page, default = terms["page_size"], EngineConfig.kv_reserve_tokens
+            floor = max(default, min(_preset_kv_target(config), align_ceil(chunk + PRESET_CHUNK_ANSWER_TOKENS, page)))
+            lowered = max(floor, min(config.kv_reserve_tokens, kv_reserve_keeping(terms)))
+            if lowered < config.kv_reserve_tokens:
+                logger.info_rank0(
+                    f"--preset {config.preset}: the KV reserve is {lowered} tokens, not {config.kv_reserve_tokens}: the working "
+                    f"memory of a prefill chunk of {chunk} tokens comes before it"
+                )
+                object.__setattr__(config, "kv_reserve_tokens", lowered)
+                if lowered <= default:
+                    _drop_preset_fields(config, "kv_reserve_tokens")
+                terms = self._auto_cache_terms(config, banks, method, max_slots)
+        self._preset_reserve_kept = kept = reserve_kept(terms)
+        if kept < need:
+            logger.warning_rank0(
+                f"--preset {config.preset}: the plan leaves {mem_GB(kept)} free for a prefill, and a chunk of {chunk} tokens works in "
+                f"about {mem_GB(need)}: a prompt longer than {self._prefill_tokens_within(config, kept)} tokens can end the server "
+                "with a CUDA out-of-memory error. Lower --max-prefill-length to that, or free GPU memory"
+            )
+
+    def _preset_left_free(self, config: EngineConfig) -> str:
+        """What a preset's plan leaves free for a prefill chunk, for a log line: the bytes kept, and of how many where the plan is short."""
+        need, chunk = self._preset_prefill_reserve(config), _prefill_working_bytes(config)[0]
+        kept = getattr(self, "_preset_reserve_kept", need)
+        short = f" of the {mem_GB(need)} it works in" if kept < need else ""
+        return f"{mem_GB(kept)}{short} left free for a prefill chunk of {chunk} tokens"
+
     def _preset_stages(self, config: EngineConfig, banks, method, max_slots) -> list[tuple[str, dict]]:
         """plan_changes' stages for the budget settings a preset filled: the plan without any of them, then with each in turn."""
         filled = config.preset_fields
@@ -1229,7 +1287,7 @@ class Engine:
         if reserve or captures:
             # both are on wherever the staged config's preset_fields say so: right after the ratio's own step, where there is one
             at = next((i + 1 for i, (_, names) in enumerate(steps) if names == ("memory_ratio",)), len(steps))
-            left = [f"{mem_GB(reserve)} left free for a prefill chunk of {_prefill_working_bytes(config)[0]} tokens"] if reserve else []
+            left = [self._preset_left_free(config)] if reserve else []
             left += [f"{mem_GB(captures)} left free for the prefill graphs"] if captures else []
             steps.insert(at, (" and ".join(left), ("preset_fields",)))
         staged = copy.copy(config)
@@ -1267,8 +1325,8 @@ class Engine:
         elif getattr(config.model_config, "is_moe", False):
             parts.append(f"every expert resident ({config.moe_strategy})")
         parts.append(f"{num_tokens} KV tokens")
-        if reserve := self._preset_prefill_reserve(config):
-            parts.append(f"{mem_GB(reserve)} left free for a prefill chunk of {_prefill_working_bytes(config)[0]} tokens")
+        if self._preset_prefill_reserve(config):
+            parts.append(self._preset_left_free(config))
         if captures := _preset_capture_bytes(config):
             parts.append(f"{mem_GB(captures)} left free for the prefill graphs of chunks up to {config.prefill_graph_tokens} tokens")
         parts.append(f"{config.max_running_req} running request" + ("s" if config.max_running_req != 1 else ""))
@@ -1388,6 +1446,7 @@ class Engine:
             self._settle_preset_captures(config, banks, method, size_cap, spare)
             if "kv_reserve_tokens" in config.preset_fields:
                 self._settle_preset_kv_reserve(config, banks, method, size_cap)
+            self._settle_preset_chunk_reserve(config, banks, method, size_cap)
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
             if spare:
                 from freetoken.engine.cache_budget import plan_resident_staging

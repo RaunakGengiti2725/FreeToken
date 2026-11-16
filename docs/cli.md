@@ -142,8 +142,12 @@ of one prefill chunk of `--max-prefill-length` tokens left free on top of its he
 8192 tokens on Qwen3.6-35B-A3B, counted from the GatedDeltaNet layer's tensor shapes): `--memory-ratio
 0.95` alone leaves less than that on a 16 GB card, and a long prompt then ends the server with a CUDA
 out-of-memory error. An automatically sized expert cache takes that memory from the KV tokens above
-`--kv-reserve-tokens` first and from expert slots after, and neither cache goes under its minimum: a
-plan too small for the whole chunk keeps less of it free instead of refusing to start. For a model
+`--kv-reserve-tokens` first and from expert slots after, and neither cache goes under its minimum.
+Where that cannot leave the whole chunk free, the preset's own KV reserve gives way before the chunk
+does: it is lowered to the largest reserve that can, at the least to a prompt as long as the chunk
+and 1024 tokens of answer (never under the default reserve). If the plan is still short, the server
+starts, the plan line says how much it keeps free, and one warning names the prompt length that
+fits: a longer prompt can end the server. For a model
 without GatedDeltaNet layers the preset keeps the default ratio. A
 typed `--memory-ratio` gets no such reserve. The startup log lists what the preset set,
 what each setting did to the `--moe-cache-auto` plan, and the resulting expert slots and KV tokens.

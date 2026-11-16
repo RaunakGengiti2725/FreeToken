@@ -582,6 +582,45 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     assert stages[-1][1] == engine._auto_cache_terms(config, StubBanks())
     engine._settle_preset_memory_ratio(config)
     assert config.memory_ratio == 0.95
+    # the chunk's working memory comes before the preset's raised KV reserve: a budget of the slot floor, some KV pages and
+    # some bytes more. The reserve gives way page by page, to a chunk-long prompt and 1024 tokens of answer at the least
+    from unittest.mock import patch
+
+    from freetoken.engine import engine as eng
+    from freetoken.engine.cache_budget import reserve_kept
+
+    config.max_forward_len = 8192
+    need, fields = engine._preset_prefill_reserve(config), config.preset_fields
+    shapes = dict(hidden=64, key_dim=32, value_dim=64, value_heads=4, head_dim=16, chunk=64, itemsize=2)
+    assert need == prefill_working_bytes(8192, **shapes) and eng.PRESET_CHUNK_ANSWER_TOKENS == 1024
+    t = engine._auto_cache_terms(config, StubBanks())
+    page_bytes, engine._weights_bytes = t["cache_per_page"], 0
+
+    def settled(kv_pages, more, preset=fields):
+        config.kv_reserve_tokens, config.preset_fields = 16384, preset
+        budget = t["fixed_cache_size"] + 4 * t["per_expert_bytes"] + kv_pages * page_bytes + more
+        engine._baseline_free = -(-budget * 20 // 19) + 1  # the ratio is 0.95
+        warned = []
+        with patch.object(eng.logger, "warning_rank0", warned.append), patch.object(eng.logger, "info_rank0", lambda line: None):
+            engine._settle_preset_chunk_reserve(config, StubBanks(), None, None)
+        kept = reserve_kept(engine._auto_cache_terms(config, StubBanks()))
+        assert engine._resolve_auto_moe_cache_size(config, StubBanks())[1] * 16 >= config.kv_reserve_tokens  # the plan stands
+        return config.kv_reserve_tokens, kept, warned
+
+    assert settled(1024, need) == (16384, need, [])  # room for both
+    assert settled(1024, need - 3 * page_bytes) == (16384 - 3 * 16, need, [])  # three pages short: three pages of reserve go
+    assert settled(576, need) == (9216, need, [])
+    reserve, kept, warned = settled(576, need // 2)  # not even at 8192 + 1024 tokens: the reserve stops there, and the log says what is kept
+    assert reserve == 9216 and need // 2 <= kept < need // 2 + page_bytes and len(warned) == 1
+    longest = int(warned[0].split("a prompt longer than ")[1].split(" tokens")[0])
+    assert prefill_working_bytes(longest, **shapes) <= kept < prefill_working_bytes(longest + 1, **shapes) and 0 < longest < 8192
+    assert " of the " in engine._preset_left_free(config)
+    # a typed --kv-reserve-tokens is not the preset's to lower: the chunk is shorted and the warning says so
+    reserve, kept, warned = settled(1024, need // 2, preset=("max_running_req", "memory_ratio"))
+    assert reserve == 16384 and kept < need and len(warned) == 1
+    assert settled(1024, 0, preset=()) == (16384, 0, [])  # without the preset: no reserve, nothing lowered, nothing said
+    config.preset_fields, config.max_forward_len = fields, 256
+    del engine._preset_reserve_kept
     config.model_config.linear_attention_group = lambda: None
     engine._settle_preset_memory_ratio(config)
     assert config.memory_ratio == 0.9 and "memory_ratio" not in config.preset_fields and engine._preset_prefill_reserve(config) == 0
