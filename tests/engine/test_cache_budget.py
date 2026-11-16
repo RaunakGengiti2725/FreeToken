@@ -883,9 +883,13 @@ def test_calibration_takes_the_largest_worst_lead_above_the_margin_and_times_two
     assert choose({**static, "hybrid@3": both(120.0, 240.0), "hybrid@0": both(120.0, 240.0)}, names)[0] == "hybrid@3"  # a tie: the one named first
     assert choose({**static, "hybrid@3": both(120.0, 240.0), "hybrid@0": both(126.0, 250.0)}, names)[0] == "hybrid@0"
     assert choose({**static, "offload@0": both(60.0, 90.0), "hybrid@0": both(95.0, 230.0)}, names)[0] == "offload@3"  # slower ones change nothing
-    # the lead has to hold in every pass: ahead only in the first, while the expert cache still fills, is not a lead
-    assert choose({**static, "hybrid@3": [[150.0, 105.0], [300.0, 260.0]]}, names)[0] == "offload@3"
-    assert choose({**static, "hybrid@3": [[150.0, 115.0], [300.0, 260.0]]}, names) == ("hybrid@3", pytest.approx(0.15))
+    # a pass behind the static choice is no lead, whatever the other pass says
+    assert choose({**static, "hybrid@3": [[150.0, 95.0], [300.0, 260.0]]}, names)[0] == "offload@3"
+    # the margin is asked of a prompt's mean over its passes: one pass at +5% beside one at +50% is +27.5%
+    assert choose({**static, "hybrid@3": [[150.0, 105.0], [300.0, 260.0]]}, names) == ("hybrid@3", pytest.approx(0.275))
+    # the timings of a 16 GB card: +25% to +36% in three passes, +9.7% in the fourth
+    card = {"offload@3": [[145.4, 143.8], [143.9, 151.3]], "hybrid@3": [[181.9, 195.7], [193.9, 165.9]]}
+    assert choose(card, names) == ("hybrid@3", pytest.approx(0.219, abs=0.001))
 
     # a candidate's server, through the bench's own code: a warm-up that fills the cache, then two or more timed passes a prompt
     seen = {}

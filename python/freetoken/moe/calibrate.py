@@ -2,9 +2,10 @@
 
 The rule: every candidate (offload and hybrid, each with no drafts, 3 and 5 MTP draft tokens) is one server start
 that decodes DECODE tokens after WARM warm-up tokens on each of the two built-in prompts, PASSES times over. A
-candidate's lead over the static preset's choice is its smallest over the prompts and the passes, so one that is
-ahead only while the expert cache still fills has none. The candidate with the largest lead runs, if that lead is
-above MARGIN; otherwise the static choice runs.
+candidate's lead over the static preset's choice is taken per prompt from the means over the passes, and is the
+smaller of the prompts'; a candidate behind the static choice in any single pass has none. The candidate with the
+largest lead runs, if that lead is above MARGIN; otherwise the static choice runs. (The lead was first the smallest
+single pass's: on a 16 GB card that kept offload over a hybrid that led by 25% to 36% in three passes and 9.7% in one.)
 
 A dimension the command line fixed (--moe-strategy, --speculative-algorithm) is not a candidate. The timings are a
 row of the decode profile (moe/decode_profile.py), under the key and the stamp `--moe-strategy auto` reads its rows
@@ -38,7 +39,7 @@ PRESET = "single-measured"
 # bench's own default: after fewer, a cold cache was timed, and a candidate that misses less from cold looked faster.
 WARM, DECODE = 1024, 512
 PASSES = 2                # per prompt, in one server start: the second pass runs on the cache the first one left
-# unmeasured: about twice the noise of a lead between two single passes, whose tok/s had an SD of up to 3.8% (decode_profile.py)
+# unmeasured: about twice the noise of a lead between two single passes, whose tok/s had an SD of up to 3.8% (decode_profile.py); asked of a prompt's mean over its passes
 MARGIN = 0.10
 READY_S = 900             # the longest a candidate's server may take to load
 PROMPTS = ("math", "code")
@@ -59,17 +60,21 @@ def candidates(args) -> list[tuple[str, str, int | None]]:
 
 
 def choose(tok_s: dict, names: list[str], margin: float = MARGIN) -> tuple[str, float]:
-    """``(candidate, lead)``: of ``names`` (the static choice first), the one whose smallest lead over the static
-    choice across the prompts and passes is largest, if that lead is above ``margin``; else the static choice, with
-    lead 0. ``tok_s`` maps a candidate to its tok/s per prompt and pass; one that is missing did not run and is not
-    chosen. A tie goes to the candidate named first."""
+    """``(candidate, lead)``: of ``names`` (the static choice first), the one whose lead over the static choice is
+    largest, if that lead is above ``margin``; else the static choice, with lead 0. A candidate's lead is, per prompt,
+    its mean tok/s over the passes against the static choice's, and the smaller of the prompts'; one that is behind
+    in any single pass has no lead. ``tok_s`` maps a candidate to its tok/s per prompt and pass; one that is missing
+    did not run and is not chosen. A tie goes to the candidate named first."""
     base = tok_s[names[0]]
     best, best_lead = names[0], 0.0
     for name in names[1:]:
         if name not in tok_s:
             continue
         # pass k against pass k: both servers had then decoded the same number of tokens
-        lead = min(c / b for cs, bs in zip(tok_s[name], base) for c, b in zip(cs, bs)) - 1.0
+        if any(c < b for cs, bs in zip(tok_s[name], base) for c, b in zip(cs, bs)):
+            continue
+        # a single pass's tok/s moves by several percent: the margin is asked of a prompt's mean, not of its worst pass
+        lead = min(sum(cs) / sum(bs) for cs, bs in zip(tok_s[name], base)) - 1.0
         if lead > margin and lead > best_lead:
             best, best_lead = name, lead
     return best, best_lead
@@ -348,9 +353,9 @@ def measured_choice(args, argv: list[str]) -> dict:
     _, strategy, depth = todo[names.index(name)]
     timed = ", ".join(f"{n} {'/'.join(f'{sum(col) / len(col):.0f}' for col in row['tok_s'][n])}" for n in names if n in row["tok_s"])
     if name != names[0]:
-        why = f"its smallest lead over {names[0]} across the prompts and passes is {lead:+.1%}"
+        why = f"its lead over {names[0]} on its worse prompt (the passes' mean) is {lead:+.1%}"
     else:
-        why = f"no candidate leads it by more than {MARGIN:.0%} on every prompt and pass"
+        why = f"no candidate leads it by more than {MARGIN:.0%} on both prompts without falling behind in a pass"
         if "moe_strategy" in args.preset_fields:
             why += f"; --moe-strategy stays {args.moe_strategy}"
     left = {**row.get("skipped", {}), **row.get("failed", {})}
