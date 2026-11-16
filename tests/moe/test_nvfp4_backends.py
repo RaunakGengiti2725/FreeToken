@@ -448,6 +448,41 @@ def test_w4a4_prefill_sizes_its_tiles_by_the_routed_experts_and_hands_them_to_it
     assert seen["fallback"][9] == slots and seen["fallback"][-1] == E
 
 
+def test_prefill_tiles_override_replaces_only_what_it_names():
+    """FREETOKEN_PREFILL_TILES reaches every _PrefillTuning field, leaves a class's other tiles alone and is a no-op unset."""
+    from freetoken.kernel import nvfp4_moe
+
+    geforce = nvfp4_moe._TUNING_GEFORCE
+    assert nvfp4_moe._parse_prefill_tiles("") == {}
+    assert nvfp4_moe._override_prefill_tuning(geforce, {}) is geforce
+
+    fields = nvfp4_moe._parse_prefill_tiles(
+        " steps=16:100:inf; 32=64x64x3 ;pair_decode_below=48;small_tile_decode=1;large_tile_decode=2;scale_words=1;long_k_warps=8;")
+    tuning = nvfp4_moe._override_prefill_tuning(geforce, fields)
+    assert tuning == nvfp4_moe._PrefillTuning(
+        (16.0, 100.0, math.inf), {**geforce.tiles, 32: (64, 64, 3)}, pair_decode_below=48.0, small_tile_decode=1,
+        large_tile_decode=2, scale_words=True, long_k_warps=8)
+    assert geforce.tiles[32] == (128, 64, 2)
+
+    # the GeForce class has no BLOCK_SIZE_M 128 tile: steps that reach it must bring one
+    reach_128 = nvfp4_moe._parse_prefill_tiles("steps=16:100:200")
+    with pytest.raises(ValueError, match="FREETOKEN_PREFILL_TILES"):
+        nvfp4_moe._override_prefill_tuning(geforce, reach_128)
+    assert nvfp4_moe._override_prefill_tuning(geforce, {**reach_128, "tiles": {128: (64, 32, 2)}}).tiles[128] == (64, 32, 2)
+
+
+@pytest.mark.parametrize("spec", [
+    "steps=16:150", "steps=150:16:inf", "steps=0:16:inf", "steps=a:b:c", "steps=16:150:nan",
+    "32=128x64", "32=100x64x2", "32=128x48x2", "32=128x64x0", "48=128x64x2", "32:128x64x2",
+    "small_tile_decode=3", "scale_words=yes", "long_k_warps=6", "pair_decode_below=-1", "block_n=128", "steps",
+])
+def test_prefill_tiles_override_rejects_malformed(spec):
+    from freetoken.kernel import nvfp4_moe
+
+    with pytest.raises(ValueError, match="FREETOKEN_PREFILL_TILES"):
+        nvfp4_moe._parse_prefill_tiles(f"16=64x64x4;{spec}")
+
+
 @cuda
 def test_triton_swigluoai_matches_dequant_reference():
     """MiniMax-M3's swigluoai routed experts through the Triton prefill grouped GEMM
