@@ -374,7 +374,8 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill movement. A chunk within ``prefill_demand_tokens`` loads its routed experts
+        """Prefill movement. A chunk within ``prefill_demand_tokens``, or a longer one the cache
+        chose at its first layer (``choose_prefill_path``), loads its routed experts
         into the slot cache as decode does and runs the same grouped GEMM over the slots; so does
         any chunk once every expert is resident, with nothing to load. Otherwise a chunk streams
         whole layers -- double-buffered behind the previous layer's GEMMs when ``prefill_overlap``
@@ -385,6 +386,8 @@ class OffloadMoELayer(MoELayer):
         demand = cache.loads_prefill_on_demand(hidden_states.shape[0])
         if self.layer_id == 0 and not demand:
             cache.begin_prefill(num_routes=topk_ids.numel())
+            cache.choose_prefill_path(self.layer_id, topk_ids)
+        demand = demand or cache.prefill_chunk_demand
         if cache.all_resident or demand:
             slot_of = None
             if not cache.all_resident:

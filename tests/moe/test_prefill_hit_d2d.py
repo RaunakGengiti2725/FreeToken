@@ -195,6 +195,43 @@ def test_prefill_hit_d2d_short_chunk_gathers_routed_experts_only():
 @CUDA
 @JIT
 @BATCH_API
+def test_prefill_chunk_chosen_for_demand_reads_the_rows_the_stream_stages():
+    """A chunk above the token threshold that the cache chooses to load on demand (choose_prefill_path) reads, expert
+    for expert, the bytes the stream stages for the same routes; a cache with empty hit slots keeps streaming."""
+    cache, sources = _make_cache()
+    cache.prefill_demand_tokens, cache.prefill_demand_by_misses = 1, True
+    routed = torch.tensor([[1, 5], [5, 2]], dtype=torch.int32, device="cuda")
+    cache.begin_prefill(num_routes=routed.numel())
+    cache.choose_prefill_path(2, routed)
+    assert not cache.prefill_chunk_demand, "the hit slots are empty: the stream fills them"
+
+    cache, sources = _make_cache()
+    cache.prefill_demand_tokens, cache.prefill_demand_by_misses = 1, True
+    # full hit slots: experts 0..3 of layers 2 and 1
+    for e in range(4):
+        _seed_resident(cache, sources, layer_id=2, expert_id=e, slot=2 * E + e)
+        _seed_resident(cache, sources, layer_id=1, expert_id=e, slot=2 * E + 4 + e)
+    rows = routed.view(-1).long()
+    cache.begin_prefill(num_routes=routed.numel())
+    cache.prefetch_prefill_layer(2)
+    staged = [view[rows].clone() for view in cache.wait_prefill_layer(2, routed)]
+    cache.release_prefill_layer(2)
+
+    cache.begin_prefill(num_routes=routed.numel())
+    cache.choose_prefill_path(2, routed)
+    assert cache.prefill_chunk_demand
+    slots = cache.load_prefill_experts(2, routed)
+    torch.cuda.synchronize()
+    assert not torch.equal(slots, routed), "the admission must have mapped expert ids to slots"
+    for view, stream_rows, (name, per_layer) in zip(cache.pool_bank_views(2), staged, sources.items()):
+        loaded = view[slots.view(-1).long()]
+        assert torch.equal(loaded, stream_rows), name
+        assert torch.equal(loaded.cpu(), per_layer[2][rows.cpu()]), name
+
+
+@CUDA
+@JIT
+@BATCH_API
 def test_prefill_hit_d2d_keeps_streamed_experts_in_empty_slots():
     cache, sources = _make_cache()
     cache.begin_prefill()

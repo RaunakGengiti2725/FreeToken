@@ -286,9 +286,14 @@ def _drop_preset_demand(config, reason: str) -> None:
     logger.info_rank0(f"--preset {config.preset}: no prefill chunk loads its experts on demand ({reason})")
 
 
+# A/B switch: FREETOKEN_PREFILL_DEMAND_BY_MISSES=0 leaves a preset's demand-loaded chunks to the token count alone
+_PREFILL_DEMAND_BY_MISSES = os.getenv("FREETOKEN_PREFILL_DEMAND_BY_MISSES", "1") != "0"
+
+
 def _settle_preset_demand(config, decode_target: str, pool_sizes: list[int], cache=None) -> None:
     """A preset's short prefill chunks load their experts on demand only through a GPU-decoded expert cache that cannot
-    hold every expert. Called before the cache is built, which refuses them on another decode target, and with the cache."""
+    hold every expert. Called before the cache is built, which refuses them on another decode target, and with the cache.
+    There a longer chunk is loaded on demand too when that copies less than streaming it (cache.choose_prefill_path)."""
     if decode_target != "gpu":
         _drop_preset_demand(config, f"the expert cache decodes on {decode_target}")
     elif min(pool_sizes) < config.model_config.num_experts:
@@ -298,6 +303,7 @@ def _settle_preset_demand(config, decode_target: str, pool_sizes: list[int], cac
         _drop_preset_demand(config, "the expert cache has a slot for every expert")
     if cache is not None:
         cache.prefill_demand_tokens = config.moe_prefill_demand_tokens
+        cache.prefill_demand_by_misses = _PREFILL_DEMAND_BY_MISSES and "moe_prefill_demand_tokens" in config.preset_fields
 
 
 def _preset_kv_target(config) -> int:

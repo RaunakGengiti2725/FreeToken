@@ -179,7 +179,11 @@ plan line says which. Both give the same output as the expert cache does.
   reserve. The prefill staging buffers lie over that many slots, and only with every expert in a
   slot outside them does a prefill read the slots as decode does. With fewer slots a prefill keeps
   streaming what is not resident (`--moe-prefill-hit-d2d`), and a chunk of at most 96 tokens (a
-  resend, a short turn) loads only the experts it routes to (`--moe-prefill-demand-tokens`).
+  resend, a short turn) loads only the experts it routes to (`--moe-prefill-demand-tokens`). A longer
+  chunk does the same when the routes of its first layer and the cache's contents say that this copies
+  fewer bytes than streaming it, counting an expert it would evict as one more copy; a cache with
+  empty slots keeps streaming, which fills them. `FREETOKEN_PREFILL_DEMAND_BY_MISSES=0` leaves the
+  choice to the token count alone.
 
 `--preset single` measures nothing: it serves with `fused` where every expert fits as described
 above, else with `offload` (or what `--moe-strategy auto` takes from an

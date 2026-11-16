@@ -229,6 +229,88 @@ def test_offload_moe_cache_takes_a_prefill_chunk_on_demand_only_within_its_thres
     assert [cache.loads_prefill_on_demand(tokens) for tokens in range(4)] == [False, True, True, False]
 
 
+def test_offload_moe_cache_loads_a_longer_chunk_on_demand_where_that_copies_less_than_the_stream(monkeypatch):
+    """Above the token threshold a hit-d2d chunk loads on demand when its first layer's routes and the snapshot say
+    that copies fewer bytes than the stream; the layers after the first follow that answer. The snapshot is written
+    by hand: a CPU cache takes none."""
+    import numpy as np
+
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    L, E = 4, 8
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=24, device=torch.device("cpu"), prefill_overlap=True, prefill_hit_d2d=True,
+        prefill_demand_tokens=2, prefill_demand_by_misses=True,
+    )
+    cache.set_bank_sources({"gate_up": [torch.randn(E, 32, 8) for _ in range(L)], "down": [torch.randn(E, 8, 16) for _ in range(L)]})
+    # the staging buffers lie on slots 0..15 and are empty; the hit slots hold experts 0..3 of layers 0 and 1
+    full = torch.full((L, E), -1, dtype=torch.int32)
+    full[0, :4], full[1, :4] = torch.arange(16, 20, dtype=torch.int32), torch.arange(20, 24, dtype=torch.int32)
+
+    def chosen(routes, slots=full, **state):
+        ids = torch.full((24,), -1, dtype=torch.int32)
+        for l, e in (slots >= 0).nonzero().tolist():
+            ids[slots[l, e]] = l * E + e
+        cache._prefill_snapshot_np, cache._prefill_id_snapshot = slots.numpy(), ids
+        cache._prefill_free_slots = [np.nonzero(ids.numpy()[16:] < 0)[0] + 16]
+        cache._prefill_hit_d2d_active, cache.all_resident, cache.prefill_demand_by_misses = True, False, True
+        for name, value in state.items():
+            setattr(cache, name, value)
+        cache.choose_prefill_path(0, torch.tensor([routes], dtype=torch.int32))
+        return cache.prefill_chunk_demand
+
+    # the stream copies the 24 experts outside the hit slots. Routes to 0, 1 and 4: one of layer 0's four absent
+    # experts, so (1 + 1) / (4 + 1) of each layer's absent ones, at most 3 a layer: 1.6 + 1.6 + 3 + 3 copies
+    assert chosen([0, 1, 4, 4])
+    # every absent expert of layer 0 and one more: 4 + 4 + 5 + 5 copies, 2 of them beyond the 16 empty slots
+    assert chosen([4, 5, 6, 7, 0])
+    # seven experts: 4 + 4 + 7 + 7 copies and 6 evictions are more than the stream's 24; so is every expert
+    assert not chosen([1, 2, 3, 4, 5, 6, 7]) and not chosen(list(range(E)))
+    # seven experts, three of the absent ones: 3.2 + 3.2 + 6.4 + 6.4 copies and 3.2 evictions
+    assert chosen([0, 1, 2, 3, 4, 5, 6])
+    # experts in staging slots are residents on demand and copies of the stream: 4 + 4 copies, 8 evictions, against 24
+    staged = full.clone()
+    staged[2], staged[3] = torch.arange(0, 8, dtype=torch.int32), torch.arange(8, 16, dtype=torch.int32)
+    assert chosen(list(range(E)), staged)
+    # an empty hit slot: the stream fills it for the chunks that follow
+    holed = full.clone()
+    holed[1, 3] = -1
+    assert not chosen([0, 1, 4], holed)
+    assert not chosen([0, 1, 4], prefill_demand_by_misses=False)
+    assert not chosen([0, 1, 4], _prefill_hit_d2d_active=False)
+    assert not chosen([0, 1, 4], all_resident=True)
+
+    cache.all_resident = False
+    layers = [_bf16_offload_layer(layer_id, E, 2, 8, 16) for layer_id in range(2)]
+    events, answer = [], [True]
+    monkeypatch.setattr(cache, "begin_prefill", lambda num_routes=None: events.append("begin"))
+    monkeypatch.setattr(
+        cache, "choose_prefill_path", lambda layer_id, routed: (events.append("choose"), setattr(cache, "prefill_chunk_demand", answer[0]))
+    )
+    monkeypatch.setattr(cache, "load_prefill_experts", lambda layer_id, ids: (events.append(("demand", layer_id)), ids)[1])
+    monkeypatch.setattr(cache, "release_prefill_layer", lambda layer_id: None)
+    for layer in layers:
+        layer.offload_cache = cache
+        monkeypatch.setattr(layer.quant_method, "apply", lambda x, w, ids, view, **kwargs: x)
+        monkeypatch.setattr(
+            layer, "_wait_prefill_overlap",
+            lambda cache, ids, layer_id=layer.layer_id: (events.append(("stream", layer_id)), cache.stage_views(layer_id, 0))[1],
+        )
+
+    def forward(tokens):
+        events.clear()
+        for layer in layers:
+            layer._prefill_routed(torch.randn(tokens, 8), torch.rand(tokens, 2), torch.zeros(tokens, 2, dtype=torch.int32))
+        return list(events)
+
+    assert forward(3) == ["begin", "choose", ("demand", 0), ("demand", 1)]
+    answer[0] = False
+    assert forward(3) == ["begin", "choose", ("stream", 0), ("stream", 1)]
+    # within the threshold nothing is asked: no snapshot, no host sync
+    assert forward(2) == [("demand", 0), ("demand", 1)]
+
+
 def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(monkeypatch):
     from freetoken.moe.offload_cache import OffloadMoeCache
 

@@ -131,6 +131,9 @@ class OffloadMoeCache:
     # A prefill chunk of at most this many tokens admits the experts it routes to into the slot
     # cache, as decode does, instead of streaming every expert of each layer; 0 streams them all.
     prefill_demand_tokens: int = 0
+    # A longer chunk of a hit-d2d prefill loads on demand too when that is estimated to copy fewer bytes than
+    # streaming it (choose_prefill_path); off, the token count alone decides.
+    prefill_demand_by_misses: bool = False
     prefill_overlap: bool = False
     # Prefill hit/miss split: experts already resident in the slot cache (slots
     # >= 2 * num_experts) are gathered device-side into the double buffer instead
@@ -351,6 +354,8 @@ class OffloadMoeCache:
         self._prefill_slot_snapshot: torch.Tensor | None = None
         self._prefill_snapshot_np = None
         self._prefill_hit_d2d_active = False
+        # choose_prefill_path's answer for the chunk in flight: its layers after the first read it
+        self.prefill_chunk_demand = False
         # every expert of every layer has a slot outside the staging buffers: begin_prefill sees it in its snapshot.
         # Nothing evicts from then on (decode and prefill only hit), so it holds until the cache is reset or rebuilt,
         # and a prefill reads the slots as decode does, with no staging, gather or host sync.
@@ -979,6 +984,38 @@ class OffloadMoeCache:
             self._prefill_streamed = [None, None]
             self.all_resident = self._snapshot_all_resident(ids)
 
+    def choose_prefill_path(self, layer_id: int, routed_ids: torch.Tensor) -> None:
+        """Decide at a chunk's first layer, after begin_prefill, whether a chunk longer than ``prefill_demand_tokens``
+        loads its experts on demand all the same: ``prefill_chunk_demand``. One host sync, for this layer's routes."""
+        self.prefill_chunk_demand = False
+        if not (self.prefill_demand_by_misses and self.prefill_overlap and self._prefill_hit_d2d_active) or self.all_resident:
+            return
+        # a stream into a pool with empty slots also fills them (_keep_streamed_experts), which later chunks read
+        if any(free.size for free in self._prefill_free_slots):
+            return
+        self.prefill_chunk_demand = self._demand_copies_less(layer_id, routed_ids.reshape(-1).unique().cpu().numpy())
+
+    def _demand_copies_less(self, layer_id: int, routed) -> bool:
+        """Whether loading a chunk on demand is estimated to copy fewer bytes than streaming it, from begin_prefill's
+        snapshot. The stream copies every expert outside the hit slots. On demand a layer copies the experts it routes
+        to that have no slot: counted for ``layer_id``, whose routes ``routed`` are known, and taken for every other
+        layer as the same share of its absent experts, at most as many experts as this layer routes to. An expert
+        admitted beyond a pool's empty slots evicts one, counted as one more copy: a later layer of the chunk or the
+        next decode step loads it again."""
+        absent = self._prefill_snapshot_np < 0
+        ids = self._prefill_id_snapshot.numpy()
+        # one more routed than counted, so that a layer with few absent experts does not promise none elsewhere
+        share = (int(absent[layer_id][routed].sum()) + 1) / (int(absent[layer_id].sum()) + 1)
+        demand = stream = 0.0
+        for p, (base, size, stable) in enumerate(zip(self.pool_bases, self.pool_sizes, self._pool_stable_from)):
+            layers = [l for l in range(self.num_layers) if self.pool_of_layer[l] == p]
+            per_expert = sum(self._row_bytes[self._pool_layout(p)])
+            copies = sum(min(float(routed.size), share * int(absent[l].sum())) for l in layers)
+            empty = int((ids[base : base + size] < 0).sum())
+            demand += (copies + max(copies - empty, 0.0)) * per_expert
+            stream += int((self._prefill_snapshot_np[layers] < stable).sum()) * per_expert
+        return demand < stream
+
     def _snapshot_all_resident(self, ids) -> bool:
         """Whether begin_prefill's snapshot has every expert in a slot and none in a staging buffer (GPU decode only: hybrid and CPU layers leave experts off the device by design)."""
         if not self.keeps_streamed_experts or self.cpu_layer_ids or self._unpinned_layers:
@@ -1352,6 +1389,7 @@ class OffloadMoeCache:
 
         reset_cache(self)
         self.all_resident = False
+        self.prefill_chunk_demand = False
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)

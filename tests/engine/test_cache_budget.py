@@ -1181,7 +1181,8 @@ def test_preset_loads_short_prefill_chunks_on_demand_only_into_a_gpu_decoded_cac
     engine = decode_rows.engine
     monkeypatch.setattr(OffloadMoeCache, "keeps_streamed_experts", property(lambda self: self.prefill_hit_d2d))
 
-    def settled(extra, decode_target="gpu", pool_sizes=None, fields=("moe_prefill_demand_tokens",), tokens=96):
+    def settled(extra, decode_target="gpu", pool_sizes=None, fields=("moe_prefill_demand_tokens",), tokens=96, by_misses=True):
+        monkeypatch.setattr(engine, "_PREFILL_DEMAND_BY_MISSES", by_misses)
         config = SimpleNamespace(
             preset="single", preset_fields=fields, moe_prefill_demand_tokens=tokens, model_config=SimpleNamespace(num_experts=4),
         )
@@ -1194,11 +1195,13 @@ def test_preset_loads_short_prefill_chunks_on_demand_only_into_a_gpu_decoded_cac
         cache.set_bank_sources({"gate_up": [torch.randn(4, 32, 8) for _ in range(10)], "down": [torch.randn(4, 8, 16) for _ in range(10)]})
         engine._settle_preset_demand(config, decode_target, pool_sizes, cache)
         assert cache.prefill_demand_tokens == config.moe_prefill_demand_tokens
+        # only the preset's chunks may also go by the bytes each way copies, and FREETOKEN_PREFILL_DEMAND_BY_MISSES=0 stops that
+        assert cache.prefill_demand_by_misses == (by_misses and "moe_prefill_demand_tokens" in config.preset_fields)
         assert ("moe_prefill_demand_tokens" in config.preset_fields) == (bool(fields) and config.moe_prefill_demand_tokens == 96)
         return config.moe_prefill_demand_tokens
 
     # 40 experts, 8 staging slots: a slot for every expert outside them, or one short of it
-    assert settled(7) == 96 and settled(0) == 96 and settled(8) == 0
+    assert settled(7) == 96 and settled(0) == 96 and settled(8) == 0 and settled(7, by_misses=False) == 96
     assert settled(0, decode_target="hybrid") == 0 and settled(0, decode_target="cpu") == 0
     assert settled(0, pool_sizes=[3, 37]) == 0  # a pool smaller than a layer: a chunk can route to every expert of one
     # typed tokens are the command line's: kept on any cache, and refused by it as without the preset
