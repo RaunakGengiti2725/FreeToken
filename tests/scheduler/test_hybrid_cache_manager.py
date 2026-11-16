@@ -201,6 +201,64 @@ def test_turn_anchor_is_where_the_next_turn_parts_from_the_prompt():
         assert pm._turn_anchor(prompt[:4]) is None
 
 
+def test_prefill_plan_covers_the_chunk_and_snapshots_where_the_next_request_matches():
+    """SpecRunner.prefill_plan with prefill graphs: the steps cover the chunk's tokens exactly, there is one snapshot, at
+    the turn anchor when the chunk crosses it and else one token before the end, and the request's mark and slot agree with it."""
+    from freetoken.scheduler.prefill import ChunkedReq
+    from freetoken.spec.runner import SpecRunner
+
+    sizes, limit, pair = [1 << i for i in range(11)], 2048, (7, 8)
+    runner = object.__new__(SpecRunner)
+    runner.k, runner.device = 3, torch.device("cpu")
+    runner.engine = SimpleNamespace(
+        chunk_runners=dict.fromkeys(sizes), chunk_graphs_usable=lambda: True, page_table=torch.zeros(1, 1 << 16),
+        config=SimpleNamespace(prefill_graph_tokens=limit), prefill_runner=None,
+    )
+
+    def plan(start, n, anchor=None, chunked=False):
+        tracked = (n - 1) // 64 >= 1  # what attention/linear.py's own tracking does for this extend
+        req = object.__new__(ChunkedReq) if chunked else SimpleNamespace()
+        req.cached_len, req.turn_anchor_len, req.mamba_ping_pong = start, anchor, pair
+        req.mamba_next_track_idx, req.mamba_last_track_seqlen = (1, start + (n - 1) // 64 * 64) if tracked else (0, None)
+        if chunked:
+            req.device_len = start + n
+        else:
+            req.extend_len = n
+        fla = SimpleNamespace(track_dst=torch.tensor([pair[0]]) if tracked else None)
+        batch = SimpleNamespace(reqs=[req], fla_metadata=fla)
+        return runner.prefill_plan(batch), req, batch, tracked
+
+    for start in (0, 100):
+        for n in [*range(1, 200), 1023, 1024, 1025, 2047, 2048, 2049, 5000, 8192]:
+            for anchor in (None, start + n - 5, start + 3, start):
+                for chunked in (False, True):
+                    steps, req, batch, tracked = plan(start, n, anchor, chunked)
+                    done, at = 0, None
+                    for i, (kind, size) in enumerate(steps):
+                        if kind == "track":
+                            assert at is None and 0 < done < n
+                            at = done
+                            continue
+                        # an eager step only opens a cut longer than the limit; nothing is left over, since size 1 is captured
+                        opens = i == 0 or steps[i - 1][0] == "track"
+                        assert kind == "chunk" and size in sizes or kind == "eager" and opens and size % 64 == 0 and n > limit, (n, steps)
+                        done += size
+                    assert done == n, (start, n, anchor, chunked, steps)
+                    if chunked:
+                        want = (n - 1) // 64 * 64 if tracked else None
+                    elif anchor is not None and start < anchor < start + n:
+                        want = anchor - start
+                    else:
+                        want = n - 1 if n >= 2 else None
+                    assert at == want, (start, n, anchor, chunked, steps)
+                    if at is None:
+                        assert req.mamba_last_track_seqlen is None and req.mamba_next_track_idx == 0
+                        continue
+                    assert req.mamba_last_track_seqlen == start + at
+                    # the slot the commit donates is the one the plan's snapshot goes to
+                    assert batch.prefill_track_dst.tolist() == [pair[1 - req.mamba_next_track_idx]]
+
+
 def test_naive_cache_does_not_align_prefill_chunks():
     """The alignment hook is hybrid-only; every other cache keeps the raw budget chunk."""
     from freetoken.scheduler.prefill import PrefillAdder
