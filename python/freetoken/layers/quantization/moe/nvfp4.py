@@ -39,6 +39,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
 
     name = "triton"
     cpu_format = "nvfp4"
+    groups_prefill_by_expert = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
@@ -74,9 +75,10 @@ class TritonNvfp4MoEKernel(MoEKernel):
         banks = (t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"])
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
         if is_prefill:
+            routed = view.routed
             return fused_experts_nvfp4(
                 x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit,
-                routed_experts=None if view.routed is None else view.routed.count,
+                routed_experts=None if routed is None else routed.count, slot_of=None if routed is None else routed.slot_of,
             )
         return fused_experts_decode_nvfp4_marlin(
             x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit,
@@ -133,7 +135,7 @@ class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):
         return fused_experts_nvfp4_w4a4(
             x, t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"],
             input_scales[0], input_scales[1], topk_weights, topk_ids, view.n, layer.activation, float(layer.alpha), limit_or_inf(layer),
-            routed_experts=None if routed is None else routed.count,
+            routed_experts=None if routed is None else routed.count, slot_of=None if routed is None else routed.slot_of,
         )
 
 
