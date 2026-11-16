@@ -87,7 +87,7 @@ READY_S = 900             # the longest a candidate's server may take to load
 PROMPTS = ("math", "code")
 DEPTHS = (3, 4, 5, 0)     # the static preset's first
 MAP_DEPTH = 5             # draft tokens of the candidate with a draft token map
-_VERSION = 4
+_VERSION = 5
 _now, _sleep = time.monotonic, time.sleep
 
 # removed from the command line of a candidate's server: the bench names these itself, and the preset must not measure again
@@ -392,7 +392,9 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
         skipped = {n: why for n, why in known.get("skipped", {}).items() if n in names and why != OUT_OF_TIME}
         wall = {n: float(v) for n, v in (known.get("wall_s") or {}).items() if n in tok_s} or {static[0]: 0.0}
         first = {**known["static"], **{k: known.get(k) for k in ("cache_slots", "total_slots", "slot_bytes", "gpu_free_bytes")}}
-        tail = float(known.get("tail_s") or 0.0)
+    # the candidates this run started: the budget is theirs, so a stored static choice that took most of an earlier
+    # budget does not keep the ones it left untimed from ever starting
+    ran: list[str] = []
     heads = [c for c in todo[1:] if c[2] == static[2] and c[3] is None]
     rest = [c for c in todo[1:] if c not in heads]
     queue, stage = [static], 0
@@ -430,7 +432,7 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
             # choice itself, and its rule already says the other depths of this strategy lose here
             skipped[name] = "the static preset serves this cache size without drafts"
             continue
-        if first is not None and _now() - t0 + SLACK * max(wall.values()) > BUDGET_S:
+        if ran and _now() - t0 + SLACK * max(wall[n] for n in ran) > BUDGET_S:
             skipped[name] = OUT_OF_TIME
             continue
         if stopped:
@@ -438,13 +440,14 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
             del stopped[:]
         began = _now()
         stopped[:] = [name]
+        ran.append(name)
         logger.info(f"--preset {PRESET}: timing {name} ({len(tok_s) + len(failed) + len(skipped) + 1} of {len(todo)}) ...")
         try:
             # a candidate that starts at under half the static choice's speed is stopped after its first tokens
             floors = [0.5 * e for e in first["early"]] if first is not None and all(first.get("early") or [None]) else None
             # the static choice may take as long as any server to load; the others must be ready with time left for their requests
             left = BUDGET_S - (began - t0)
-            ready_s = min(READY_S, left) if first is None else max(1.0, min(READY_S, left - tail))
+            ready_s = min(READY_S, left) if len(ran) == 1 else max(1.0, min(READY_S, left - tail))
             r = _time_candidate(args, argv, strategy, depth, floors, ready_s=ready_s, left_s=left, **({"token_map": token_map} if token_map else {}))
         except RuntimeError as exc:
             wall[name] = _now() - began

@@ -1492,6 +1492,15 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0))
     monkeypatch.setattr(calibrate, "_sleep", lambda seconds: None)
     free_now(_ROW_FREE)
+    # a static choice that took 280 s left every other candidate untimed. --calibrate-again does not time it again, so
+    # its seconds are not this run's: the first candidate not timed always starts, and the next ones are gated by the
+    # candidates of this run
+    monkeypatch.setattr(calibrate, "_time_candidate", taking(280.0))
+    slow, slow_argv = parsed("--memory-ratio", "0.802")
+    assert starts(slow, slow_argv) == ({"speculative_num_steps": 3}, 1)
+    monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0))
+    choice, timed = starts(*parsed("--memory-ratio", "0.802", "--calibrate-again"))
+    assert timed == 2 and started[-2:] == [("hybrid", 3), ("hybrid", 4)] and choice["moe_strategy"] == "hybrid"
     monkeypatch.setattr(calibrate, "_now", time.monotonic)
     monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (_ for _ in ()).throw(RuntimeError("the GPU could not be read")))
     assert starts(third, third_argv) == ({}, 0)
