@@ -1303,6 +1303,28 @@ def _gated_unfused(attn, qg):
     return attn.reshape(-1, heads * width // 2) * torch.sigmoid(gate)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The bits are those of torch's CUDA sigmoid and mul")
+@pytest.mark.parametrize("M", [1, 3, 64, 1000])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_prefill_attention_gate_read_where_it_lies_is_the_copied_gate_bit_for_bit(M, dtype):
+    """A prefill hands the output gate to the sigmoid as the strided half of the q|gate projection it is; the unfused
+    statements of decode copy it first. A prefilled token and the same token decoded must be gated to the same bits."""
+    from freetoken.models.qwen3_5_moe.attention import Qwen3_5Attention
+
+    heads, d = 16, 256  # Qwen3.6-35B-A3B's attention
+    gen = torch.Generator(device="cuda").manual_seed(M)
+    qkv = (4 * torch.randn(M, heads * 2 * d + 40, device="cuda", generator=gen)).to(dtype)
+    qg = qkv[:, : heads * 2 * d].view(M, heads, 2 * d)
+    before = qkv.clone()
+    attn = torch.randn(M, heads, d, device="cuda", generator=gen).to(dtype)
+    layer = SimpleNamespace(qo_attn_dim=heads * d, o_proj=SimpleNamespace(forward=lambda t: t))
+    gate = qg[..., d:]
+    assert not gate.is_contiguous() or M == 1
+    out = Qwen3_5Attention._combine(layer, attn, gate)
+    assert torch.equal(out, _gated_unfused(attn, qg)), f"{M} rows of {dtype}"
+    assert torch.equal(qkv, before), "the projection was written"
+
+
 def _assert_same_bf16_bits(out, ref, what):
     """Equal bf16 bits; a NaN matches a NaN of any payload."""
     assert out.shape == ref.shape and out.dtype == ref.dtype == torch.bfloat16, f"{what}: {out.shape} {out.dtype} against {ref.shape} {ref.dtype}"
