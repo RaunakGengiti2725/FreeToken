@@ -700,6 +700,8 @@ class Engine:
             # the warmup is what makes every expert resident, which the prefill graphs of an offloaded MoE are captured
             # on: the sizes the first pass had to leave are captured now
             self.chunk_runners.update(self._make_chunk_runners(self.graph_runner, init_free_memory, aligned_max_seq_len, have=self.chunk_runners))
+            if os.environ.get("FREETOKEN_PREFILL_GRAPH_CHECK") == "selftest":
+                self._selftest_chunk_graphs()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1518,7 +1520,14 @@ class Engine:
         chunk into replays of them). Each has its own attention capture and linear capture; one that cannot be
         captured is left out, with a warning."""
         config, pool, cache = self.config, self.linear_state_pool, self.moe_offload_cache
-        sizes = sorted({int(x) for x in config.prefill_graph_chunks.split(",") if x.strip()}, reverse=True)
+        sizes = set()
+        for part in config.prefill_graph_chunks.split(","):
+            # a count, a range "1-64", or a range with a step "128-512:64"
+            span, _, step = part.strip().partition(":")
+            low, _, high = span.partition("-")
+            if low:
+                sizes.update(range(int(low), int(high or low) + 1, int(step or 1)))
+        sizes = sorted(sizes, reverse=True)
         if config.prefill_graph_tokens <= 0 or not sizes or 1 not in target.graph_map or not self.spec.can_prefill_as_verify:
             return {}
         runners: Dict[int, GraphRunner] = {}
@@ -1559,6 +1568,42 @@ class Engine:
             except Exception as exc:  # noqa: BLE001 -- optional graphs: a failure leaves that size to the other steps
                 logger.warning_rank0(f"--prefill-graph-chunks {tokens}: the prefill graph was not captured ({type(exc).__name__}: {exc})")
         return runners
+
+    @torch.inference_mode()
+    def _selftest_chunk_graphs(self) -> None:
+        """Diagnostic (FREETOKEN_PREFILL_GRAPH_CHECK=selftest): every captured prefill forward against an eager prefill
+        forward of the same tokens, once from an empty state and once after a 96-token prefix, on the padding request's
+        row with seeded token ids; SpecRunner.prefill_as_verify prints one PREFILL_SPLIT_CHECK line each."""
+        from types import SimpleNamespace
+
+        row = self.page_table[self.dummy_req.table_idx]
+        saved, prefix = row.clone(), 96
+        generator = torch.Generator().manual_seed(0)
+        vocab = min(self.config.model_config.vocab_size, 100_000)
+
+        def run(ids: torch.Tensor, start: int, plan: list) -> None:
+            req = SimpleNamespace(
+                table_idx=self.dummy_req.table_idx, cached_len=start, device_len=ids.numel(), extend_len=ids.numel() - start,
+                linear_slot_idx=self.dummy_req.linear_slot_idx, mrope_delta=0, mrope_positions_full=None,
+            )
+            batch = SimpleNamespace(reqs=[req], input_ids=ids[start:].to(self.device), out_loc=row[start : ids.numel()], prefill_plan=plan)
+            self.spec.prefill_as_verify(batch, check=True)
+
+        try:
+            for size in sorted(self.chunk_runners):
+                if prefix + size > row.numel():
+                    continue
+                # free pages, as the warmup takes them
+                row[: prefix + size] = torch.arange(prefix + size, dtype=row.dtype, device=row.device)
+                ids = torch.randint(1000, vocab, (prefix + size,), generator=generator, dtype=torch.int32)
+                run(ids[:size], 0, [("chunk", size)])
+                run(ids[:prefix], 0, [("eager", prefix)])
+                run(ids, prefix, [("chunk", size)])
+        finally:
+            row.copy_(saved)
+            self.spec.proposer._prefill_sink = None
+        torch.cuda.synchronize(self.device)
+        logger.info_rank0(f"prefill graph self-test done for {len(self.chunk_runners)} sizes")
 
     def chunk_graphs_usable(self) -> bool:
         """Whether the prefill graphs may run now: those captured on an all-resident expert cache read its slots as they are."""
@@ -1686,7 +1731,7 @@ class Engine:
         if spec_prefill and self._prefill_runs_as_verify(batch):
             if os.environ.get("FREETOKEN_PREFILL_GRAPH_CHECK") == "split":
                 logits = self.spec.prefill_as_verify(batch, check=True)
-            elif os.environ.get("FREETOKEN_PREFILL_GRAPH_CHECK"):
+            elif os.environ.get("FREETOKEN_PREFILL_GRAPH_CHECK", "selftest") != "selftest":
                 logits = self._check_prefill_as_verify(batch)
             else:
                 logits = self.spec.prefill_as_verify(batch)

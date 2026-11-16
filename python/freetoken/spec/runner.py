@@ -178,15 +178,12 @@ class SpecRunner:
         ("verify", w): a verify step of w rows, whose rows past the chunk are padding. ("track", 0): the linear state
         as it is there is the chunk's snapshot.
 
-        With prefill graphs (--prefill-graph-chunks) the steps are prefill forwards only, largest graph first, and what
-        no graph fits runs eagerly: the result is that of eager prefill forwards cut at the same tokens. A request's
-        last chunk is cut where its snapshot is most useful and the linear state there is the snapshot: at the turn
-        anchor (Req.turn_anchor_len) when the chunk crosses it, else one token before the end, so the same prompt sent
-        again has one token left to run, whatever its length. Without prefill graphs the chunk runs as verify steps,
-        on the decode kernels.
+        With prefill graphs (--prefill-graph-chunks) a chunk of at most --prefill-graph-tokens tokens runs as one or
+        two replays of them, cut at the last 64-token boundary before its end, where its snapshot goes anyway: the
+        result is that of eager prefill forwards cut at that token. A chunk no such pair covers runs as one eager
+        forward. Without prefill graphs the chunk runs as verify steps, on the decode kernels.
         """
         from freetoken.kernel.fla.chunk import CHUNK_SIZE
-        from freetoken.scheduler.prefill import ChunkedReq
 
         engine, req, fla = self.engine, batch.reqs[0], batch.fla_metadata
         sizes = sorted(engine.chunk_runners, reverse=True)
@@ -195,58 +192,24 @@ class SpecRunner:
         steps: List[tuple[str, int]] = []
         left = req.extend_len
 
-        def cut(n: int) -> None:
-            # the graphs take about the last --prefill-graph-tokens tokens; whole 64-token blocks before them are one eager forward
-            head = max(n - limit, 0) // CHUNK_SIZE * CHUNK_SIZE
-            if head:
-                steps.append(("eager", head))
-                n -= head
-            for b in sizes:
-                while n >= b:
-                    steps.append(("chunk", b))
-                    n -= b
-            if n:
-                steps.append(("eager", n))
-
         if sizes:
-            if not engine.chunk_graphs_usable():
+            # One or two replays, or nothing: a replay of a captured prefill forward has a fixed cost of several
+            # milliseconds, so a chunk cut into many of them is slower than one eager forward. The cut is where the
+            # eager forward's own tracking puts the chunk's snapshot (the last 64-token boundary before its end), so
+            # the snapshot costs no step of its own and the request's mark and slot are the ones the forward's
+            # metadata already set.
+            if left > engine.config.prefill_graph_tokens or not engine.chunk_graphs_usable():
                 return None
-            limit, start = engine.config.prefill_graph_tokens, req.cached_len
-            tracked = fla is not None and fla.track_dst is not None
-            at = None
-            if isinstance(req, ChunkedReq):
-                # not the prompt's last chunk: its snapshot stays where the forward's own tracking marked it
-                at = req.mamba_last_track_seqlen - start if tracked else None
-            elif tracked or getattr(req, "mamba_ping_pong", None) is not None:
-                # where the snapshot goes: the turn anchor when this chunk crosses it (the next turn of the
-                # conversation reuses up to there), else one token before the end (the same prompt sent again does)
-                anchor = getattr(req, "turn_anchor_len", None)
-                if anchor is not None and start < anchor < start + left:
-                    at = anchor - start
-                elif left >= 2 and (tracked or req.mamba_last_track_seqlen is None):
-                    # not over a mark carried from the chunk before: that one serves the next turn as well
-                    at = left - 1
-                page = engine.config.page_size
-                if at is not None and (start + at) % page:
-                    # the commit takes a snapshot only at a page boundary
-                    at = (start + at) // page * page - start
-                    at = at if at > 0 else None
-                if at is None and tracked:
-                    return None  # the forward's own tracking stands: one eager forward
-            if at is None:
-                cut(left)
-                return steps
-            if not tracked:
-                # a chunk of 64 tokens or fewer, which the forward's own tracking leaves without a snapshot
-                slot = req.mamba_ping_pong[req.mamba_next_track_idx]
-                req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
-                batch.prefill_track_dst = torch.tensor([slot], dtype=torch.int64).to(self.device, non_blocking=True)
-            else:
-                batch.prefill_track_dst = fla.track_dst
-            req.mamba_last_track_seqlen = start + at
-            cut(at)
-            steps.append(("track", 0))
-            cut(left - at)
+            head = (left - 1) // CHUNK_SIZE * CHUNK_SIZE
+            tail = left - head
+            if tail not in engine.chunk_runners or (head and head not in engine.chunk_runners):
+                return None
+            if head:
+                steps.append(("chunk", head))
+                if fla is not None and fla.track_dst is not None:
+                    batch.prefill_track_dst = fla.track_dst
+                    steps.append(("track", 0))
+            steps.append(("chunk", tail))
             return steps
         if fla is not None and fla.track_dst is not None:
             return None  # verify steps cannot stop at the tracked boundary

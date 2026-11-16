@@ -1006,8 +1006,7 @@ def parse_args(
             "With speculative decoding and no --prefill-graph-chunks, a prefill chunk of at most this many "
             "tokens on a cached prefix runs as captured verify steps (the CUDA graphs decode already uses) "
             "instead of an eager forward: other kernels, so other text. With --prefill-graph-chunks it is "
-            "about how many of a chunk's last tokens run through the captured prefill forwards; whole 64-token "
-            "blocks before them run as one eager forward. 0 = always eager."
+            "the longest chunk that runs through the captured prefill forwards. 0 = always eager."
         ),
     )
 
@@ -1017,12 +1016,13 @@ def parse_args(
         dest="prefill_graph_chunks",
         default=ServerArgs.prefill_graph_chunks,
         help=(
-            "With --prefill-graph-tokens, capture prefill forwards of these token counts of one request "
-            "(comma separated, e.g. 1,2,4,8,16,32,64,128,256,512,1024): a chunk is cut into replays of them, "
-            "largest first, and what no size fits runs as an eager prefill forward, so the result is that of "
-            "eager prefill forwards cut at the same tokens. The chunk's snapshot goes where the next request "
-            "can use it: before the generation prompt's tail, or one token before the end. With an offloaded "
-            "MoE the sizes are captured once every expert is resident (a cache with a slot for each, "
+            "With --prefill-graph-tokens, capture prefill forwards of these token counts of one request: "
+            "counts and ranges, comma separated, e.g. 1-64,128-512:64 (1 to 64, then every 64 to 512). A chunk "
+            "runs as one replay, or as two cut at the last 64-token boundary before its end, where its snapshot "
+            "goes anyway, so the result is that of eager prefill forwards cut at that token; a chunk no such "
+            "pair covers runs as one eager forward. A replay has a fixed cost of several milliseconds, so "
+            "the captured forwards pay for chunks of a few hundred tokens or fewer. With an offloaded MoE the "
+            "sizes are captured once every expert is resident (a cache with a slot for each, "
             "--moe-prefill-hit-d2d) or within --moe-prefill-demand-tokens. Empty = none."
         ),
     )
