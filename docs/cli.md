@@ -130,26 +130,33 @@ A flag on the command line always wins, also when it repeats the default (`--mem
 cannot apply, each with one log line: speculative decoding where the checkpoint has no MTP layers (or
 an explicit `--speculative-algorithm mtp` would be refused), host embeddings where the table is tied
 to the LM head, and the KV reserve where the expert cache's minimum does not fit beside it (the
-warning names the largest `--kv-reserve-tokens` that does). The startup log lists what the preset set,
+warning names the largest `--kv-reserve-tokens` that does). The KV reserve is never more than the
+model's context, and it is lowered, to the default at the least, where it would leave fewer expert
+slots than a server without the preset plans. The startup log lists what the preset set,
 what each setting did to the `--moe-cache-auto` plan, and the resulting expert slots and KV tokens.
 
 `--preset single` measures nothing: it serves with `offload` (or what `--moe-strategy auto` takes
 from an [`ft bench decode`](#ft-bench-decode) row) and 3 draft tokens. `--preset single-measured`
 is the same preset, and on its first start for a checkpoint, set of flags and machine it times the
 candidates the preset cannot choose between: `offload` and `hybrid`, each with no drafts, 3 and 5
-MTP draft tokens. Each candidate is one server start that decodes 512 tokens after 256 warm-up
-tokens on two built-in prompts (a math problem and a coding task), with the checkpoint's sampling.
-The candidate whose smaller lead over `offload` with 3 draft tokens across the two prompts is largest
-runs, if that lead is above 10%; otherwise the static preset's choice runs. This is measured on the
-first start, before the server loads; the log prints the time (`calibration took N s`): six model
-loads and about 9,000 decoded tokens, so expect several minutes. A strategy or a speculative setting
-given on the command line is not timed, and a checkpoint that drafts nothing is timed for the
-strategy alone.
+MTP draft tokens. Each candidate is one server start that decodes two built-in prompts (a math
+problem and a coding task) twice over, with the checkpoint's sampling: each time 512 timed tokens
+after 1024 warm-up tokens that fill the expert cache. A candidate's lead over `offload` with 3 draft
+tokens is its smallest across the prompts and the passes; the candidate with the largest lead runs,
+if that lead is above 10%, and otherwise the static preset's choice runs, with `--moe-strategy` as
+the command line left it. This is measured on the first start, before the server loads; the log
+prints the time (`calibration took N s`): six model loads and about 37,000 decoded tokens, so
+expect it to take a while. A strategy or a speculative setting given on the command line is not
+timed, and a checkpoint that drafts nothing is timed for the strategy alone (two model loads).
+SIGTERM, SIGHUP or Ctrl-C during the calibration stops the candidate's server and ends the launcher
+with exit code 128 + the signal.
 
 The timings are kept in the decode profile, next to the `ft bench decode` rows, and are read under
-the same conditions as those rows (same checkpoint and flags, same machine and release, and with an
-automatically sized cache no more free GPU memory than when they were taken), so later starts
-measure nothing and say which calibration they read. Where the calibration cannot be done or its
+the same conditions as those rows (same checkpoint and flags, same machine and release), so later
+starts measure nothing and say which calibration they read. A `--moe-cache-rate` or `--moe-cache-size`
+is part of those flags. With an automatically sized cache the timings are read only while about as
+much GPU memory is free as when they were taken: clearly more or clearly less is timed again. Where
+the calibration cannot be done or its
 static candidate does not start, the static preset runs and one log line says why; a candidate that
 does not start is not chosen. The 10% margin and the token counts are not tuned on measurements.
 
