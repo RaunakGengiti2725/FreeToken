@@ -916,7 +916,7 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
             return parse_args(argv)[0], argv
 
     speeds = {("offload", 3): [100.0, 200.0], ("hybrid", 3): [130.0, 250.0], ("offload", 0): [60.0, 90.0],
-              ("hybrid", 0): [70.0, 120.0], ("offload", 5): [105.0, 190.0]}  # hybrid with 5 drafts does not start
+              ("hybrid", 0): [70.0, 120.0], ("offload", 5): [105.0, 190.0], ("hybrid", 5): [110.0, 195.0]}
     started = []
 
     def time_candidate(args, argv, strategy, depth, floors=None):
@@ -937,6 +937,17 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     free_now(_ROW_FREE)
     args, argv = parsed()
     hybrid_3 = {"moe_strategy": "hybrid", "moe_cache_auto": True, "speculative_num_steps": 3}
+    # the faster candidate does not start, once: the static choice runs, and the next start times again and takes it
+    hybrid = speeds.pop(("hybrid", 3))
+    assert starts(args, argv) == ({"speculative_num_steps": 3}, 6)
+    speeds["hybrid", 3] = hybrid
+    assert starts(args, argv) == (hybrid_3, 6) and starts(args, argv) == (hybrid_3, 0)
+    # a candidate that fails on two starts in a row is left out from then on, not timed at every start
+    del speeds["hybrid", 5]
+    again, again_argv = parsed("--memory-ratio", "0.6")
+    assert [starts(again, again_argv)[1] for _ in range(3)] == [6, 6, 0]
+    speeds["hybrid", 5] = [110.0, 195.0]
+    args, argv = parsed("--memory-ratio", "0.65")
     assert starts(args, argv) == (hybrid_3, 6)
     # the same checkpoint, flags, machine and release: the stored timings answer and no server is started
     assert starts(args, argv) == (hybrid_3, 0)

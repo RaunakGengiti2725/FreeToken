@@ -163,7 +163,8 @@ is part of those flags. With an automatically sized cache the timings are read o
 much GPU memory is free as when they were taken: clearly more or clearly less is timed again. Where
 the calibration cannot be done or its
 static candidate does not start, the static preset runs and one log line says why; a candidate that
-does not start is not chosen. The 10% margin and the token counts are not tuned on measurements.
+does not start is not chosen, the log names it, and the next start times the candidates again (a
+candidate that fails on two starts in a row is left out from then on). The 10% margin and the token counts are not tuned on measurements.
 
 ### API behaviour
 

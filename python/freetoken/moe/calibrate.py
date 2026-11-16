@@ -10,7 +10,8 @@ A dimension the command line fixed (--moe-strategy, --speculative-algorithm) is 
 row of the decode profile (moe/decode_profile.py), under the key and the stamp `--moe-strategy auto` reads its rows
 by, so a later start with the same checkpoint, flags, machine and release measures nothing; with an automatically
 sized cache, only while about as much GPU memory is free as when they were taken. A candidate that does
-not start is not chosen; when the static choice itself cannot be timed, or anything else fails, the static preset
+not start is not chosen, and the next start times the candidates again (once: a candidate that fails twice in a
+row is left out from then on); when the static choice itself cannot be timed, or anything else fails, the static preset
 runs and one log line says why. The servers are started and timed by `ft bench decode`'s own code (moe/benchdecode.py).
 """
 
@@ -77,7 +78,7 @@ def choose(tok_s: dict, names: list[str], margin: float = MARGIN) -> tuple[str, 
 def _usable(row: dict) -> bool:
     """What every reader of a calibration row relies on; the file can be edited by hand."""
     tok = row.get("tok_s")
-    if not isinstance(tok, dict) or not tok or not isinstance(row.get("failed", {}), dict):
+    if not isinstance(tok, dict) or not tok or not all(isinstance(row.get(k, {}), dict) for k in ("failed", "skipped")):
         return False
     width = len(PROMPTS)
     if not all(row.get(k) is None or (isinstance(row[k], int) and not isinstance(row[k], bool)) for k in ("cache_slots", "total_slots", "slot_bytes", "gpu_free_bytes")):
@@ -129,6 +130,10 @@ def child_flags(argv: list[str], depth: int | None) -> list[str]:
     return out
 
 
+class _Slower(RuntimeError):
+    """The bench stopped a candidate that started under half the static choice's speed: a result, not a failure."""
+
+
 def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, floors: list[float] | None = None) -> dict:
     """One server start of a candidate through the bench's own code: its tok/s per prompt and pass, and what it ran with.
     Raises RuntimeError when the server does not start or does not answer, or when a request starts below its
@@ -152,7 +157,7 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
     ns.eos = benchdecode.eos_strings(ns.model)
     r = benchdecode.run_arm(ns, extra, arm, None, [(name, builtin[name]) for name in PROMPTS], [], sampling, floors)
     if any(x.get("gave_up") for x in r["results"]):
-        raise RuntimeError("stopped early: under half the static choice's speed")
+        raise _Slower("stopped early: under half the static choice's speed")
     return {
         "tok_s": [[float(run["tok_s"]) for run in benchdecode.runs_of(x)] for x in r["results"]],
         "drafts": sum(int(x.get("draft_n") or 0) for x in r["results"]),
@@ -206,14 +211,15 @@ def measure(args, argv: list[str], todo: list[tuple[str, str, int | None]]) -> d
 
 def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None]]) -> dict:
     t0 = time.monotonic()
-    tok_s, failed = {}, {}
+    # failed: did not start or answer, timed again on the next start. skipped: left out for a reason that holds then too
+    tok_s, failed, skipped = {}, {}, {}
     first = None
     for name, strategy, depth in todo:
         if first is not None and not first["drafts"] and depth != todo[0][2]:
             # the static choice drafted nothing: this checkpoint has no MTP layers, and every depth is the same server
-            failed[name] = "not timed: the checkpoint drafts nothing"
+            skipped[name] = "the checkpoint drafts nothing"
             continue
-        logger.info(f"--preset {PRESET}: timing {name} ({len(tok_s) + len(failed) + 1} of {len(todo)}) ...")
+        logger.info(f"--preset {PRESET}: timing {name} ({len(tok_s) + len(failed) + len(skipped) + 1} of {len(todo)}) ...")
         try:
             # a candidate that starts at under half the static choice's speed is stopped after its first tokens
             floors = [0.5 * e for e in first["early"]] if first is not None and all(first.get("early") or [None]) else None
@@ -221,12 +227,12 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None]]) -> 
         except RuntimeError as exc:
             if first is None:
                 raise
-            failed[name] = str(exc).splitlines()[0][:300]
+            (skipped if isinstance(exc, _Slower) else failed)[name] = str(exc).splitlines()[0][:300]
             continue
         first = first or r
         tok_s[name] = r["tok_s"]
     return {
-        "tok_s": tok_s, "failed": failed, "columns": list(PROMPTS), "warm": WARM, "decode": DECODE, "passes": PASSES,
+        "tok_s": tok_s, "failed": failed, "skipped": skipped, "columns": list(PROMPTS), "warm": WARM, "decode": DECODE, "passes": PASSES,
         "cache_slots": first["cache_slots"], "total_slots": first["total_slots"], "slot_bytes": first["slot_bytes"],
         "gpu_free_bytes": first["gpu_free_bytes"], "seconds": round(time.monotonic() - t0, 1),
         "measured_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
@@ -239,8 +245,9 @@ def _stale(row: dict, names: list[str], free: int | None, args) -> str | None:
 
     if names[0] not in row["tok_s"]:
         return f"it has no timing of {names[0]}"
-    if missing := [n for n in names if n not in row["tok_s"] and n not in row.get("failed", {})]:
-        return f"it has no timing of {', '.join(missing)}"
+    if missing := [n for n in names if n not in row["tok_s"] and n not in row.get("skipped", {})]:
+        failed = row.get("failed", {})
+        return "it has no timing of " + ", ".join(f"{n} (failed: {failed[n]})" if n in failed else n for n in missing)
     if _moe_cache_is_auto(args):
         return _memory_objection(row, free, args.memory_ratio)
     return None
@@ -309,6 +316,7 @@ def measured_choice(args, argv: list[str]) -> dict:
         key = f"{_decode_decision_key(args)}|calibration={_VERSION}:{','.join(names)}"
         stamp = decode_profile.stamp(gpu_name, gpu_uuid)
         row, reason = decode_profile.lookup(key, gpu_name=gpu_name, gpu_uuid=gpu_uuid, now=stamp, well_formed=_usable)
+        failed_before = set(row.get("failed", {})) if row is not None else set()
         if row is not None and (stale := _stale(row, names, free, args)):
             row, reason = None, f"the stored calibration does not apply: {stale}"
         if row is None:
@@ -318,6 +326,14 @@ def measured_choice(args, argv: list[str]) -> dict:
             )
             # the launcher's own reading of the free memory: a later start compares its reading with this one
             row = {**measure(args, argv, todo), "stamp": stamp, "gpu_free_bytes": free}
+            for again in failed_before & set(row["failed"]):
+                # a second failure in a row is not a passing one: later starts do not time for it again
+                row["skipped"][again] = "failed twice: " + row["failed"].pop(again)
+            if row["failed"]:
+                logger.warning(
+                    f"--preset {PRESET}: not timed, and so not chosen: " + "; ".join(f"{n} ({why})" for n, why in row["failed"].items())
+                    + ". The next start times the candidates again"
+                )
             took = f"calibration took {row['seconds']:.0f} s"
             try:
                 decode_profile.store(key, row, gpu={"name": gpu_name, "uuid": gpu_uuid})
@@ -337,5 +353,8 @@ def measured_choice(args, argv: list[str]) -> dict:
         why = f"no candidate leads it by more than {MARGIN:.0%} on every prompt and pass"
         if "moe_strategy" in args.preset_fields:
             why += f"; --moe-strategy stays {args.moe_strategy}"
+    left = {**row.get("skipped", {}), **row.get("failed", {})}
+    if untimed := "; ".join(f"{n} ({left[n]})" for n in names if n in left):
+        timed += f"; not timed: {untimed}"
     logger.info(f"--preset {PRESET}: {took}; mean tok/s on {'/'.join(PROMPTS)}: {timed}; taking {name}: {why}")
     return _overrides(args, strategy, depth, static=name == names[0])
