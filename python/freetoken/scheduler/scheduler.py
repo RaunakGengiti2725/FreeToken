@@ -616,7 +616,9 @@ class Scheduler(SchedulerIOMixin):
         pool: weights + KV + MoE cache + graphs). 0 on CPU. Cheap, no device sync."""
         if self.device.type != "cuda":
             return 0
-        return torch.cuda.memory_reserved(self.device)
+        # memory_reserved() reads the same counter after flattening and sorting every allocator statistic, on each reply
+        stats = torch.cuda.memory_stats_as_nested_dict(self.device)
+        return stats.get("reserved_bytes", {}).get("all", {}).get("current", 0)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
