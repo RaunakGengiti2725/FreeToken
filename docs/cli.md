@@ -147,8 +147,9 @@ candidates the preset cannot choose between: `offload` and `hybrid`, each with n
 MTP draft tokens. Each candidate is one server start that decodes two built-in prompts (a math
 problem and a coding task) twice over, with the checkpoint's sampling: each time 512 timed tokens
 after 1024 warm-up tokens that fill the expert cache. A candidate's lead over `offload` with 3 draft
-tokens is its smallest across the prompts and the passes; the candidate with the largest lead runs,
-if that lead is above 10%, and otherwise the static preset's choice runs, with `--moe-strategy` as
+tokens is taken per prompt from the means over the two passes and is the smaller of the two prompts';
+a candidate behind in any single pass has none. The candidate with the largest lead runs, if that
+lead is above 10%, and otherwise the static preset's choice runs, with `--moe-strategy` as
 the command line left it. This is measured on the first start, before the server loads; the log
 prints the time (`calibration took N s`): six model loads and about 37,000 decoded tokens, so
 expect it to take a while. A strategy or a speculative setting given on the command line is not
