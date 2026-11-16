@@ -40,6 +40,7 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
     track_state: Optional[torch.Tensor] = None,
+    value_rows: Optional[torch.Tensor] = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -53,6 +54,7 @@ def chunk_gated_delta_rule_fwd(
         beta=beta,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        value_rows=value_rows,
     )
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
@@ -99,6 +101,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
         track_state: Optional[torch.Tensor] = None,
+        value_rows: Optional[torch.Tensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -124,6 +127,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             track_state=track_state,
+            value_rows=value_rows,
         )
         return o.to(q.dtype), h
 
@@ -142,6 +146,7 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     track_state: Optional[torch.Tensor] = None,
+    value_rows: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -173,6 +178,9 @@ def chunk_gated_delta_rule(
         track_state (Optional[torch.Tensor]):
             Output of shape `[N, H, V, K]`, filled with each sequence's state entering its last chunk
             in its own dtype (the per-chunk `h` holds it in the input dtype). Default: `None`.
+        value_rows (torch.Tensor):
+            The values as `[H * V, T]` contiguous, a row a value dim, read in place of `v`, which is then `None`.
+            Needs `cu_seqlens`. Default: `None`.
 
     Returns:
         o (torch.Tensor):
@@ -209,7 +217,9 @@ def chunk_gated_delta_rule(
             cu_seqlens=cu_seqlens
         )
     """
-    assert q.dtype == k.dtype == v.dtype
+    assert (v is None) != (value_rows is None), "the values come as v or as value_rows"
+    assert value_rows is None or (cu_seqlens is not None and value_rows.is_contiguous())
+    assert q.dtype == k.dtype == (value_rows if v is None else v).dtype
     assert (
         q.dtype != torch.float32
     ), "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
@@ -260,6 +270,7 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         track_state,
+        value_rows,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

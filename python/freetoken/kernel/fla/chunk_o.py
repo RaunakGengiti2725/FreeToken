@@ -143,7 +143,8 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.zeros_like(v)
+    # every row of o belongs to one chunk of one sequence and the kernel stores each chunk whole
+    o = torch.empty_like(v)
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)

@@ -344,6 +344,7 @@ def chunk_gated_delta_rule_fwd_intra(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
+    value_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""
     GDN intra-chunk forward: fused kkt + solve_tril + recompute_w_u.
@@ -412,5 +413,6 @@ def chunk_gated_delta_rule_fwd_intra(
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        value_rows=value_rows,
     )
     return w, u, A
