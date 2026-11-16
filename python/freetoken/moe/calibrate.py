@@ -7,7 +7,10 @@ smaller of the prompts'; a candidate behind the static choice in any single pass
 largest lead runs, if that lead is above MARGIN; otherwise the static choice runs. (The lead was first the smallest
 single pass's: on a 16 GB card that kept offload over a hybrid that led by 25% to 36% in three passes and 9.7% in one.)
 
-A dimension the command line fixed (--moe-strategy, --speculative-algorithm) is not a candidate. The timings are a
+A dimension the command line fixed (--moe-strategy, --speculative-algorithm) is not a candidate. Where the static
+preset serves every expert resident (fused: they fit on the GPU), fused is the only strategy and the depths are what
+is timed: hybrid then has nothing to compute on the CPU, and timing it against offload would judge it against a
+strategy the static preset does not run. The timings are a
 row of the decode profile (moe/decode_profile.py), under the key and the stamp `--moe-strategy auto` reads its rows
 by, so a later start with the same checkpoint, flags, machine and release measures nothing; with an automatically
 sized cache, only while about as much GPU memory is free as when they were taken. A candidate that does
@@ -50,11 +53,14 @@ _VERSION = 2
 _DROPPED = ("--model-path", "--model", "--host", "--port", "--api-key", "--moe-strategy", "--moe-backend", "--preset")
 
 
-def candidates(args) -> list[tuple[str, str, int | None]]:
+def candidates(args, fused: bool = False) -> list[tuple[str, str, int | None]]:
     """(name, strategy, depth) of every candidate, the static preset's choice first. A depth of None leaves
-    speculative decoding as the command line set it."""
+    speculative decoding as the command line set it. ``fused``: the static preset takes fused (_static_strategy)."""
     left = args.preset_fields
-    strategies = ["offload", "hybrid"] if "moe_strategy" in left else [args.moe_strategy]
+    if "moe_strategy" not in left:
+        strategies = [args.moe_strategy]
+    else:
+        strategies = ["fused"] if fused else ["offload", "hybrid"]
     depths = DEPTHS if "speculative_algorithm" in left and "speculative_num_steps" in left else (None,)
     return [(f"{s}@{'set' if d is None else d}", s, d) for d in depths for s in strategies]
 
@@ -113,6 +119,31 @@ def _probe_gpu(args) -> tuple[str | None, str | None, int | None]:
         raise RuntimeError(f"the GPU could not be read: {(done.stderr.strip().splitlines() or ['no error text'])[-1][:200]}")
     name, uuid, free = json.loads(done.stdout.strip().splitlines()[-1])
     return name, uuid, free
+
+
+def _static_strategy(args, argv: list[str]) -> str | None:
+    """The strategy the static preset resolves to for this command line on the GPU the server will bind, from the
+    engine's own _adjust_config in a process of its own (see _probe_gpu); None where that cannot be run."""
+    target = (args.gpu_assigned or args.gpu or ("0",))[0]
+    code = (
+        "import json, sys\n"
+        "from freetoken.server.args import parse_args\n"
+        "args, _ = parse_args(sys.argv[2:])\n"
+        "from freetoken.distributed import set_tp_info\n"
+        "from freetoken.engine import engine\n"
+        "from freetoken.gpu_select import bind_assigned_gpu, set_assigned_gpu\n"
+        "set_tp_info(rank=args.tp_info.rank, size=args.tp_info.size)\n"
+        "engine.set_quant_backend(engine._adjust_ftw_quant_backend(args.model_path, engine.QuantBackend.parse(args.quant_backend)))\n"
+        "set_assigned_gpu(sys.argv[1])\n"
+        "bind_assigned_gpu()\n"
+        "engine._adjust_config(args)\n"
+        "print(json.dumps(args.moe_strategy))\n"
+    )
+    try:
+        done = subprocess.run([sys.executable, "-c", code, target, *argv], capture_output=True, text=True, timeout=300)
+        return json.loads(done.stdout.strip().splitlines()[-1]) if done.returncode == 0 else None
+    except (subprocess.SubprocessError, ValueError, IndexError):
+        return None
 
 
 def child_flags(argv: list[str], depth: int | None) -> list[str]:
@@ -317,6 +348,11 @@ def measured_choice(args, argv: list[str]) -> dict:
         return static("calibrations are kept on Linux only: this machine's memory cannot be read from /proc")
     try:
         gpu_name, gpu_uuid, free = _probe_gpu(args)
+        if "moe_strategy" in args.preset_fields and _static_strategy(args, argv) == "fused":
+            todo = candidates(args, fused=True)
+            names = [name for name, _, _ in todo]
+            if len(todo) == 1:
+                return static("every expert fits on the GPU and the command line sets the speculative decoding: nothing to measure")
         # the candidates are part of the setup: a command line that fixes one of them is timed for itself
         key = f"{_decode_decision_key(args)}|calibration={_VERSION}:{','.join(names)}"
         stamp = decode_profile.stamp(gpu_name, gpu_uuid)

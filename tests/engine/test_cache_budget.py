@@ -883,6 +883,71 @@ def test_preset_speculative_decoding_is_dropped_where_an_explicit_start_is_refus
     assert resolved(preset=True, model_path=str(decode_rows.tmp / "not-downloaded")).speculative_algorithm is None
 
 
+def test_preset_serves_every_expert_resident_where_the_checkpoint_fits_and_the_strategy_was_left_alone(decode_rows, monkeypatch):
+    engine = decode_rows.engine
+    # stand-ins for what the checkpoint's own shapes give: 1000 B of KV a token in 16-token pages and 500 B fixed,
+    # 300 B of linear state, 7000 B for a prefill chunk; the weight file on disk is 100 B
+    monkeypatch.setattr(engine, "resolve_pool_class", lambda model: SimpleNamespace(kv_cost=lambda config: (16_000, 500, 16, 0)))
+    monkeypatch.setattr(engine, "state_pool_bytes", lambda config: 300)
+    monkeypatch.setattr(engine, "_prefill_working_bytes", lambda config, tokens: (7000, 0))
+    need = 100 + 8192 * 1000 + 500 + 300 + 7000
+
+    def strategy(free, fields=("moe_strategy",), **flags):
+        monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: free)
+        config = _resolved(decode_rows, preset="single", preset_fields=fields, max_seq_len_override=40960, **flags)
+        return config.moe_strategy
+
+    enough = -(-need * 20 // 19)  # the preset's memory ratio is the user's here: the default 0.9 would need more
+    assert strategy(enough, memory_ratio=0.95) == "fused" and strategy(enough - 64, memory_ratio=0.95) == "offload"
+    assert strategy(None, memory_ratio=0.95) == "offload"  # the free memory cannot be read
+    # the larger reserve of the preset counts: 36864 tokens do not fit where 8192 did; so does a KV pool sized on the command line
+    assert strategy(enough, memory_ratio=0.95, kv_reserve_tokens=36864) == "offload"
+    assert strategy(enough, memory_ratio=0.95, num_token_override=8192) == "fused"
+    assert strategy(enough, memory_ratio=0.95, num_token_override=8193) == "offload"
+    assert strategy(enough, memory_ratio=0.95, num_page_override=8193) == "offload"
+    # a strategy from the command line, typed auto included, is never replaced; nor is one without the preset
+    assert strategy(1 << 40, fields=()) == "offload" and strategy(1 << 40, fields=(), moe_strategy="hybrid") == "hybrid"
+    assert _resolved(decode_rows, max_seq_len_override=40960).moe_strategy == "offload"
+    # an expert cache the command line asks for is a cache; a checkpoint that is not on disk cannot be counted
+    assert strategy(1 << 40, moe_cache_rate=0.5) == "offload" and strategy(1 << 40, moe_cache_auto=True) == "offload"
+    monkeypatch.setattr(engine, "_checkpoint_bytes", lambda path: None)
+    assert strategy(1 << 40) == "offload"
+
+
+def test_preset_plan_takes_the_staging_slots_only_where_every_expert_and_the_kv_reserve_still_fit():
+    from freetoken.engine.cache_budget import plan_resident_staging
+
+    def terms(free, reserve=64):
+        return dict(
+            baseline_free=free, weights_bytes=0, memory_ratio=1.0, cache_per_page=160, fixed_cache_size=0, per_expert_bytes=50,
+            num_experts=4, total_experts=40, prefill_overlap=True, kv_reserve_tokens=reserve, page_size=16,
+        )
+
+    def staged(free, limit=None, **kw):
+        t = terms(free, **kw)
+        plan = resolve_moe_cache_auto(**t)
+        return plan, plan_resident_staging(plan, t, 8, limit)
+
+    # 40 experts of 50 B and 4 pages of reserve are 2640 B; 8 slots more cost 400 B, 3 pages
+    plan, with_staging = staged(2640 + 480)
+    assert plan == (40, 7, True) and with_staging == (48, 4, True)
+    assert staged(2640 + 479)[1] == (40, 6, True)  # the reserve would lose a page
+    assert staged(2640 - 50)[1][0] == 39  # not every expert fits: the plan as it is
+    capped = {**terms(1 << 20), "max_slots": 30}  # nor under a kernel's slot cap, whatever is left for KV
+    assert plan_resident_staging(resolve_moe_cache_auto(**capped), capped, 8)[0] == 30
+    assert staged(2640 + 480, limit=47)[1] == plan  # the kernel's slot limit
+    assert plan_resident_staging((40, 7, False), terms(2640 + 480), 8) == (40, 7, False)  # no prefill overlap, no staging buffers
+    # what the engine then builds: a cache of one slot an expert can never hold them all outside the staging buffers
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    def cache(extra):
+        c = OffloadMoeCache(num_layers=10, num_experts=4, cache_size=40 + extra, device=torch.device("cpu"), prefill_overlap=True, prefill_hit_d2d=True)
+        c.set_bank_sources({"gate_up": [torch.randn(4, 32, 8) for _ in range(10)], "down": [torch.randn(4, 8, 16) for _ in range(10)]})
+        return c
+
+    assert cache(8).holds_every_expert and not cache(7).holds_every_expert and not cache(0).holds_every_expert
+
+
 # ---- --preset single-measured (moe/calibrate.py): its rule, the timings it keeps in the decode profile, its fallback ----
 
 
@@ -957,7 +1022,9 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     def free_now(free):
         monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (*_ROW_GPU, free))
 
+    static_strategy = ["offload"]
     monkeypatch.setattr(calibrate, "_time_candidate", time_candidate)
+    monkeypatch.setattr(calibrate, "_static_strategy", lambda args, argv: static_strategy[0])
     free_now(_ROW_FREE)
     args, argv = parsed()
     hybrid_3 = {"moe_strategy": "hybrid", "moe_cache_auto": True, "speculative_num_steps": 3}
@@ -1017,6 +1084,19 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
         m.setattr(calibrate.decode_profile, "store", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left on device")))
         assert starts(fourth, fourth_argv) == ({"speculative_num_steps": 3}, 6)
     assert starts(fourth, fourth_argv) == ({"speculative_num_steps": 3}, 6) and starts(fourth, fourth_argv) == ({"speculative_num_steps": 3}, 0)
+    # every expert fits and the static preset serves them resident: fused is the strategy of every candidate, no hybrid
+    # is timed against it, and the timings are a row of their own. A deeper draft that leads keeps fused
+    static_strategy[0] = "fused"
+    speeds.update({("fused", 3): [100.0, 200.0], ("fused", 0): [60.0, 90.0], ("fused", 5): [120.0, 230.0]})
+    fifth, fifth_argv = parsed("--memory-ratio", "0.75")
+    assert starts(fifth, fifth_argv) == ({"moe_strategy": "fused", "speculative_num_steps": 5}, 3)
+    assert started[-3:] == [("fused", 3), ("fused", 0), ("fused", 5)] and starts(fifth, fifth_argv)[1] == 0
+    speeds["fused", 5] = [105.0, 190.0]
+    assert starts(*parsed("--memory-ratio", "0.72")) == ({"speculative_num_steps": 3}, 3)  # the static choice: the strategy stays auto
+    # a typed strategy is not asked about and stays, and typed drafts leave nothing to time
+    assert starts(*parsed("--moe-strategy", "hybrid", "--memory-ratio", "0.75"))[1] == 3 and started[-1] == ("hybrid", 5)
+    assert starts(*parsed("--speculative-algorithm", "off", "--memory-ratio", "0.75")) == ({}, 0)
+    static_strategy[0] = "offload"
     monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (_ for _ in ()).throw(RuntimeError("the GPU could not be read")))
     assert starts(third, third_argv) == ({}, 0)
 

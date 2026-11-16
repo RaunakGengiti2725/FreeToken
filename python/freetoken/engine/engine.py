@@ -269,6 +269,70 @@ def _prefill_working_bytes(config, tokens: int) -> tuple[int, int] | None:
     )
 
 
+def _checkpoint_bytes(path: str) -> int | None:
+    """Bytes of a checkpoint's weight files on disk; None where ``path`` is neither a weight file nor a folder that holds some."""
+    from freetoken.moe.decode_profile import _WEIGHT_FILES
+
+    path = os.path.realpath(os.path.expanduser(path))
+    try:
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+        if not os.path.isdir(path):
+            return None
+        files = [os.path.join(path, name) for name in os.listdir(path) if name.endswith(_WEIGHT_FILES)]
+        return sum(os.path.getsize(f) for f in files if os.path.isfile(f)) or None
+    except OSError:
+        return None
+
+
+def _preset_resident_need(config) -> int | None:
+    """GPU bytes a preset's server needs with every expert resident ('fused'): the checkpoint's weight files, the
+    preset's KV reserve with the draft's share, the linear states and one prefill chunk's working memory. None where
+    one of them cannot be counted before the load, or the command line asks for an expert cache."""
+    model = config.model_config
+    sized = config.moe_cache_size > 0 or config.moe_cache_rate or config.moe_cache_mem is not None or config.moe_cache_auto
+    if sized or config.moe_cpu_layers or config.tp_info.size > 1 or not _fused_resident_ok(model):
+        return None
+    weights = _checkpoint_bytes(config.model_path)
+    working = _prefill_working_bytes(config, config.max_forward_len)
+    if weights is None or working is None:
+        return None
+    if config.speculative_draft_model_path:
+        draft = _checkpoint_bytes(config.speculative_draft_model_path)
+        if draft is None:
+            return None
+        weights += draft
+    page_bytes, fixed, page_tokens, _ = resolve_pool_class(model).kv_cost(config)
+    if config.speculative_algorithm is not None:
+        spec_fixed, draft_token = _spec_runner().budget(config)
+        fixed += spec_fixed
+        page_bytes += draft_token * page_tokens
+    pages = -(-_preset_kv_target(config) // page_tokens)
+    # a KV pool the command line sized is allocated at that size, whatever is free
+    if config.num_token_override is not None:
+        pages = -(-config.num_token_override // page_tokens)
+    elif config.num_page_override is not None:
+        pages = config.num_page_override
+    return weights + pages * page_bytes + fixed + state_pool_bytes(config) + working[0]
+
+
+def _preset_takes_fused(config) -> bool:
+    """Whether a preset the command line left the strategy to serves every expert resident: what that needs
+    (_preset_resident_need) is within the memory ratio's share of the free GPU memory. A wrong yes is an
+    out-of-memory error while the weights load, so what cannot be counted is a no."""
+    if "moe_strategy" not in getattr(config, "preset_fields", ()):
+        return False
+    need, free = _preset_resident_need(config), _gpu_free_bytes()
+    if need is None or free is None:
+        return False
+    fits = need <= int(config.memory_ratio * free)
+    logger.info_rank0(
+        f"--preset {config.preset}: every expert resident needs {mem_GB(need)} of the {mem_GB(int(config.memory_ratio * free))} "
+        f"the memory ratio allows: {'fused' if fits else 'the expert cache'}"
+    )
+    return fits
+
+
 def _adjust_preset_spec_config(config, override, windowed_kv: bool) -> None:
     """Speculative decoding a preset turned on: kept where an explicit start's checks pass and the draft's source is
     on disk to be checked, dropped with one log line elsewhere."""
@@ -975,6 +1039,17 @@ class Engine:
         need = _prefill_working_bytes(config, config.max_forward_len)
         return need[0] if need is not None else 0
 
+    def _preset_staging_slots(self, config: EngineConfig, decode_target: str, pools: list) -> int:
+        """Expert slots a preset's automatic cache takes beyond one an expert where the plan has room for them
+        (cache_budget.plan_resident_staging): the slots the two prefill staging buffers lie over. 0 where a prefill
+        cannot read the slots anyway (no hit path, CPU-computed experts, or several pools, each capped at its experts),
+        and where the command line sized the KV pool: the plan's pages, which pay for the slots, are then not used."""
+        if config.preset is None or not (config.moe_prefill_hit_d2d and config.moe_prefill_overlap):
+            return 0
+        if decode_target != "gpu" or len(pools) != 1 or config.num_page_override is not None:
+            return 0
+        return 2 * config.model_config.num_experts
+
     def _settle_preset_kv_reserve(self, config: EngineConfig, banks, method, max_slots) -> None:
         """A preset's KV reserve is at most the model's context, and stays only while the plan keeps the expert slots
         of a server without the preset: where it would not, the reserve is the largest that does, the default reserve
@@ -1068,6 +1143,12 @@ class Engine:
         if self.moe_offload_cache is not None:
             total = config.model_config.num_moe_layers * config.model_config.num_experts
             parts.append(f"{config.moe_cache_size} of {total} expert slots ({config.moe_strategy})")
+            if self.moe_offload_cache.keeps_streamed_experts and self.moe_offload_cache.holds_every_expert:
+                parts.append("a prefill reads the slots once every expert is loaded")
+            elif config.moe_prefill_hit_d2d:
+                parts.append("a prefill streams the experts that are not resident (--moe-prefill-hit-d2d)")
+        elif getattr(config.model_config, "is_moe", False):
+            parts.append(f"every expert resident ({config.moe_strategy})")
         parts.append(f"{num_tokens} KV tokens")
         if reserve := self._preset_prefill_reserve(config):
             parts.append(f"{mem_GB(reserve)} left free for a prefill chunk of {config.max_forward_len} tokens")
@@ -1187,6 +1268,18 @@ class Engine:
             if "kv_reserve_tokens" in config.preset_fields:
                 self._settle_preset_kv_reserve(config, banks, method, size_cap)
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
+            if spare := self._preset_staging_slots(config, decode_target, pools):
+                from freetoken.engine.cache_budget import plan_resident_staging
+
+                terms = self._auto_cache_terms(config, banks, method, size_cap)
+                plan = plan_resident_staging((size, pages, overlap), terms, spare, self._moe_slot_limit)
+                if plan[0] > size:
+                    logger.info_rank0(
+                        f"--preset {config.preset}: {spare} expert slots more than the {size} experts, for "
+                        f"{(pages - plan[1]) * config.page_size} KV tokens: every expert then has a slot outside the prefill "
+                        "staging buffers, and a prefill reads the slots as decode does"
+                    )
+                size, pages, overlap = plan
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             if config.num_page_override is None:
@@ -2813,6 +2906,9 @@ def _adjust_config(config: EngineConfig):
                     "(use --moe-strategy offload to keep the offload flags)"
                 )
                 override("moe_cpu_layers", None)
+        if default_backend == "offload" and _preset_takes_fused(config):
+            # the one case where it is known that the experts fit: no slot cache, and a prefill reads them in place
+            default_backend = "fused"
         if default_backend == "offload" and getattr(config, "moe_decode_key", None) is not None:
             # hybrid only on a decode row measured for this setup, on this machine and release; offload without one
             default_backend, row = _measured_decode_strategy(config)

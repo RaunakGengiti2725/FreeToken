@@ -143,8 +143,24 @@ out-of-memory error. For a model without GatedDeltaNet layers the preset keeps t
 typed `--memory-ratio` gets no such reserve. The startup log lists what the preset set,
 what each setting did to the `--moe-cache-auto` plan, and the resulting expert slots and KV tokens.
 
-`--preset single` measures nothing: it serves with `offload` (or what `--moe-strategy auto` takes
-from an [`ft bench decode`](#ft-bench-decode) row) and 3 draft tokens. `--preset single-measured`
+Where every expert fits on the GPU the preset stops streaming them, in one of two ways, and the
+plan line says which. Both give the same output as the expert cache does.
+
+- If `--moe-strategy` is not on the command line and the checkpoint's weight files, the KV reserve
+  and the prefill chunk above fit in the memory ratio's share of the free GPU memory, the experts
+  are served resident (`--moe-strategy fused`): there is no expert cache, and a prefill reads them
+  in place. The sizes are counted before the load from the files on disk, so a checkpoint that is
+  not a local folder, a `--moe-cache-*` flag or `--moe-cpu-layers` keeps the expert cache. A typed
+  `--moe-strategy`, `auto` included, is never replaced.
+- With an automatically sized expert cache (`offload`) that has room for every expert, the plan
+  takes two layers' worth of slots more than there are experts, out of the KV tokens above the
+  reserve. The prefill staging buffers lie over that many slots, and only with every expert in a
+  slot outside them does a prefill read the slots as decode does. With fewer slots a prefill keeps
+  streaming what is not resident (`--moe-prefill-hit-d2d`).
+
+`--preset single` measures nothing: it serves with `fused` where every expert fits as described
+above, else with `offload` (or what `--moe-strategy auto` takes from an
+[`ft bench decode`](#ft-bench-decode) row), and 3 draft tokens. `--preset single-measured`
 is the same preset, and on its first start for a checkpoint, set of flags and machine it times the
 candidates the preset cannot choose between: `offload` and `hybrid`, each with no drafts, 3 and 5
 MTP draft tokens. Each candidate is one server start that decodes two built-in prompts (a math
@@ -157,6 +173,9 @@ the command line left it. This is measured on the first start, before the server
 prints the time (`calibration took N s`): six model loads and about 37,000 decoded tokens, so
 expect it to take a while. A strategy or a speculative setting given on the command line is not
 timed, and a checkpoint that drafts nothing is timed for the strategy alone (two model loads).
+Where the static preset serves the experts resident, `fused` is every candidate's strategy and only
+the three draft settings are timed (three model loads): with every expert on the GPU `hybrid` has
+nothing to compute on the CPU.
 SIGTERM, SIGHUP or Ctrl-C during the calibration stops the candidate's server and ends the launcher
 with exit code 128 + the signal.
 

@@ -128,10 +128,13 @@ _PRESETS: dict[str, dict] = {
         "speculative_algorithm": "mtp",
         "speculative_num_steps": 3,
         "kv_reserve_tokens": None,  # the default max output tokens + PRESET_PROMPT_TOKENS (_apply_preset)
+        # as the default: listed so that the engine can tell a strategy the command line left alone, which it serves
+        # 'fused' where every expert fits (engine._preset_takes_fused)
+        "moe_strategy": "auto",
     },
 }
-# the same, and which of offload and hybrid and how many draft tokens are timed on the first start (moe/calibrate.py)
-_PRESETS["single-measured"] = {**_PRESETS["single"], "moe_strategy": "auto"}
+# the same, and the strategy and the number of draft tokens are timed on the first start (moe/calibrate.py)
+_PRESETS["single-measured"] = dict(_PRESETS["single"])
 _UNSET = object()
 
 
@@ -1160,7 +1163,9 @@ def parse_args(
             "request at a time on a GPU smaller than the model: --max-running-requests 1, --embed-weights host, "
             "--memory-ratio 0.95, --moe-prefill-hit-d2d, mtp speculative decoding with 3 draft tokens where the "
             "checkpoint has the MTP layers, and a --kv-reserve-tokens that holds the default max output tokens and "
-            f"a {PRESET_PROMPT_TOKENS}-token prompt where the expert cache's minimum still fits. The log says what it set. "
+            f"a {PRESET_PROMPT_TOKENS}-token prompt where the expert cache's minimum still fits. Where every expert fits "
+            "on the GPU it serves them resident (--moe-strategy fused), or from an expert cache with a slot for each, so "
+            "that a prefill streams nothing; a typed --moe-strategy is kept. The log says what it set. "
             "'single-measured' is 'single', and on its first start for a checkpoint, flags and machine it also times "
             "offload against hybrid and 0, 3 and 5 draft tokens (one server start each), keeps the choice next to the "
             "`ft bench decode` rows and logs how long that took; later starts read the choice."

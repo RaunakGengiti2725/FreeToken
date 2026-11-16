@@ -105,10 +105,14 @@ _PRESET_SINGLE = {
 }
 
 
+# the strategy stays the default "auto": the preset lists it so that the engine can tell it was left alone
+_PRESET_FIELDS = (*_PRESET_SINGLE, "moe_strategy")
+
+
 def test_preset_single_changes_its_fields_and_nothing_without_the_flag():
     plain, preset = _parse(), _parse("--preset", "single")
     changed = {f.name: getattr(preset, f.name) for f in dataclasses.fields(plain) if getattr(plain, f.name) != getattr(preset, f.name)}
-    assert changed == {**_PRESET_SINGLE, "preset": "single", "preset_fields": tuple(_PRESET_SINGLE)}
+    assert changed == {**_PRESET_SINGLE, "preset": "single", "preset_fields": _PRESET_FIELDS}
     # without the flag: the class defaults, and a startup dump of the arguments that does not name it
     assert all(getattr(plain, name) == getattr(ServerArgs, name) for name in _PRESET_SINGLE)
     assert "preset" not in repr(plain)
@@ -128,6 +132,8 @@ def test_preset_single_changes_its_fields_and_nothing_without_the_flag():
         (("--speculative-algorithm", "dflash"), "speculative_algorithm", "dflash"),
         (("--speculative-num-steps", "5"), "speculative_num_steps", 5),
         (("--kv-reserve-tokens", "8192"), "kv_reserve_tokens", 8192),
+        (("--moe-strategy", "offload"), "moe_strategy", "offload"),
+        (("--moe-strategy", "auto"), "moe_strategy", "auto"),  # typed: the engine's auto, which never takes fused for the preset
     ],
 )
 def test_explicit_flag_wins_over_the_preset(flag, field, value):
@@ -135,8 +141,8 @@ def test_explicit_flag_wins_over_the_preset(flag, field, value):
     assert getattr(args, field) == value and field not in args.preset_fields
     # a method the user chose keeps its own default k; every other field is still the preset's
     theirs = {field, "speculative_num_steps"} if field == "speculative_algorithm" else {field}
-    assert set(args.preset_fields) == set(_PRESET_SINGLE) - theirs
-    assert all(getattr(args, name) == _PRESET_SINGLE[name] for name in args.preset_fields)
+    assert set(args.preset_fields) == set(_PRESET_FIELDS) - theirs
+    assert all(getattr(args, name) == _PRESET_SINGLE.get(name, "auto") for name in args.preset_fields)
     if field == "speculative_algorithm":
         assert args.speculative_num_steps == 0
 

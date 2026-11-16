@@ -1208,6 +1208,15 @@ class OffloadMoeCache:
         """Whether a prefill keeps the experts it streams (see _keep_streamed_experts): hit-d2d prefills with GPU decode."""
         return self.prefill_hit_d2d and self.prefill_overlap and self.decode_target == "gpu" and self.device.type == "cuda"
 
+    @property
+    def holds_every_expert(self) -> bool:
+        """Whether each pool has a slot outside the prefill staging buffers for every expert of its layers, which
+        ``all_resident`` needs of a cache that keeps what a prefill streams; a cache of one slot an expert has not."""
+        return not self.cpu_layer_ids and not self._unpinned_layers and all(
+            size - stable >= self.pool_of_layer.count(p) * self.num_experts
+            for p, (size, stable) in enumerate(zip(self.pool_sizes, self._pool_stable_from))
+        )
+
     def warm_prefill_keeps(self) -> bool:
         """Whether a warmup prefill would leave experts resident: the cache keeps what a prefill streams and the hit-d2d split is usable. Asked once at startup, where a fallback is logged."""
         return self.keeps_streamed_experts and self._hit_d2d_usable()

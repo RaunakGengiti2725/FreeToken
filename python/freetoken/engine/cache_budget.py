@@ -276,6 +276,23 @@ def budget_advice(stages: list[tuple[str, dict]], min_reserve_tokens: int) -> st
     return f"no fit{' even with ' + flags if flags else ''}: the minimum plan is still {short} B ({mem_GB(short)}) short"
 
 
+def plan_resident_staging(plan: tuple[int, int, bool], terms: dict, staging_slots: int, slot_limit: int | None = None) -> tuple[int, int, bool]:
+    """``plan`` (resolve_moe_cache_auto's for ``terms``) with ``staging_slots`` more expert slots, paid for in KV pages;
+    ``plan`` itself where it does not hold every expert, or the KV reserve or the kernel's ``slot_limit`` would not hold.
+
+    A prefill reads the slots as decode does once every expert has one outside the prefill staging buffers
+    (OffloadMoeCache.all_resident), which a cache of one slot an expert never reaches: the buffers lie over its first slots.
+    """
+    slots, pages, overlap = plan
+    cost = div_ceil(staging_slots * terms["per_expert_bytes"], terms["cache_per_page"])
+    reserve = div_ceil(terms["kv_reserve_tokens"], terms["page_size"])
+    if staging_slots <= 0 or not overlap or slots < terms["total_experts"] or pages - cost < max(reserve, 2):
+        return plan
+    if slot_limit is not None and slots + staging_slots > slot_limit:
+        return plan
+    return slots + staging_slots, pages - cost, overlap
+
+
 def kv_capacity_warning(kv_tokens: int, max_tokens: int, slots: int, terms: dict) -> str | None:
     """Startup warning for a --moe-cache-auto plan whose KV pool holds fewer than ``max_tokens``
     tokens, the most a request generates when it sets no max_tokens; None when it holds that many.
