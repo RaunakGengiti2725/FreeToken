@@ -1595,7 +1595,11 @@ class Engine:
         finally:
             dummy_row.fill_(dummy_slot)
             if self.moe_offload_cache is not None:
-                self.moe_offload_cache.reset()
+                if self.moe_offload_cache.keeps_streamed_experts:
+                    # the warmup streamed every expert once and the cache kept what it had room for: the first request finds them resident
+                    self.moe_offload_cache.reset_stats()
+                else:
+                    self.moe_offload_cache.reset()
         ended.record(self.stream)
         torch.cuda.synchronize(self.device)
         logger.info_rank0(
