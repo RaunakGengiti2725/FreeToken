@@ -1619,13 +1619,53 @@ class Engine:
         batch.prefill_plan = self.spec.prefill_plan(batch)
         return batch.prefill_plan is not None
 
+    def _check_prefill_as_verify(self, batch: Batch) -> torch.Tensor:
+        """Diagnostic: run the chunk eagerly, put the linear state back, run it as verify steps, and log how far apart the two are."""
+        pool, req = self.linear_state_pool, batch.reqs[0]
+        slot = gdn_slot(req)
+        rec0, conv0 = pool.recurrent_states[:, slot].clone(), pool.conv_states[:, slot].clone()
+        loc = batch.out_loc.long()
+        batch.features = self.spec.feature_sink(batch)
+        eager = self.forward_logits(batch)[:1].float().clone()
+        hid_e = batch.features.hidden.float().clone()
+        rec_e, conv_e = pool.recurrent_states[:, slot].clone(), pool.conv_states[:, slot].clone()
+        kv_e = []
+        for layer in range(64):
+            try:
+                kv_e.append((self.kv_cache.k_cache(layer)[loc].float().clone(), self.kv_cache.v_cache(layer)[loc].float().clone()))
+            except Exception:  # noqa: BLE001 -- past the last attention layer
+                break
+        pool.recurrent_states[:, slot] = rec0
+        pool.conv_states[:, slot] = conv0
+        graph = self.spec.prefill_as_verify(batch)
+        hid_g = self.spec.proposer._prefill_sink.hidden.float()
+        rel = lambda a, b: float((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-30))
+        top = eager[0].topk(2)
+        kv = [max(rel(self.kv_cache.k_cache(i)[loc], k), rel(self.kv_cache.v_cache(i)[loc], v)) for i, (k, v) in enumerate(kv_e)]
+        logger.info_rank0(
+            f"PREFILL_GRAPH_CHECK n={req.extend_len} cached={req.cached_len} argmax eager={int(eager[0].argmax())} graph={int(graph[0].argmax())} "
+            f"equal={bool(eager[0].argmax() == graph[0].argmax())} eager_top2_gap={float(top.values[0] - top.values[1]):.4f} "
+            f"logits_max_abs_diff={float((eager - graph.float()).abs().max()):.4f} logits_scale={float(eager.abs().max()):.2f} "
+            f"hidden_rel={rel(hid_g, hid_e):.5f} rec_state_rel={rel(pool.recurrent_states[:, slot], rec_e):.5f} "
+            f"conv_state_rel={rel(pool.conv_states[:, slot], conv_e):.5f} kv_rel_max={max(kv) if kv else -1:.5f} kv_layers={len(kv)} "
+            f"kv_rel_first={kv[0] if kv else -1:.5f} kv_rel_last={kv[-1] if kv else -1:.5f} "
+            f"rec_by_layer={[round(rel(pool.recurrent_states[i, slot], rec_e[i]), 5) for i in range(0, rec_e.shape[0], max(1, rec_e.shape[0] // 8))]} "
+            f"conv_by_layer={[round(rel(pool.conv_states[i, slot], conv_e[i]), 5) for i in range(0, conv_e.shape[0], max(1, conv_e.shape[0] // 8))]} "
+            f"hidden_by_row={[round(rel(hid_g[i], hid_e[i]), 5) for i in range(hid_e.shape[0])]} "
+            f"hidden_cos_last={float(torch.nn.functional.cosine_similarity(hid_g[-1], hid_e[-1], dim=0)):.6f}"
+        )
+        return graph
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         spec_prefill = self.spec is not None and batch.is_prefill
         if spec_prefill and self._prefill_runs_as_verify(batch):
-            logits = self.spec.prefill_as_verify(batch)
+            if os.environ.get("FREETOKEN_PREFILL_GRAPH_CHECK"):
+                logits = self._check_prefill_as_verify(batch)
+            else:
+                logits = self.spec.prefill_as_verify(batch)
         else:
             if spec_prefill:
                 batch.features = self.spec.feature_sink(batch)
