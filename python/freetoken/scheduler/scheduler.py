@@ -135,6 +135,8 @@ class Scheduler(SchedulerIOMixin):
         # the thinking tags' token ids, or why they cannot be tracked; resolved by the first request that asks
         self._think_tokens: ThinkTokens | str | None = None
         self._think_void: torch.Tensor | None = None
+        # (table row, rows) of each request of the last decode batch and the device tensor built from them: steps over the same requests repeat it
+        self._sent_rows: Tuple[List[Tuple[int, int]], torch.Tensor] | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -1000,7 +1002,7 @@ class Scheduler(SchedulerIOMixin):
         batch.positions = _make_positions(batch, self.device)
         if self._model_is_mrope:
             batch.mrope_positions = _make_mrope_positions(batch, self.device)
-        input_mapping = _make_input_tuple(batch, self.device)
+        input_mapping = (self._input_rows(batch), batch.positions.to(torch.int64))
         write_mapping = None if batch.phase == "verify" else _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
         if self.engine.linear_backend is not None:
@@ -1016,6 +1018,15 @@ class Scheduler(SchedulerIOMixin):
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
+
+    def _input_rows(self, batch: Batch) -> torch.Tensor:
+        """The page-table row of every batch row, on the device; a decode step over the same requests reuses the last copy."""
+        if batch.is_prefill:
+            return _make_input_rows(batch, self.device)
+        rows = [(req.table_idx, req.extend_len) for req in batch.padded_reqs]
+        if self._sent_rows is None or self._sent_rows[0] != rows:
+            self._sent_rows = (rows, _make_input_rows(batch, self.device))
+        return self._sent_rows[1]
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Plan the chunk's encoder jobs, gather rows and scatter rows over the batch; the engine runs them before the LM forward."""
@@ -1120,14 +1131,14 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
     return indices_host.to(device, non_blocking=True)
 
 
-def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
+def _make_input_rows(batch: Batch, device: torch.device) -> torch.Tensor:
+    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=device.type == "cuda")
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
         mapping_host[offset : offset + length].fill_(req.table_idx)
         offset += length
-    return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
+    return mapping_host.to(device, non_blocking=True)
 
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:

@@ -183,6 +183,27 @@ def test_drain_stamps_intermediate_timings_when_requested():
     assert reply[1].finished and reply[1].timings["predicted_n"] == 3
 
 
+def test_a_step_reads_the_table_rows_of_the_batch_in_front_of_it():
+    """The scheduler repeats the device copy of a decode batch's row mapping while its requests repeat: a reorder, a request leaving, a table row handed to another request, a different row count and a prefill in between must each reach the rows the step gathers its tokens and KV slots with."""
+    stub = SimpleNamespace(device=torch.device("cpu"), _sent_rows=None)
+
+    def rows(reqs, phase="verify"):
+        batch = Batch(reqs=reqs, phase=phase, rows_per_req=None if phase == "prefill" else reqs[0].extend_len)
+        batch.padded_reqs = reqs
+        batch.positions = torch.zeros(sum(r.extend_len for r in reqs), dtype=torch.int32)
+        return Scheduler._input_rows(stub, batch).tolist()
+
+    a, b = SimpleNamespace(table_idx=1, extend_len=K + 1), SimpleNamespace(table_idx=2, extend_len=K + 1)
+    for reqs in ([a, b], [a, b], [b, a], [a], [b]):
+        assert rows(reqs) == [r.table_idx for r in reqs for _ in range(K + 1)]
+    b.table_idx = 3
+    assert rows([b]) == [3] * (K + 1)
+    b.extend_len = 1
+    assert rows([b], "decode") == [3]
+    assert rows([SimpleNamespace(table_idx=0, extend_len=5)], "prefill") == [0] * 5
+    assert rows([b], "decode") == [3]
+
+
 def test_drain_commits_a_forced_token_as_the_end_of_the_accepted_run():
     """A request at its reasoning budget inside a verify step: the host plans the close tag for the row where the budget ends, the verify cuts the accepted drafts there, and the drain commits, rolls back and leaves pending exactly that prefix."""
     from freetoken.scheduler.reasoning import ReasoningTracker, ThinkTokens
