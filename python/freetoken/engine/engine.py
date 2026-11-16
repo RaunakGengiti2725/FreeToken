@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
-from freetoken.attention.linear import LinearAttnBackend, WideVerifyLinearBackend, gdn_slot
+from freetoken.attention.linear import ChunkCaptureLinearBackend, LinearAttnBackend, WideVerifyLinearBackend, gdn_slot
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
@@ -1422,6 +1422,9 @@ class Engine:
         if self.prefill_runner is not None:
             self.prefill_runner.destroy_cuda_graphs()
             self.prefill_runner = None
+        for chunk_runner in self.chunk_runners.values():
+            chunk_runner.destroy_cuda_graphs()
+        self.chunk_runners = {}
         if self.spec is not None:
             # the draft KV is keyed by the target's slots, so it can stay only when the target KV pool does
             self.spec.detach(keep_kv=num_pages is None and num_swa_pages is None)
@@ -1491,7 +1494,54 @@ class Engine:
         if self.spec is not None:
             self.spec.capture_graphs(runner.graph_bs_list, runner.graph_pool)
         self.prefill_runner = self._make_prefill_runner(runner, free_memory, max_seq_len) if rows > 1 else None
+        self.chunk_runners = self._make_chunk_runners(runner, free_memory, max_seq_len) if rows > 1 else {}
         return runner
+
+    def _capture_attn_backend(self):
+        """One more attention backend for a capture of another row count; it borrows the target backend's workspaces, which only one forward uses at a time."""
+        attn = create_attention_backend(self.config.attention_backend, self.config.model_config)
+        for name in ("float_workspace_buffer", "int_workspace_buffer", "prefill_wrapper", "decode_wrappers"):
+            if hasattr(attn, name) and hasattr(self.attn_backend, name):
+                setattr(attn, name, getattr(self.attn_backend, name))
+        return attn
+
+    def _make_chunk_runners(self, target: GraphRunner, free_memory: int, max_seq_len: int) -> Dict[int, GraphRunner]:
+        """Prefill graphs of --prefill-graph-chunks token counts of one request (SpecRunner.prefill_plan cuts a short
+        chunk into replays of them). Each has its own attention capture and linear capture; one that cannot be
+        captured is left out, with a warning."""
+        config, pool, cache = self.config, self.linear_state_pool, self.moe_offload_cache
+        sizes = sorted({int(x) for x in config.prefill_graph_chunks.split(",") if x.strip()}, reverse=True)
+        if config.prefill_graph_tokens <= 0 or not sizes or 1 not in target.graph_map or not self.spec.can_prefill_as_verify:
+            return {}
+        runners: Dict[int, GraphRunner] = {}
+        for tokens in sizes:
+            if cache is not None and not cache.loads_prefill_on_demand(tokens):
+                logger.warning_rank0(f"--prefill-graph-chunks {tokens}: not captured, the expert cache stages chunks of that length through host-side steps (--moe-prefill-demand-tokens is below it)")
+                continue
+            try:
+                dummy = Req(
+                    input_ids=torch.zeros(tokens, dtype=torch.int32, device="cpu"),
+                    table_idx=self.dummy_req.table_idx, cached_len=0, output_len=1, uid=-1,
+                    sampling_params=None, cache_handle=None,  # type: ignore[arg-type]
+                )
+                dummy.linear_slot_idx = self.dummy_req.linear_slot_idx
+                attn = self._capture_attn_backend()
+                linear = ChunkCaptureLinearBackend(self.device, pool, tokens) if pool is not None else None
+                sink = self.spec.chunk_rows_sink(tokens)
+
+                def hook(batch: Batch, sink=sink) -> None:
+                    batch.features = sink
+
+                runners[tokens] = GraphRunner(
+                    stream=self.stream, device=self.device, forward=self.model.forward, attn_backend=attn,
+                    cuda_graph_bs=[1], cuda_graph_max_bs=1, free_memory=free_memory, max_seq_len=max_seq_len,
+                    dummy_req=dummy, moe_offload_cache=cache, mrope=config.model_config.model_is_mrope,
+                    rows_per_req=tokens, phase="prefill", ctx_override={"attn_backend": attn}, batch_hook=hook,
+                    pool=target.graph_pool, out_dtype=torch.float32, linear_backend=linear,
+                )
+            except Exception as exc:  # noqa: BLE001 -- optional graphs: a failure leaves that size to the other steps
+                logger.warning_rank0(f"--prefill-graph-chunks {tokens}: the prefill graph was not captured ({type(exc).__name__}: {exc})")
+        return runners
 
     def _make_prefill_runner(self, target: GraphRunner, free_memory: int, max_seq_len: int) -> GraphRunner | None:
         """A verify graph of --prefill-graph-rows rows of one request, for short prefill chunks longer than a decode
@@ -1510,7 +1560,7 @@ class Engine:
                 sampling_params=None, cache_handle=None,  # type: ignore[arg-type]
             )
             dummy.linear_slot_idx = self.dummy_req.linear_slot_idx
-            attn = create_attention_backend(config.attention_backend, config.model_config)
+            attn = self._capture_attn_backend()
             linear = WideVerifyLinearBackend(self.device, pool, rows) if pool is not None else None
             sink = self.spec.prefill_rows_sink(rows)
 
@@ -1560,26 +1610,14 @@ class Engine:
         return logits
 
     def _prefill_runs_as_verify(self, batch: Batch) -> bool:
-        """Whether this prefill chunk is short enough, and plain enough, to run as captured verify steps.
-
-        One request, text only, continuing a cached prefix (its state slot is live), with no GDN track
-        snapshot due in the chunk, and room in the page table for the rows a last, partly filled step
-        reads past the chunk."""
+        """Whether this prefill chunk runs as captured steps (SpecRunner.prefill_plan): one request, text only, at most --prefill-graph-tokens tokens, and a plan exists for it."""
         limit, runner = self.config.prefill_graph_tokens, self.graph_runner
         if limit <= 0 or batch.size != 1 or runner.phase != "verify" or batch.mm_gather_plan:
             return False
-        if not self.spec.can_prefill_as_verify:
+        if not self.spec.can_prefill_as_verify or batch.reqs[0].extend_len > limit:
             return False
-        req = batch.reqs[0]
-        rows = self.spec.prefill_step_rows(req.extend_len)
-        steps = -(-req.extend_len // rows)
-        fla = batch.fla_metadata
-        return (
-            req.cached_len > 0
-            and req.extend_len <= limit
-            and req.cached_len + steps * rows <= self.page_table.shape[1]
-            and (fla is None or fla.track_dst is None)
-        )
+        batch.prefill_plan = self.spec.prefill_plan(batch)
+        return batch.prefill_plan is not None
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream

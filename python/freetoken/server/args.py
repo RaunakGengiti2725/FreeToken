@@ -1010,6 +1010,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--prefill-graph-chunks",
+        type=str,
+        dest="prefill_graph_chunks",
+        default=ServerArgs.prefill_graph_chunks,
+        help=(
+            "With --prefill-graph-tokens, capture prefill forwards of these token counts of one request "
+            "(comma separated, e.g. 1024,256,64,16): a chunk is cut into replays of them, largest first, and "
+            "what is left over runs as verify steps. Needs --moe-prefill-demand-tokens at least as large with "
+            "an offloaded MoE. Empty = none."
+        ),
+    )
+
+    parser.add_argument(
         "--prefill-graph-rows",
         type=int,
         dest="prefill_graph_rows",

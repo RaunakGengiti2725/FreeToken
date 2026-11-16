@@ -153,72 +153,139 @@ class SpecRunner:
         self._wide_hidden = torch.zeros(rows, like.shape[1], dtype=like.dtype, device=like.device)
         return _RowsSink(self._wide_hidden)
 
+    def chunk_rows_sink(self, tokens: int) -> _RowsSink:
+        """The sink of a captured prefill forward of ``tokens`` tokens."""
+        like = self.proposer.adopt_verify_rows(1)
+        self._chunk_hidden = getattr(self, "_chunk_hidden", {})
+        self._chunk_hidden[tokens] = torch.zeros(tokens, like.shape[1], dtype=like.dtype, device=like.device)
+        return _RowsSink(self._chunk_hidden[tokens])
+
     def prefill_step_rows(self, n: int) -> int:
-        """Rows of the verify step a prefill chunk of ``n`` tokens runs in: the decode step's, or the wider graph's when the chunk is longer than one decode step."""
+        """Rows of the verify step that takes ``n`` tokens of a prefill chunk: the decode step's, or the wider graph's when more than one decode step is left."""
         wide = self.engine.prefill_runner
         return wide.rows_per_req if wide is not None and n > self.k + 1 else self.k + 1
 
-    def prefill_as_verify(self, batch: Batch) -> torch.Tensor:
-        """Run a short prefill chunk of one request as verify steps and return its last token's logits, ``[1, vocab]``.
+    def prefill_plan(self, batch: Batch) -> List[tuple[str, int]] | None:
+        """How a short prefill chunk of one request is cut into captured steps, or None when it must run eagerly.
 
-        A verify step is a forward of k + 1 consecutive rows of one request on the decode kernels, captured in a
-        CUDA graph; an eager prefill forward of two tokens costs several times one. Here every row is a prompt
-        token, so none is drafted or rejected: each step's rows are committed as accepted (commit_verify), which
-        leaves the K/V and the linear state where a prefill of those tokens leaves them. A last step with fewer
-        tokens than rows repeats its last token in the rows past the chunk and stores them to the padding page;
-        nothing of those rows is kept. The draft then reads the rows' hidden states as it does after a prefill.
-        The logits come from the decode kernels, not the prefill ones: the same weights, not always the same bits.
+        ("chunk", b): a replay of the prefill graph of b tokens. ("verify", w): a verify step of w rows, whose rows past
+        the chunk are padding. ("track", 0): the linear state as it is there is the chunk's track snapshot. Prefill graphs
+        come first, largest first, so that verify steps only take what no graph fits. A chunk that owes a track snapshot
+        (65 tokens or more) needs its first tokens, up to the tracked boundary, to be cut exactly by graphs of whole
+        64-token multiples.
+        """
+        from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+        engine, req, fla = self.engine, batch.reqs[0], batch.fla_metadata
+        sizes = sorted(engine.chunk_runners, reverse=True)
+        steps: List[tuple[str, int]] = []
+        left = req.extend_len
+        if fla is not None and fla.track_dst is not None:
+            aligned = (left - 1) // CHUNK_SIZE * CHUNK_SIZE
+            for b in sizes:
+                if b % CHUNK_SIZE == 0:
+                    while aligned >= b:
+                        steps.append(("chunk", b))
+                        aligned -= b
+                        left -= b
+            if aligned:
+                return None
+            steps.append(("track", 0))
+        for b in sizes:
+            while left >= b:
+                steps.append(("chunk", b))
+                left -= b
+        if left > 2 * CHUNK_SIZE:
+            return None  # too much for verify steps, which cost about as much a row as a decode step does
+        end = req.cached_len + req.extend_len - left
+        while left > 0:
+            width = self.prefill_step_rows(left)
+            if end + width > engine.page_table.shape[1]:
+                return None
+            steps.append(("verify", width))
+            end += min(width, left)
+            left -= min(width, left)
+        return steps
+
+    def prefill_as_verify(self, batch: Batch) -> torch.Tensor:
+        """Run a short prefill chunk of one request as the captured steps of its plan and return its last token's logits, ``[1, vocab]``.
+
+        An eager prefill forward of a few tokens spends tens of milliseconds reaching the GPU a few dozen times a layer;
+        a replayed graph does not. A prefill graph is the prefill forward itself for a fixed token count. A verify step
+        is k + 1 (or --prefill-graph-rows) consecutive rows of one request on the decode kernels: here every row is a
+        prompt token, so each step's rows are committed as accepted, which leaves the K/V and the linear state where a
+        prefill of those tokens leaves them; a step with fewer tokens than rows repeats its last token in the rows past
+        the chunk and stores them to the padding page. A request with no cached prefix starts from a zeroed state slot,
+        as an eager prefill does. The draft then reads the rows' hidden states as it does after a prefill.
+        Steps on the decode kernels give the same weights' logits, not always the same bits.
         """
         from freetoken.attention.linear import gdn_slot
         from freetoken.core import Batch as _Batch
 
-        engine, req = self.engine, batch.reqs[0]
+        engine, req, fla = self.engine, batch.reqs[0], batch.fla_metadata
         start, n = req.cached_len, req.extend_len
-        width = self.prefill_step_rows(n)
-        wide = engine.prefill_runner if width != self.k + 1 else None
-        runner = wide or engine.graph_runner
         pad_loc = engine.page_table[engine.dummy_req.table_idx, 0]
-        pool = engine.linear_state_pool
-        hidden = []
-        for done in range(0, n, width):
-            m = min(width, n - done)
-            rows = _PrefillRows(
-                req.table_idx, start + done, start + done + width, req.linear_slot_idx,
-                req.mrope_delta, req.mrope_positions_full,
-            )
-            step = _Batch(reqs=[rows], phase="verify", rows_per_req=width)
+        pool, slot = engine.linear_state_pool, gdn_slot(req)
+        mrope = engine.config.model_config.model_is_mrope
+        if start == 0 and pool is not None:
+            pool.recurrent_states[:, slot].zero_()
+            pool.conv_states[:, slot].zero_()
+            for state in pool.slot_states.values():
+                state[:, slot].zero_()
+        hidden, done, logits = [], 0, None
+        for kind, size in batch.prefill_plan:
+            if kind == "track":
+                # the live slot holds the state at the tracked boundary: that is the snapshot an eager chunk writes
+                src = slice(slot, slot + 1)
+                pool.conv_states.index_copy_(1, fla.track_dst, pool.conv_states[:, src].expand(-1, fla.track_dst.numel(), -1, -1))
+                rec = pool.recurrent_states
+                rec.index_copy_(1, fla.track_dst, rec[:, src].expand(-1, fla.track_dst.numel(), *rec.shape[2:]))
+                for state in pool.slot_states.values():
+                    state.index_copy_(1, fla.track_dst, state[:, src].expand(-1, fla.track_dst.numel(), *state.shape[2:]))
+                continue
+            chunk = kind == "chunk"
+            runner = engine.chunk_runners[size] if chunk else (engine.prefill_runner if size != self.k + 1 else engine.graph_runner)
+            m = size if chunk else min(size, n - done)
+            rows = _PrefillRows(req.table_idx, start + done, start + done + size, req.linear_slot_idx, req.mrope_delta, req.mrope_positions_full)
+            step = _Batch(reqs=[rows], phase="prefill" if chunk else "verify", rows_per_req=size)
             runner.pad_batch(step)
             ids, out_loc = batch.input_ids[done : done + m], batch.out_loc[done : done + m]
-            if m < width:
-                ids = torch.cat([ids, ids[-1:].expand(width - m)])
-                out_loc = torch.cat([out_loc, pad_loc.expand(width - m).to(out_loc.dtype)])
+            if m < size:
+                ids = torch.cat([ids, ids[-1:].expand(size - m)])
+                out_loc = torch.cat([out_loc, pad_loc.expand(size - m).to(out_loc.dtype)])
             if step.padded_size > 1:
                 # the padding requests' rows, as a verify batch of the scheduler has them
-                pad = (step.padded_size - 1) * width
+                pad = (step.padded_size - 1) * size
                 ids = torch.cat([ids, ids.new_zeros(pad)])
                 out_loc = torch.cat([out_loc, pad_loc.expand(pad).to(out_loc.dtype)])
             step.input_ids, step.out_loc = ids, out_loc
             positions = [torch.arange(r.cached_len, r.device_len, dtype=torch.int32) for r in step.padded_reqs]
             step.positions = torch.cat(positions).to(self.device, non_blocking=True)
-            if engine.config.model_config.model_is_mrope:
+            if mrope:
                 step.mrope_positions = _mrope_rows(step.padded_reqs).to(self.device, non_blocking=True)
             if runner.linear_backend is not None:
                 runner.linear_backend.prepare_metadata(step)
             runner.attn_backend.prepare_metadata(step)
-            if wide is None:
+            if runner is engine.graph_runner:
                 step.features = self.feature_sink(step)
-                logits = engine.forward_logits(step)
+                logits = engine.forward_logits(step)[m - 1 : m]
                 if pool is not None and pool.verify_scratch is not None:
-                    pool.commit_verify([gdn_slot(req)], [m])
+                    pool.commit_verify([slot], [m])
                 hidden.append(self.proposer.adopt_verify_rows(m))
             else:
-                with engine.ctx.forward_batch(step, **wide.ctx_override), engine.model.forward_host_ctx(step, True):
-                    logits = wide.replay(step)
-                if wide.linear_backend is not None:
-                    wide.linear_backend.scratch.commit(pool, [gdn_slot(req)], [m])
-                hidden.append(self._wide_hidden[:m].clone())
+                with engine.ctx.forward_batch(step, **runner.ctx_override), engine.model.forward_host_ctx(step, True):
+                    out = runner.replay(step)
+                if chunk:
+                    logits = out[:1]
+                    hidden.append(self._chunk_hidden[size].clone())
+                else:
+                    logits = out[m - 1 : m]
+                    if runner.linear_backend is not None:
+                        runner.linear_backend.scratch.commit(pool, [slot], [m])
+                    hidden.append(self._wide_hidden[:m].clone())
+            done += m
         self.proposer.prefill_sink_from(batch, torch.cat(hidden))
-        return logits[m - 1 : m]
+        return logits
 
     def on_prefill(self, batch: Batch, next_tokens_gpu: torch.Tensor) -> None:
         self.proposer.on_prefill(batch, next_tokens_gpu)
