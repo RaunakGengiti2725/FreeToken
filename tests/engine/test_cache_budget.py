@@ -1035,6 +1035,67 @@ def test_preset_single_fast_serves_as_single_where_its_captures_do_not_fit(decod
     assert typed.prefill_graph_chunks == "1-64,128-384:64" and typed.prefill_graph_tokens == 448
 
 
+def test_preset_keeps_its_drafts_only_where_the_offload_cache_holds_a_fifth_of_the_experts(monkeypatch):
+    from freetoken.engine import engine as eng
+    from freetoken.engine.engine import PRESET_DRAFT_SHARE, PRESET_NO_DRAFTS, Engine
+
+    assert PRESET_DRAFT_SHARE == 0.20
+    lines = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(eng.logger, "info_rank0", lines.append)
+    monkeypatch.setattr(eng, "shared_offload_method", lambda model: None)
+    monkeypatch.setattr(eng, "offload_layer_methods", lambda model: None)
+    bank_bytes = [10240 * 1_780_000 - 5]
+    monkeypatch.setattr(eng, "_bank_bytes", lambda config, method=None, layer_methods=None: bank_bytes[0])
+    drafts = ("speculative_algorithm", "speculative_num_steps")
+    # Qwen3.6-35B-A3B's sizes: 10240 experts of 1.78 MB, 20 KB of KV a token
+    slot, weights, page = 1_780_000, int(4.44 * 2**30), 16 * 20_000
+
+    def served(slots=0, mem=None, fields=drafts, strategy="offload", cpu_layers=None, free=None):
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(num_moe_layers=40, num_experts=256), model=None, moe_cache_size=slots, moe_cache_mem=mem,
+            moe_strategy=strategy, moe_cpu_layers=cpu_layers, preset="single", preset_fields=fields, speculative_algorithm="mtp",
+            speculative_num_steps=3, spec_slot_states=("draft state",), moe_decode_key=None, kv_reserve_tokens=36864, max_seq_len=262144,
+        )
+        engine = Engine.__new__(Engine)
+        engine.model = None
+        reads = iter((1000, 1700))
+        engine._sync_get_memory = lambda: (next(reads), 0)
+        engine.spec, engine._weights_bytes, engine._post_weights_free = object(), 5000, 3000
+
+        def terms(config, banks, method=None, max_slots=None, per_expert_bytes=None):
+            assert banks is None and per_expert_bytes == slot  # a slot's bytes from the bank layout, rounded up
+            return dict(
+                baseline_free=free, weights_bytes=weights, memory_ratio=1.0, cache_per_page=page, fixed_cache_size=0, per_expert_bytes=slot,
+                num_experts=256, total_experts=10240, prefill_overlap=True, kv_reserve_tokens=config.kv_reserve_tokens, page_size=16,
+            )
+
+        engine._auto_cache_terms = terms
+        engine._settle_preset_drafts(config)
+        dropped = engine.spec is None
+        if dropped:
+            # as a server started without them, and the draft's weights are free for the caches again
+            assert (config.speculative_algorithm, config.speculative_num_steps, config.spec_slot_states, config.preset_fields) == (None, 0, (), ())
+            assert (engine._weights_bytes, engine._post_weights_free) == (4300, 3700)
+        else:
+            assert config.speculative_algorithm == "mtp" and config.preset_fields == fields and engine._weights_bytes == 5000
+        return dropped
+
+    # a cache the command line sized (--moe-cache-rate 0.05 and 0.2 are 512 and 2048 slots), in slots or in bytes
+    assert served(slots=512) and served(slots=2047) and not served(slots=2048)
+    assert served(mem=2047 * slot) and not served(mem=2048 * slot)
+    assert any(PRESET_NO_DRAFTS in line and "512 of 10240" in line for line in lines)
+    # an automatic cache: the plan with the drafts at the preset's KV reserve, a slot more or less
+    at_share = weights + 2048 * slot + (36864 // 16) * page
+    assert not served(free=at_share) and served(free=at_share - 1)
+    assert served(free=weights + 100 * slot)  # no plan at all with them: not served with them
+    # only offload's own drafts at the preset's own depth: hybrid, CPU layers and a typed depth keep them
+    assert not served(slots=512, strategy="hybrid") and not served(slots=512, cpu_layers="2")
+    assert not served(slots=512, fields=("speculative_algorithm",))
+    bank_bytes[0] = None  # a format whose bank size is not known before the load: not counted, so kept
+    assert not served(free=at_share - 1) and served(slots=512)
+
+
 def test_preset_plan_takes_the_staging_slots_only_where_every_expert_and_the_kv_reserve_still_fit():
     from freetoken.engine.cache_budget import plan_resident_staging
 
@@ -1189,6 +1250,15 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     speeds.update({("offload", 3): [60.0, 90.0], ("hybrid", 3): [80.0, 120.0]})
     monkeypatch.setattr(calibrate, "_time_candidate", lambda args, argv, s, d, floors=None: {**time_candidate(args, argv, s, d), "drafts": 0})
     assert starts(*parsed("--memory-ratio", "0.9")) == (hybrid_3, 2)
+    # the static preset dropped its drafts for the size of the cache: that is the static choice, the other depths of its
+    # strategy are not timed against it, and hybrid's are
+    def no_drafts(args, argv, s, d, floors=None):
+        return {**time_candidate(args, argv, s, d), "drafts": 0 if (s, d) == ("offload", 3) else 100, "no_drafts": (s, d) == ("offload", 3)}
+
+    monkeypatch.setattr(calibrate, "_time_candidate", no_drafts)
+    choice, timed = starts(*parsed("--memory-ratio", "0.91"))
+    assert timed == 4 and started[-4:] == [("offload", 3), ("hybrid", 3), ("hybrid", 0), ("hybrid", 5)]
+    assert (choice["moe_strategy"], choice["speculative_num_steps"]) == ("hybrid", 5) and "speculative_num_steps" not in choice["preset_fields"]
     # the static choice cannot be timed, or the GPU cannot be read: the static preset, and nothing is kept
     monkeypatch.setattr(calibrate, "_time_candidate", time_candidate)
     del speeds["offload", 3]
@@ -1210,7 +1280,8 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     static_strategy[0] = "fused"
     speeds.update({("fused", 3): [100.0, 200.0], ("fused", 0): [60.0, 90.0], ("fused", 5): [120.0, 230.0]})
     fifth, fifth_argv = parsed("--memory-ratio", "0.75")
-    assert starts(fifth, fifth_argv) == ({"moe_strategy": "fused", "speculative_num_steps": 5}, 3)
+    measured_depth = tuple(n for n in fifth.preset_fields if n != "speculative_num_steps")  # as its server was started: the depth typed
+    assert starts(fifth, fifth_argv) == ({"moe_strategy": "fused", "speculative_num_steps": 5, "preset_fields": measured_depth}, 3)
     assert started[-3:] == [("fused", 3), ("fused", 0), ("fused", 5)] and starts(fifth, fifth_argv)[1] == 0
     speeds["fused", 5] = [105.0, 190.0]
     assert starts(*parsed("--memory-ratio", "0.72")) == ({"speculative_num_steps": 3}, 3)  # the static choice: the strategy stays auto

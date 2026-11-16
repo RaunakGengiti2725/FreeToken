@@ -166,6 +166,17 @@ def child_flags(argv: list[str], depth: int | None) -> list[str]:
     return out
 
 
+def _dropped_drafts(log_path: str | None) -> bool:
+    """Whether a candidate's server dropped the preset's drafts for the size of its expert cache (engine.PRESET_NO_DRAFTS in its log)."""
+    from freetoken.engine.engine import PRESET_NO_DRAFTS
+
+    try:
+        with open(log_path, errors="replace") as f:
+            return any(PRESET_NO_DRAFTS in line for line in f)
+    except (OSError, TypeError):
+        return False
+
+
 class _Slower(RuntimeError):
     """The bench stopped a candidate that started under half the static choice's speed: a result, not a failure."""
 
@@ -197,6 +208,7 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
     return {
         "tok_s": [[float(run["tok_s"]) for run in benchdecode.runs_of(x)] for x in r["results"]],
         "drafts": sum(int(x.get("draft_n") or 0) for x in r["results"]),
+        "no_drafts": _dropped_drafts(r.get("log")),
         "early": [x.get("early") for x in r["results"]],
         "cache_slots": r["cache_slots"], "total_slots": r["total_slots"], "slot_bytes": r["slot_bytes"],
         "gpu_free_bytes": r["gpu_free_bytes"], "ready_s": r["ready_s"],
@@ -251,9 +263,14 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None]]) -> 
     tok_s, failed, skipped = {}, {}, {}
     first = None
     for name, strategy, depth in todo:
-        if first is not None and not first["drafts"] and depth != todo[0][2]:
+        if first is not None and not first["drafts"] and depth != todo[0][2] and not first.get("no_drafts"):
             # the static choice drafted nothing: this checkpoint has no MTP layers, and every depth is the same server
             skipped[name] = "the checkpoint drafts nothing"
+            continue
+        if first is not None and first.get("no_drafts") and strategy == todo[0][1]:
+            # the static preset dropped its drafts for this cache (engine._settle_preset_drafts): no drafts is the static
+            # choice itself, and its rule already says the other depths of this strategy lose here
+            skipped[name] = "the static preset serves this cache size without drafts"
             continue
         logger.info(f"--preset {PRESET}: timing {name} ({len(tok_s) + len(failed) + len(skipped) + 1} of {len(todo)}) ...")
         try:
@@ -326,6 +343,9 @@ def _overrides(args, strategy: str, depth: int | None, static: bool = False) -> 
         out["preset_fields"] = tuple(n for n in args.preset_fields if n not in ("speculative_algorithm", "speculative_num_steps"))
     elif depth is not None:
         out["speculative_num_steps"] = depth
+        if depth != DEPTHS[0] and not static:
+            # timed with the depth on its command line, which the static preset's rule for small caches leaves alone
+            out["preset_fields"] = tuple(n for n in args.preset_fields if n != "speculative_num_steps")
     return out
 
 

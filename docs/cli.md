@@ -147,6 +147,17 @@ without GatedDeltaNet layers the preset keeps the default ratio. A
 typed `--memory-ratio` gets no such reserve. The startup log lists what the preset set,
 what each setting did to the `--moe-cache-auto` plan, and the resulting expert slots and KV tokens.
 
+Under `offload` the preset serves without its drafts where the expert cache holds under 20% of all
+experts: a `--moe-cache-rate`, `--moe-cache-size` or `--moe-cache-mem` that small, or an automatic
+plan that small with the drafts loaded and the preset's KV reserve (counted before the expert banks
+load, a slot's bytes taken from the bank layout). At such a cache the drafted rows miss the cache
+more often than their accepted tokens pay back. One log line says so and how much GPU memory the
+draft's weights gave back to the caches. A `--speculative-num-steps` or `--speculative-algorithm` on
+the command line keeps the drafts, and so do `hybrid` and `--moe-cpu-layers`. The 20% comes from four
+decode cells of Qwen3.6-35B-A3B NVFP4 on RTX 5090s, the preset with 3 drafts against a server with no
+flags: slower at 512 and 701 of 10240 slots, faster at 2048 and 2991. Nothing was measured between
+6.8% and 20%.
+
 Where every expert fits on the GPU the preset stops streaming them, in one of two ways, and the
 plan line says which. Both give the same output as the expert cache does.
 

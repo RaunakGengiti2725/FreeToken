@@ -265,6 +265,15 @@ def _drop_preset_captures(config, reason: str) -> None:
     logger.info_rank0(f"--preset {config.preset}: serving as --preset single, without the captured prefill forwards ({reason})")
 
 
+# --preset: the drafts it turns on are served only where an offload expert cache holds this share of all experts or
+# more. Chosen from four decode cells of Qwen3.6-35B-A3B NVFP4 on RTX 5090s, the preset with 3 drafts against a
+# server with no flags: under it at 512 and 701 of 10240 slots (5.0% and 6.8%), over it at 2048 and 2991 (20.0%
+# and 29.2%). No cell lies between 6.8% and 20%, and the share is the lowest at which the drafts were seen to win.
+PRESET_DRAFT_SHARE = 0.20
+# the log line of a start that drops them; moe/calibrate.py reads it from the server of its static candidate
+PRESET_NO_DRAFTS = "serving without the preset's draft tokens"
+
+
 def _preset_kv_target(config) -> int:
     """The KV reserve a preset asks for, at most the model's context (no request holds more) and at least the default reserve."""
     return max(min(config.kv_reserve_tokens, config.max_seq_len), EngineConfig.kv_reserve_tokens)
@@ -721,6 +730,7 @@ class Engine:
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
         self._settle_preset_memory_ratio(config)
         if is_offload_moe_strategy(config.moe_strategy):
+            self._settle_preset_drafts(config)
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
@@ -991,8 +1001,9 @@ class Engine:
                 "docs/performance/decode.md (Getting more slots) lists what each flag costs"
             ) from exc
 
-    def _auto_cache_terms(self, config: EngineConfig, banks, method=None, max_slots=None) -> dict:
-        """resolve_moe_cache_auto's arguments for ``config``."""
+    def _auto_cache_terms(self, config: EngineConfig, banks, method=None, max_slots=None, per_expert_bytes: int | None = None) -> dict:
+        """resolve_moe_cache_auto's arguments for ``config``. ``per_expert_bytes`` stands in for the banks' slot size
+        before they are loaded."""
         from freetoken.engine.cache_budget import expert_bytes_per_slot
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
@@ -1008,7 +1019,7 @@ class Engine:
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
-            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+            per_expert_bytes=per_expert_bytes or expert_bytes_per_slot(banks.sources),
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
@@ -1058,6 +1069,63 @@ class Engine:
         )
         object.__setattr__(config, "memory_ratio", EngineConfig.memory_ratio)
         _drop_preset_fields(config, "memory_ratio")
+
+    def _preset_draft_slots(self, config: EngineConfig) -> int | None:
+        """Expert slots of the cache a preset's server would serve its drafts from, counted before the expert banks load:
+        the size the command line gave, or the automatic plan at the preset's KV reserve with a slot's bytes taken from
+        the bank layout (0 where that plan does not fit). None where the bank layout's bytes are not known."""
+        from freetoken.engine.cache_budget import _plan_or_short
+        from freetoken.moe.expert_banks import is_mixed
+
+        if config.moe_cache_size > 0:
+            return config.moe_cache_size
+        method, layer_methods = shared_offload_method(self.model), offload_layer_methods(self.model)
+        bank_bytes = _bank_bytes(config, method, layer_methods if is_mixed(layer_methods) else None)
+        if not bank_bytes:
+            return None
+        total = config.model_config.num_moe_layers * config.model_config.num_experts
+        per_slot = -(-bank_bytes // total)
+        if config.moe_cache_mem is not None:
+            return config.moe_cache_mem // per_slot
+        terms = self._auto_cache_terms(config, None, method, per_expert_bytes=per_slot)
+        if "kv_reserve_tokens" in config.preset_fields:
+            terms["kv_reserve_tokens"] = min(terms["kv_reserve_tokens"], _preset_kv_target(config))
+        plan, _ = _plan_or_short(terms)
+        return plan[0] if plan is not None else 0
+
+    def _settle_preset_drafts(self, config: EngineConfig) -> None:
+        """A preset's drafts stay only where the offload expert cache holds PRESET_DRAFT_SHARE of all experts or more:
+        under that, the draft's verify rows miss the cache more often than their accepted tokens pay back, and its weights
+        take slots. Called once the draft has loaded and before the expert banks do; a strategy other than offload, CPU
+        layers, and a draft depth or method from the command line are left alone."""
+        drafts = {"speculative_algorithm", "speculative_num_steps"} <= set(getattr(config, "preset_fields", ()))
+        if self.spec is None or not drafts or config.moe_strategy != "offload" or config.moe_cpu_layers:
+            return
+        total = config.model_config.num_moe_layers * config.model_config.num_experts
+        slots = self._preset_draft_slots(config)
+        if slots is None or slots >= PRESET_DRAFT_SHARE * total:
+            return
+        before = self._sync_get_memory()[0]
+        self.spec = None
+        for name in ("speculative_algorithm", "speculative_num_steps", "spec_slot_states"):
+            object.__setattr__(config, name, getattr(EngineConfig, name))
+        _drop_preset_fields(config, "speculative_algorithm", "speculative_num_steps")
+        gc.collect()
+        torch.cuda.empty_cache()
+        # the draft's weights were counted with the target's: what the driver got back is free for the caches again
+        freed = max(self._sync_get_memory()[0] - before, 0)
+        self._weights_bytes -= freed
+        self._post_weights_free += freed
+        logger.info_rank0(
+            f"--preset {config.preset}: {PRESET_NO_DRAFTS}: with them the expert cache holds {slots} of {total} experts, "
+            f"under {PRESET_DRAFT_SHARE:.0%}, where offload decodes faster without ({mem_GB(freed)} of draft weights freed)"
+        )
+        if _preset_capture_bytes(config):
+            _drop_preset_captures(config, "they are captured beside the verify step of speculative decoding, which is off")
+        if getattr(config, "moe_decode_key", None) is not None:
+            # the key was made with the drafts on: `ft bench decode` reads the last one a server logs
+            object.__setattr__(config, "moe_decode_key", _decode_decision_key(config))
+            logger.info_rank0(f"MoE decode setup: {config.moe_decode_key}; {self._baseline_free} bytes of GPU memory free")
 
     def _preset_prefill_reserve(self, config: EngineConfig) -> int:
         """GPU bytes the caches leave free under a preset's memory ratio, on top of its headroom: the working memory of

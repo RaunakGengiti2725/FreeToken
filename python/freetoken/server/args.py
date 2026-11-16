@@ -1165,7 +1165,7 @@ def parse_args(
             "Settings for a kind of use, applied only where the command line says nothing. 'single' serves one "
             "request at a time on a GPU smaller than the model: --max-running-requests 1, --embed-weights host, "
             "--memory-ratio 0.95, --moe-prefill-hit-d2d, mtp speculative decoding with 3 draft tokens where the "
-            "checkpoint has the MTP layers, and a --kv-reserve-tokens that holds the default max output tokens and "
+            "checkpoint has the MTP layers and an offload expert cache holds a fifth of the experts or more, and a --kv-reserve-tokens that holds the default max output tokens and "
             f"a {PRESET_PROMPT_TOKENS}-token prompt where the expert cache's minimum still fits. Where every expert fits "
             "on the GPU it serves them resident (--moe-strategy fused), or from an expert cache with a slot for each, so "
             "that a prefill streams nothing; a typed --moe-strategy is kept. The log says what it set. "
