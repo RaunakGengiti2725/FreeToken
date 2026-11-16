@@ -45,6 +45,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--api-key` | `$FREETOKEN_API_KEY`, else off | Require the key on every route except `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`; other requests get a 401 |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
 | `--preset` | — | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. `single-fast`: `single` with captured prefill forwards, whose replies can differ from `single`'s. See [Presets](#presets) |
+| `--calibrate-again` | off | With `--preset single-measured`: time the candidates on this start and replace the stored choice, also when one is stored for this checkpoint, flags and machine. See [Presets](#presets) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
@@ -179,31 +180,43 @@ above, else with `offload` (or what `--moe-strategy auto` takes from an
 is the same preset, and on its first start for a checkpoint, set of flags and machine it times the
 candidates the preset cannot choose between: `offload` and `hybrid`, each with 3, 4 and 5 MTP draft
 tokens and with none. Each candidate is one server start that decodes two built-in prompts (a math
-problem and a coding task) twice over, with the checkpoint's sampling: each time 512 timed tokens
-after 1024 warm-up tokens that fill the expert cache. A candidate's lead over `offload` with 3 draft
-tokens is taken per prompt from the means over the two passes and is the smaller of the two prompts';
-a candidate behind in any single pass has none. The candidate with the largest lead runs, if that
-lead is above 10%, and otherwise the static preset's choice runs, with `--moe-strategy` as
-the command line left it. The strategy and the number of draft tokens are chosen together by that
-one rule; a depth is not chosen per prompt. This is measured on the first start, before the server loads; the log
-prints the time (`calibration took N s`): eight model loads and about 49,000 decoded tokens, so
-expect it to take a while. A strategy or a speculative setting given on the command line is not
+problem and a coding task) twice over, with the checkpoint's sampling: 256 timed tokens after 1024
+warm-up tokens that fill the expert cache, then 256 timed tokens after 256 warm-up tokens on the
+cache the first pass left. A candidate's lead over the static preset's choice is taken per prompt
+from the means over the two passes and is the smaller of the two prompts'; a candidate behind in any
+single pass has none. The candidate with the largest lead runs, if that lead is above 10%, and
+otherwise the static preset's choice runs, with `--moe-strategy` as the command line left it. The
+strategy and the number of draft tokens are chosen together by that one rule; a depth is not chosen
+per prompt.
+
+The calibration runs before the server loads and has 300 seconds. Every candidate is a model load,
+because a running server cannot change its strategy or its draft depth, so the candidates are timed
+in a fixed order and only as many as fit: the static choice, the other strategy with 3 draft
+tokens, then 4, 5 and no draft tokens for the strategy that is ahead of those two, then for the
+other one. A candidate is started only while 1.1 times the longest candidate so far still fits in
+what is left, and its server is stopped if it is not ready with time left for its requests. On a machine that loads the model in 80
+seconds that is two or three candidates; the log names the ones that were not started, and prints
+the time (`calibration took N s`). A candidate that was not started is not chosen and is not timed
+on a later start. A strategy or a speculative setting given on the command line is not
 timed, and a checkpoint that drafts nothing is timed for the strategy alone (two model loads).
 Where the static preset serves the experts resident, `fused` is every candidate's strategy and only
-the four draft settings are timed (four model loads): with every expert on the GPU `hybrid` has
-nothing to compute on the CPU.
+the four draft settings are timed: with every expert on the GPU `hybrid` has
+nothing to compute on the CPU. Where the static preset dropped its drafts for the size of an
+`offload` cache (above), that is the static choice, and `offload` is not timed with drafts.
 SIGTERM, SIGHUP or Ctrl-C during the calibration stops the candidate's server and ends the launcher
 with exit code 128 + the signal.
 
 The timings are kept in the decode profile, next to the `ft bench decode` rows, and are read under
 the same conditions as those rows (same checkpoint and flags, same machine and release), so later
-starts measure nothing and say which calibration they read. A `--moe-cache-rate` or `--moe-cache-size`
+starts measure nothing and say which calibration they read. `--calibrate-again` times the
+candidates on this start whatever is stored and replaces the stored choice. A `--moe-cache-rate` or `--moe-cache-size`
 is part of those flags. With an automatically sized cache the timings are read only while about as
 much GPU memory is free as when they were taken: clearly more or clearly less is timed again. Where
 the calibration cannot be done or its
 static candidate does not start, the static preset runs and one log line says why; a candidate that
 does not start is not chosen, the log names it, and the next start times the candidates again (a
-candidate that fails on two starts in a row is left out from then on). The 10% margin and the token counts are not tuned on measurements.
+candidate that fails on two starts in a row is left out from then on). The 10% margin, the token
+counts and the 1.1 are not tuned on measurements.
 
 `--preset single-fast` is `--preset single` with `--prefill-graph-tokens 448` and
 `--prefill-graph-chunks 1-64,128-384:64`: when a prompt continues a cached one by at most 448

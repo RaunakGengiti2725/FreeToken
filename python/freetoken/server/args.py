@@ -46,6 +46,8 @@ class ServerArgs(SchedulerConfig):
     # The workers read it to leave the shell's foreground process group, so the ^C that cancels
     # a turn cannot also kill the engine — see server/launch.py:_detach_process_group.
     shell_mode: bool = False
+    # --preset single-measured: time the candidates on this start whatever is stored (moe/calibrate.py)
+    calibrate_again: bool = field(default=False, repr=False)
     served_model_name: str | None = None
     tool_call_parser: str = "llama3"
     # Reasoning parser that splits <think> reasoning from content for OpenAI
@@ -1170,13 +1172,23 @@ def parse_args(
             "on the GPU it serves them resident (--moe-strategy fused), or from an expert cache with a slot for each, so "
             "that a prefill streams nothing; a typed --moe-strategy is kept. The log says what it set. "
             "'single-measured' is 'single', and on its first start for a checkpoint, flags and machine it also times "
-            "offload against hybrid and 0, 3, 4 and 5 draft tokens (one server start each), keeps the choice next to the "
-            "`ft bench decode` rows and logs how long that took; later starts read the choice. "
+            "offload against hybrid and 0, 3, 4 and 5 draft tokens (one server start each, as many as fit in 300 s), "
+            "keeps the choice next to the `ft bench decode` rows and logs how long that took; later starts read the "
+            "choice, and --calibrate-again times again. "
             "'single-fast' is 'single' with --prefill-graph-tokens 448 --prefill-graph-chunks 1-64,128-384:64: a prompt "
             "that continues a cached one by up to 448 tokens starts sooner. Its replies are not always the text 'single' "
             "gives: such a chunk is computed in one or two captured pieces instead of one forward, which changes the last "
             "bits of the numbers and, where two tokens are nearly tied, the token. It needs every expert on the GPU and "
             "leaves 2.25 GiB free for the captures; where that does not fit it serves as 'single' and the log says so."
+        ),
+    )
+
+    parser.add_argument(
+        "--calibrate-again",
+        action="store_true",
+        help=(
+            "With --preset single-measured: time the candidates on this start and replace the stored choice, "
+            "also when a calibration for this checkpoint, flags and machine is stored. Ignored without that preset."
         ),
     )
 

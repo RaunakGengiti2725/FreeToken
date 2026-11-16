@@ -1,7 +1,8 @@
 """--preset single-measured: time what the static preset cannot choose, once, and keep the choice.
 
 The rule: every candidate (offload and hybrid, each with 3, 4 and 5 MTP draft tokens and with none) is one server
-start that decodes DECODE tokens after WARM warm-up tokens on each of the two built-in prompts, PASSES times over.
+start that decodes each of the two built-in prompts PASSES times over, DECODE timed tokens after a warm-up: WARM
+tokens in the first pass, which fills the expert cache, and WARM_AGAIN in the later ones, which find it filled.
 With t(c, p, k) the tok/s of candidate c on prompt p in pass k, and s the static preset's choice:
 
     lead(c) = min over the prompts p of [ mean over k of t(c, p, k) / mean over k of t(s, p, k) ] - 1
@@ -11,6 +12,16 @@ The candidate with the largest lead runs, if that lead is above MARGIN; otherwis
 leads the candidate timed first has it. The strategy and the draft depth are chosen together by this one rule: a
 depth is not chosen per prompt. (The lead was first the smallest single pass's: on a 16 GB card that kept offload
 over a hybrid that led by 25% to 36% in three passes and 9.7% in one.)
+
+The candidates are timed in a fixed order, inside BUDGET_S seconds: the static choice, the other strategy at the
+static choice's depth, then the other depths (4, 5, none) of the strategy that is ahead of the two, then those of
+the other strategy. One strategy is ahead of the other by the rule above with a margin of 0. A candidate is started
+only if the time used so far plus SLACK times the longest candidate so far is within the budget, and its server
+must be ready while the longest time a candidate so far took after its load still fits; the candidates not started
+or not ready in time are not chosen, and a later start does not time them (--calibrate-again does, inside a budget
+of its own). The draft depth cannot be changed in a running
+server (its verify graphs and buffers are built for one depth), so every candidate is a model load, and on a box
+that loads in 80 s the budget holds two or three of them.
 
 A dimension the command line fixed (--moe-strategy, --speculative-algorithm) is not a candidate. Where the static
 preset serves every expert resident (fused: they fit on the GPU), fused is the only strategy and the depths are what
@@ -43,16 +54,22 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 PRESET = "single-measured"
-# unmeasured: tokens that fill the expert cache, then tokens that are timed, per prompt and pass. The warm-up is the
-# bench's own default: after fewer, a cold cache was timed, and a candidate that misses less from cold looked faster.
-WARM, DECODE = 1024, 512
-PASSES = 2                # per prompt, in one server start: the second pass runs on the cache the first one left
+# unmeasured: tokens that fill the expert cache, then tokens that are timed, per prompt and pass. The first warm-up is
+# the bench's own default: after fewer, a cold cache was timed, and a candidate that misses less from cold looked
+# faster. The later passes start on the cache the first one left, and warm up only as long as they are timed.
+WARM, WARM_AGAIN, DECODE = 1024, 256, 256
+PASSES = 2                # per prompt, in one server start
+# seconds a calibration may take; a candidate is started only while SLACK times the longest one so far still fits
+BUDGET_S, SLACK = 300, 1.1
+OUT_OF_TIME = f"not timed: the {BUDGET_S} s of a calibration were used"
+SETTLE_S = 3.0            # after a server that was stopped before it answered, for the driver to give its memory back
 # unmeasured: about twice the noise of a lead between two single passes, whose tok/s had an SD of up to 3.8% (decode_profile.py); asked of a prompt's mean over its passes
 MARGIN = 0.10
 READY_S = 900             # the longest a candidate's server may take to load
 PROMPTS = ("math", "code")
 DEPTHS = (3, 4, 5, 0)     # the static preset's first
-_VERSION = 3
+_VERSION = 4
+_now, _sleep = time.monotonic, time.sleep
 
 # removed from the command line of a candidate's server: the bench names these itself, and the preset must not measure again
 _DROPPED = ("--model-path", "--model", "--host", "--port", "--api-key", "--moe-strategy", "--moe-backend", "--preset")
@@ -67,7 +84,9 @@ def candidates(args, fused: bool = False) -> list[tuple[str, str, int | None]]:
     else:
         strategies = ["fused"] if fused else ["offload", "hybrid"]
     depths = DEPTHS if "speculative_algorithm" in left and "speculative_num_steps" in left else (None,)
-    return [(f"{s}@{'set' if d is None else d}", s, d) for d in depths for s in strategies]
+    # the order they are timed in when the first strategy stays ahead (_measure): the strategies at the static depth first
+    pairs = [(s, depths[0]) for s in strategies] + [(s, d) for s in strategies for d in depths[1:]]
+    return [(f"{s}@{'set' if d is None else d}", s, d) for s, d in pairs]
 
 
 def choose(tok_s: dict, names: list[str], margin: float = MARGIN) -> tuple[str, float]:
@@ -159,7 +178,7 @@ def child_flags(argv: list[str], depth: int | None) -> list[str]:
             skip = False
         elif arg in _DROPPED:
             skip = True
-        elif arg.split("=", 1)[0] in _DROPPED or arg == "--shell-mode":
+        elif arg.split("=", 1)[0] in _DROPPED or arg in ("--shell-mode", "--calibrate-again"):
             pass
         else:
             out.append(arg)
@@ -186,10 +205,10 @@ class _Slower(RuntimeError):
     """The bench stopped a candidate that started under half the static choice's speed: a result, not a failure."""
 
 
-def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, floors: list[float] | None = None) -> dict:
+def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, floors: list[float] | None = None, ready_s: float = READY_S) -> dict:
     """One server start of a candidate through the bench's own code: its tok/s per prompt and pass, and what it ran with.
-    Raises RuntimeError when the server does not start or does not answer, or when a request starts below its
-    prompt's tok/s in ``floors`` (the bench then stops it: such a candidate cannot be the one chosen)."""
+    Raises RuntimeError when the server does not start within ``ready_s`` seconds or does not answer, or when a request
+    starts below its prompt's tok/s in ``floors`` (the bench then stops it: such a candidate cannot be the one chosen)."""
     from freetoken.moe import benchdecode
 
     arm = strategy
@@ -197,7 +216,7 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
         # the rounding mode the real server will run (moe/offload_kernels.py reads the same variable)
         arm = f"hybrid:{(os.getenv('FREETOKEN_HYBRID_FETCH_ROUND') or 'min-wait').strip().lower()}"
     bench_argv = ["--model", args.model_path, "--seeds", str(PASSES), "--warm", str(WARM), "--decode", str(DECODE), "--streams", "1",
-                  "--no-write", "--server-timeout", str(READY_S), "--", *child_flags(argv, depth)]
+                  "--no-write", "--server-timeout", str(int(ready_s)), "--", *child_flags(argv, depth)]
     try:
         ns, extra = benchdecode.parse_args(bench_argv, "ft serve --preset " + PRESET)
     except SystemExit as exc:
@@ -207,7 +226,7 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
     builtin = dict(benchdecode.BUILTIN_PROMPTS)
     sampling, _ = benchdecode.resolve_sampling(ns.model, ns.greedy)
     ns.eos = benchdecode.eos_strings(ns.model)
-    r = benchdecode.run_arm(ns, extra, arm, None, [(name, builtin[name]) for name in PROMPTS], [], sampling, floors)
+    r = benchdecode.run_arm(ns, extra, arm, None, [(name, builtin[name]) for name in PROMPTS], [], sampling, floors, warm_after=WARM_AGAIN)
     if any(x.get("gave_up") for x in r["results"]):
         raise _Slower("stopped early: under half the static choice's speed")
     return {
@@ -263,11 +282,19 @@ def measure(args, argv: list[str], todo: list[tuple[str, str, int | None]]) -> d
 
 
 def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None]]) -> dict:
-    t0 = time.monotonic()
+    t0 = _now()
     # failed: did not start or answer, timed again on the next start. skipped: left out for a reason that holds then too
-    tok_s, failed, skipped = {}, {}, {}
-    first = None
-    for name, strategy, depth in todo:
+    tok_s, failed, skipped, wall = {}, {}, {}, {}
+    first, tail = None, 0.0  # tail: the longest a candidate took after its server was ready (its requests and its stop)
+    # the strategies at the static choice's depth, then the other depths, those of the strategy that is ahead first
+    heads = [c for c in todo if c[2] == todo[0][2]]
+    queue, rest = list(heads), [c for c in todo if c[2] != todo[0][2]]
+    while queue or rest:
+        if not queue:
+            ahead = choose(tok_s, [c[0] for c in heads], margin=0.0)[0]
+            leader = next(c[1] for c in heads if c[0] == ahead)
+            queue, rest = sorted(rest, key=lambda c: c[1] != leader), []
+        name, strategy, depth = queue.pop(0)
         if first is not None and not first["drafts"] and depth != todo[0][2] and not first.get("no_drafts"):
             # the static choice drafted nothing: this checkpoint has no MTP layers, and every depth is the same server
             skipped[name] = "the checkpoint drafts nothing"
@@ -277,22 +304,36 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None]]) -> 
             # choice itself, and its rule already says the other depths of this strategy lose here
             skipped[name] = "the static preset serves this cache size without drafts"
             continue
+        began = _now()
+        if first is not None and began - t0 + SLACK * max(wall.values()) > BUDGET_S:
+            skipped[name] = OUT_OF_TIME
+            continue
         logger.info(f"--preset {PRESET}: timing {name} ({len(tok_s) + len(failed) + len(skipped) + 1} of {len(todo)}) ...")
         try:
             # a candidate that starts at under half the static choice's speed is stopped after its first tokens
             floors = [0.5 * e for e in first["early"]] if first is not None and all(first.get("early") or [None]) else None
-            r = _time_candidate(args, argv, strategy, depth, floors)
+            # the static choice may take as long as any server to load; the others must be ready with time left for their requests
+            ready_s = READY_S if first is None else max(1.0, min(READY_S, BUDGET_S - (began - t0) - tail))
+            r = _time_candidate(args, argv, strategy, depth, floors, ready_s=ready_s)
         except RuntimeError as exc:
             if first is None:
                 raise
-            (skipped if isinstance(exc, _Slower) else failed)[name] = str(exc).splitlines()[0][:300]
+            wall[name] = _now() - began
+            if ready_s < READY_S and wall[name] >= ready_s:
+                skipped[name] = OUT_OF_TIME  # still loading when its time was up: not a server that cannot start
+            else:
+                (skipped if isinstance(exc, _Slower) else failed)[name] = str(exc).splitlines()[0][:300]
+            _sleep(SETTLE_S)  # the bench waits this long only after a server that answered
             continue
+        wall[name] = _now() - began
+        tail = max(tail, wall[name] - float(r.get("ready_s") or 0.0))
         first = first or r
         tok_s[name] = r["tok_s"]
     return {
-        "tok_s": tok_s, "failed": failed, "skipped": skipped, "columns": list(PROMPTS), "warm": WARM, "decode": DECODE, "passes": PASSES,
+        "tok_s": tok_s, "failed": failed, "skipped": skipped, "columns": list(PROMPTS), "warm": WARM, "warm_again": WARM_AGAIN,
+        "decode": DECODE, "passes": PASSES, "budget_s": BUDGET_S, "wall_s": {n: round(v, 1) for n, v in wall.items()},
         "cache_slots": first["cache_slots"], "total_slots": first["total_slots"], "slot_bytes": first["slot_bytes"],
-        "gpu_free_bytes": first["gpu_free_bytes"], "seconds": round(time.monotonic() - t0, 1),
+        "gpu_free_bytes": first["gpu_free_bytes"], "seconds": round(_now() - t0, 1),
         "measured_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
     }
 
@@ -385,10 +426,12 @@ def measured_choice(args, argv: list[str]) -> dict:
         failed_before = set(row.get("failed", {})) if row is not None else set()
         if row is not None and (stale := _stale(row, names, free, args)):
             row, reason = None, f"the stored calibration does not apply: {stale}"
+        if row is not None and getattr(args, "calibrate_again", False):
+            row, reason = None, "--calibrate-again"
         if row is None:
             logger.info(
-                f"--preset {PRESET}: calibrating, {len(todo)} server starts of {PASSES} passes of {WARM} + {DECODE} tokens on "
-                f"{len(PROMPTS)} prompts ({reason})"
+                f"--preset {PRESET}: calibrating, up to {len(todo)} server starts within {BUDGET_S} s, each {PASSES} passes on "
+                f"{len(PROMPTS)} prompts of {DECODE} timed tokens after {WARM} warm-up tokens, {WARM_AGAIN} from the second pass on ({reason})"
             )
             # the launcher's own reading of the free memory: a later start compares its reading with this one
             row = {**measure(args, argv, todo), "stamp": stamp, "gpu_free_bytes": free}

@@ -7,6 +7,7 @@ import torch
 
 import json
 import os
+import time
 
 from freetoken.engine.cache_budget import (
     CacheBudgetTooSmall, budget_advice, expert_bytes_per_slot, kv_capacity_warning, plan_cache_budget, plan_changes, plan_kv_target,
@@ -1165,16 +1166,22 @@ def test_calibration_takes_the_largest_worst_lead_above_the_margin_and_times_two
     # a candidate's server, through the bench's own code: a warm-up that fills the cache, then two or more timed passes a prompt
     seen = {}
 
-    def run_arm(ns, extra, arm, rate, single, together, sampling, floors=None, passes=None):
-        seen.update(passes=ns.seeds, warm=ns.warm, prompts=[name for name, _ in single], together=together)
+    def run_arm(ns, extra, arm, rate, single, together, sampling, floors=None, passes=None, warm_after=None):
+        seen.update(passes=ns.seeds, warm=ns.warm, warm_after=warm_after, timeout=ns.server_timeout, extra=extra,
+                    prompts=[name for name, _ in single], together=together)
         cols = [{"tok_s": (a + b) / 2, "seeds": [{"tok_s": a}, {"tok_s": b}], "draft_n": 4, "early": a, "gave_up": False} for a, b in ((90.0, 110.0), (180.0, 220.0))]
         return {"tok_s": [c["tok_s"] for c in cols], "results": cols, "cache_slots": 40, "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": None, "ready_s": 1.0}
 
     monkeypatch.setattr(benchdecode, "run_arm", run_arm)
     monkeypatch.setattr(benchdecode, "eos_strings", lambda model: ())
-    timed = calibrate._time_candidate(SimpleNamespace(model_path="/models/anon"), ["--preset", "single-measured"], "offload", 3)
+    argv = ["--preset", "single-measured", "--calibrate-again", "--memory-ratio", "0.8"]
+    timed = calibrate._time_candidate(SimpleNamespace(model_path="/models/anon"), argv, "offload", 3, ready_s=123.9)
     assert timed["tok_s"] == [[90.0, 110.0], [180.0, 220.0]] and timed["drafts"] == 8
     assert seen["passes"] == calibrate.PASSES >= 2 and seen["warm"] == calibrate.WARM >= 1024
+    # the later passes find the cache filled and warm up for less; the server has the seconds it was given to load, and
+    # is the static preset with the rest of the command line, never one that calibrates again
+    assert seen["warm_after"] == calibrate.WARM_AGAIN < calibrate.WARM and seen["timeout"] == 123
+    assert seen["extra"] == ["--memory-ratio", "0.8", "--preset", "single"]
     assert seen["prompts"] == list(calibrate.PROMPTS) and not seen["together"]
 
 
@@ -1195,7 +1202,7 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
               ("offload", 4): [102.0, 195.0], ("hybrid", 4): [100.0, 190.0]}
     started = []
 
-    def time_candidate(args, argv, strategy, depth, floors=None):
+    def time_candidate(args, argv, strategy, depth, floors=None, ready_s=None):
         started.append((strategy, depth))
         if (strategy, depth) not in speeds:
             raise RuntimeError("server exited with code 1 during startup")
@@ -1212,6 +1219,7 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     static_strategy = ["offload"]
     monkeypatch.setattr(calibrate, "_time_candidate", time_candidate)
     monkeypatch.setattr(calibrate, "_static_strategy", lambda args, argv: static_strategy[0])
+    monkeypatch.setattr(calibrate, "_sleep", lambda seconds: None)
     free_now(_ROW_FREE)
     args, argv = parsed()
     hybrid_3 = {"moe_strategy": "hybrid", "moe_cache_auto": True, "speculative_num_steps": 3}
@@ -1253,11 +1261,11 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     assert starts(args, argv) == (hybrid_3, 8)
     # a checkpoint that drafts nothing: the depths are one server, so only the strategies are timed
     speeds.update({("offload", 3): [60.0, 90.0], ("hybrid", 3): [80.0, 120.0]})
-    monkeypatch.setattr(calibrate, "_time_candidate", lambda args, argv, s, d, floors=None: {**time_candidate(args, argv, s, d), "drafts": 0})
+    monkeypatch.setattr(calibrate, "_time_candidate", lambda args, argv, s, d, floors=None, ready_s=None: {**time_candidate(args, argv, s, d), "drafts": 0})
     assert starts(*parsed("--memory-ratio", "0.9")) == (hybrid_3, 2)
     # the static preset dropped its drafts for the size of the cache: that is the static choice, the other depths of its
     # strategy are not timed against it, and hybrid's are
-    def no_drafts(args, argv, s, d, floors=None):
+    def no_drafts(args, argv, s, d, floors=None, ready_s=None):
         return {**time_candidate(args, argv, s, d), "drafts": 0 if (s, d) == ("offload", 3) else 100, "no_drafts": (s, d) == ("offload", 3)}
 
     monkeypatch.setattr(calibrate, "_time_candidate", no_drafts)
@@ -1294,6 +1302,42 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     assert starts(*parsed("--moe-strategy", "hybrid", "--memory-ratio", "0.75"))[1] == 4 and started[-1] == ("hybrid", 0)
     assert starts(*parsed("--speculative-algorithm", "off", "--memory-ratio", "0.75")) == ({}, 0)
     static_strategy[0] = "offload"
+    # a calibration has 300 s. A candidate is started only while 1.1 times the longest one so far still fits: at 100 s a
+    # candidate that is two, the static choice and the other strategy; what was not started is not timed on a later start
+    clock = [0.0]
+    monkeypatch.setattr(calibrate, "_now", lambda: clock[0])
+
+    def taking(seconds, late=()):
+        def timed(args, argv, s, d, floors=None, ready_s=None):
+            if (s, d) in late:  # still loading when its time is up
+                started.append((s, d))
+                clock[0] += ready_s
+                raise RuntimeError("server not ready")
+            clock[0] += seconds
+            return time_candidate(args, argv, s, d)
+        return timed
+
+    assert calibrate.BUDGET_S == 300 and calibrate.SLACK == 1.1
+    speeds.update({("offload", 3): [100.0, 200.0], ("hybrid", 3): [130.0, 250.0], ("hybrid", 4): [140.0, 260.0], ("offload", 4): [102.0, 195.0]})
+    monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0))
+    boxed, boxed_argv = parsed("--memory-ratio", "0.85")
+    assert starts(boxed, boxed_argv) == (hybrid_3, 2) and started[-2:] == [("offload", 3), ("hybrid", 3)]
+    assert starts(boxed, boxed_argv) == (hybrid_3, 0)
+    # --calibrate-again times again whatever is stored, in a budget of its own
+    assert starts(*parsed("--memory-ratio", "0.85", "--calibrate-again")) == (hybrid_3, 2)
+    # at 60 s a candidate that is four: then the other depths of the strategy that is ahead of the two, nearest first
+    monkeypatch.setattr(calibrate, "_time_candidate", taking(60.0))
+    choice, timed = starts(*parsed("--memory-ratio", "0.86"))
+    assert timed == 4 and started[-4:] == [("offload", 3), ("hybrid", 3), ("hybrid", 4), ("hybrid", 5)]
+    assert (choice["moe_strategy"], choice["speculative_num_steps"]) == ("hybrid", 4)
+    speeds["hybrid", 3] = [90.0, 250.0]  # behind the static choice on one prompt: offload's depths come first
+    assert starts(*parsed("--memory-ratio", "0.87"))[1] == 4 and started[-2:] == [("offload", 4), ("offload", 5)]
+    # a server still loading when the budget ends was not given the time, which is not a server that cannot start:
+    # the next start does not time for it again
+    monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0, late={("hybrid", 3)}))
+    late, late_argv = parsed("--memory-ratio", "0.88")
+    assert starts(late, late_argv) == ({"speculative_num_steps": 3}, 2) and starts(late, late_argv)[1] == 0
+    monkeypatch.setattr(calibrate, "_now", time.monotonic)
     monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (_ for _ in ()).throw(RuntimeError("the GPU could not be read")))
     assert starts(third, third_argv) == ({}, 0)
 
@@ -1306,7 +1350,7 @@ def test_a_signal_during_calibration_stops_the_candidates_server_and_ends_the_la
 
     servers, outer = [], []
 
-    def time_candidate(args, argv, strategy, depth, floors=None):
+    def time_candidate(args, argv, strategy, depth, floors=None, ready_s=None):
         # as benchdecode.run_arm runs a candidate: a session of its own, which a signal to the launcher does not reach
         proc = subprocess.Popen(["sleep", "600"], start_new_session=True)
         servers.append(proc)
@@ -1331,6 +1375,7 @@ def test_a_signal_during_calibration_stops_the_candidates_server_and_ends_the_la
         try:
             with pytest.MonkeyPatch.context() as m:
                 m.setattr(calibrate, "_time_candidate", time_candidate)
+                m.setattr(calibrate, "_sleep", lambda seconds: None)
                 with pytest.raises(SystemExit) as stopped:
                     calibrate.measure(SimpleNamespace(), [], todo)
             assert stopped.value.code == 128 + sig

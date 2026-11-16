@@ -677,7 +677,8 @@ def context_turns(origin: str, model_id: str, sizes: list[int], sampling: dict) 
 
 
 def run_arm(ns, extra, arm: str, rate: float | None, single, together, sampling: dict, floors: list[float] | None = None,
-            passes: int | None = None) -> dict:
+            passes: int | None = None, warm_after: int | None = None) -> dict:
+    """``warm_after``: the warm-up tokens of the passes after the first, which find the expert cache as the pass before left it."""
     passes = passes or ns.seeds
     port = free_port()
     origin = f"http://127.0.0.1:{port}"
@@ -699,8 +700,9 @@ def run_arm(ns, extra, arm: str, rate: float | None, single, together, sampling:
             gave_up = False
             # pass after pass, not prompt after prompt: pass k is then the same requests in the same order however many passes there are
             for rep in range(1, passes + 1):
+                warm, warms = (ns.warm, ns.warms) if rep == 1 or warm_after is None else (warm_after, [warm_after])
                 for i, (_, text) in enumerate(single):
-                    r = timed_request(origin, model_id, text, sampling, ns.warm, ns.decode, floors[i] if floors else None, ns.warms, ns.eos)
+                    r = timed_request(origin, model_id, text, sampling, warm, ns.decode, floors[i] if floors else None, warms, ns.eos)
                     runs[i].append({**r, "rep": rep})
                     if r["gave_up"]:
                         gave_up = True
