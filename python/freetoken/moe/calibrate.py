@@ -42,7 +42,8 @@ strategy the static preset does not run. The timings are a
 row of the decode profile (moe/decode_profile.py), under the key and the stamp `--moe-strategy auto` reads its rows
 by, so a later start with the same checkpoint, flags, machine and release measures nothing; with an automatically
 sized cache, only while about as much GPU memory is free as when they were taken. A candidate that does
-not start is not chosen, and the next start times the candidates again (once: a candidate that fails twice in a
+not start, or whose server ran without the drafts it was started with (a token map the engine refuses), is not
+chosen, and the next start times the candidates again (once: a candidate that fails twice in a
 row is left out from then on); when the static choice itself cannot be timed, or anything else fails, the static preset
 runs and one log line says why. The servers are started and timed by `ft bench decode`'s own code (moe/benchdecode.py).
 """
@@ -415,6 +416,11 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
             continue
         wall[name] = _now() - began
         tail = max(tail, wall[name] - float(r.get("ready_s") or 0.0))
+        if first is not None and depth and not r["drafts"] and (first["drafts"] or first.get("no_drafts")):
+            # the engine served it without the drafts it was started with (a token map it refuses, a draft that does
+            # not load): what was timed is another candidate than the one it is named for
+            failed[name] = "its server ran without drafts"
+            continue
         first = first or r
         tok_s[name] = r["tok_s"]
     return {

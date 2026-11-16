@@ -1373,6 +1373,15 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     assert starts(*parsed("--memory-ratio", "0.77"))[1] == 4 and ("fused", "5map") not in started[-4:]
     store_map(b"\x01\x00\x00\x00\x04\x00\x00\x00")
     assert starts(*parsed("--memory-ratio", "0.78", "--speculative-token-map", map_path))[1] == 4
+    # a map the engine refuses leaves that server without drafts: it is not the candidate it is named for, and however
+    # fast it was it is not chosen
+    def refused(args, argv, s, d, floors=None, ready_s=None, token_map=None, left_s=None):
+        return {**time_candidate(args, argv, s, d, token_map=token_map), **({"drafts": 0} if token_map else {})}
+
+    monkeypatch.setattr(calibrate, "_time_candidate", refused)
+    speeds["fused", "5map"] = [400.0, 800.0]
+    assert starts(*parsed("--memory-ratio", "0.79")) == ({"speculative_num_steps": 3}, 5)
+    monkeypatch.setattr(calibrate, "_time_candidate", time_candidate)
     os.rename(map_path, map_path + ".off")  # no map from here on
     static_strategy[0] = "offload"
     # a calibration has 300 s. A candidate is started only while 1.1 times the longest one so far still fits: at 100 s a
