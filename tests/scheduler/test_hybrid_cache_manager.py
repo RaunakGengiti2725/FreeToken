@@ -207,12 +207,13 @@ def test_prefill_plan_covers_the_chunk_and_snapshots_where_the_next_request_matc
     from freetoken.scheduler.prefill import ChunkedReq
     from freetoken.spec.runner import SpecRunner
 
-    sizes, limit, pair = [1 << i for i in range(11)], 2048, (7, 8)
+    sizes, pair = [1 << i for i in range(11)], (7, 8)
     runner = object.__new__(SpecRunner)
     runner.k, runner.device = 3, torch.device("cpu")
+    config = SimpleNamespace(prefill_graph_tokens=2048, prefill_graph_chunks="1,2", page_size=1)
     runner.engine = SimpleNamespace(
         chunk_runners=dict.fromkeys(sizes), chunk_graphs_usable=lambda: True, page_table=torch.zeros(1, 1 << 16),
-        config=SimpleNamespace(prefill_graph_tokens=limit), prefill_runner=None,
+        config=config, prefill_runner=None,
     )
 
     def plan(start, n, anchor=None, chunked=False):
@@ -228,7 +229,9 @@ def test_prefill_plan_covers_the_chunk_and_snapshots_where_the_next_request_matc
         batch = SimpleNamespace(reqs=[req], fla_metadata=fla)
         return runner.prefill_plan(batch), req, batch, tracked
 
-    for start in (0, 100):
+    # a limit under one 64-token block as well: the eager head must never be longer than the cut it opens
+    for start, limit in ((0, 2048), (100, 2048), (100, 16)):
+        config.prefill_graph_tokens = limit
         for n in [*range(1, 200), 1023, 1024, 1025, 2047, 2048, 2049, 5000, 8192]:
             for anchor in (None, start + n - 5, start + 3, start):
                 for chunked in (False, True):
@@ -250,6 +253,7 @@ def test_prefill_plan_covers_the_chunk_and_snapshots_where_the_next_request_matc
                         want = anchor - start
                     else:
                         want = n - 1 if n >= 2 else None
+                    assert all(size > 0 for kind, size in steps if kind != "track"), (n, steps)
                     assert at == want, (start, n, anchor, chunked, steps)
                     if at is None:
                         assert req.mamba_last_track_seqlen is None and req.mamba_next_track_idx == 0
@@ -257,6 +261,22 @@ def test_prefill_plan_covers_the_chunk_and_snapshots_where_the_next_request_matc
                     assert req.mamba_last_track_seqlen == start + at
                     # the slot the commit donates is the one the plan's snapshot goes to
                     assert batch.prefill_track_dst.tolist() == [pair[1 - req.mamba_next_track_idx]]
+
+
+def test_prefill_plan_without_its_graphs_is_eager():
+    from freetoken.spec.runner import SpecRunner
+
+    runner = object.__new__(SpecRunner)
+    runner.k, runner.device = 3, torch.device("cpu")
+    runner.engine = SimpleNamespace(
+        chunk_runners={}, page_table=torch.zeros(1, 4096), prefill_runner=None,
+        config=SimpleNamespace(prefill_graph_tokens=64, prefill_graph_chunks="1,2,4", page_size=1),
+    )
+    req = SimpleNamespace(cached_len=128, extend_len=6, mamba_ping_pong=None)
+    assert runner.prefill_plan(SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=None))) is None
+    # the verify-step arm is its own configuration: no prefill graphs asked for
+    runner.engine.config.prefill_graph_chunks = ""
+    assert runner.prefill_plan(SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=None))) == [("verify", 4), ("verify", 4)]
 
 
 def test_naive_cache_does_not_align_prefill_chunks():

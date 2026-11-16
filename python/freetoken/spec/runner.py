@@ -190,13 +190,15 @@ class SpecRunner:
 
         engine, req, fla = self.engine, batch.reqs[0], batch.fla_metadata
         sizes = sorted(engine.chunk_runners, reverse=True)
+        if not sizes and engine.config.prefill_graph_chunks:
+            return None  # prefill graphs were asked for and are not there (a rebuild): eager, never verify steps in their place
         steps: List[tuple[str, int]] = []
         left = req.extend_len
 
         def cut(n: int) -> None:
-            if n > limit:
-                # the graphs take the last --prefill-graph-tokens tokens; what is before them is one eager forward
-                head = (n - limit + CHUNK_SIZE - 1) // CHUNK_SIZE * CHUNK_SIZE
+            # the graphs take about the last --prefill-graph-tokens tokens; whole 64-token blocks before them are one eager forward
+            head = max(n - limit, 0) // CHUNK_SIZE * CHUNK_SIZE
+            if head:
                 steps.append(("eager", head))
                 n -= head
             for b in sizes:
@@ -221,8 +223,16 @@ class SpecRunner:
                 anchor = getattr(req, "turn_anchor_len", None)
                 if anchor is not None and start < anchor < start + left:
                     at = anchor - start
-                elif left >= 2:
+                elif left >= 2 and (tracked or req.mamba_last_track_seqlen is None):
+                    # not over a mark carried from the chunk before: that one serves the next turn as well
                     at = left - 1
+                page = engine.config.page_size
+                if at is not None and (start + at) % page:
+                    # the commit takes a snapshot only at a page boundary
+                    at = (start + at) // page * page - start
+                    at = at if at > 0 else None
+                if at is None and tracked:
+                    return None  # the forward's own tracking stands: one eager forward
             if at is None:
                 cut(left)
                 return steps
@@ -315,11 +325,11 @@ class SpecRunner:
 
         def kv_rows(done: int, size: int) -> list[torch.Tensor]:
             loc, rows = batch.out_loc[done : done + size].long(), []
-            for layer in range(1 << 10):
+            for layer in range(engine.config.model_config.num_layers):
                 try:
                     rows += [engine.kv_cache.k_cache(layer)[loc].clone(), engine.kv_cache.v_cache(layer)[loc].clone()]
-                except Exception:  # noqa: BLE001 -- past the last attention layer
-                    return rows
+                except (KeyError, IndexError):  # a layer without paged K/V (linear attention)
+                    continue
             return rows
 
         hidden, done, logits = [], 0, None

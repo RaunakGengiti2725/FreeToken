@@ -696,9 +696,10 @@ class Engine:
             # Prefill runs on the first comma part; warm its autotune cache. With a cache that keeps what a prefill
             # streams, the warmup also loads the experts.
             self._warmup_prefill(autotune=backend == "triton", keeps=keeps)
-        if not self.chunk_runners and self.graph_runner.rows_per_req > 1:
-            # the warmup is what makes every expert resident, which the prefill graphs of an offloaded MoE are captured on
-            self.chunk_runners = self._make_chunk_runners(self.graph_runner, init_free_memory, aligned_max_seq_len)
+        if self.graph_runner.rows_per_req > 1:
+            # the warmup is what makes every expert resident, which the prefill graphs of an offloaded MoE are captured
+            # on: the sizes the first pass had to leave are captured now
+            self.chunk_runners.update(self._make_chunk_runners(self.graph_runner, init_free_memory, aligned_max_seq_len, have=self.chunk_runners))
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1512,7 +1513,7 @@ class Engine:
                 setattr(attn, name, getattr(self.attn_backend, name))
         return attn
 
-    def _make_chunk_runners(self, target: GraphRunner, free_memory: int, max_seq_len: int) -> Dict[int, GraphRunner]:
+    def _make_chunk_runners(self, target: GraphRunner, free_memory: int, max_seq_len: int, have=()) -> Dict[int, GraphRunner]:
         """Prefill graphs of --prefill-graph-chunks token counts of one request (SpecRunner.prefill_plan cuts a short
         chunk into replays of them). Each has its own attention capture and linear capture; one that cannot be
         captured is left out, with a warning."""
@@ -1522,8 +1523,10 @@ class Engine:
             return {}
         runners: Dict[int, GraphRunner] = {}
         resident = cache is not None and cache.all_resident
-        self._chunks_need_resident = resident
+        self._chunks_need_resident = resident or (bool(have) and self._chunks_need_resident)
         for tokens in sizes:
+            if tokens in have:
+                continue
             if cache is not None and not resident and not cache.loads_prefill_on_demand(tokens):
                 logger.info_rank0(f"--prefill-graph-chunks {tokens}: not captured yet, the expert cache stages chunks of that length through host-side steps (not every expert is resident and --moe-prefill-demand-tokens is below it)")
                 continue
