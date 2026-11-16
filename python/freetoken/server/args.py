@@ -1170,7 +1170,7 @@ def parse_args(
             "on the GPU it serves them resident (--moe-strategy fused), or from an expert cache with a slot for each, so "
             "that a prefill streams nothing; a typed --moe-strategy is kept. The log says what it set. "
             "'single-measured' is 'single', and on its first start for a checkpoint, flags and machine it also times "
-            "offload against hybrid and 0, 3 and 5 draft tokens (one server start each), keeps the choice next to the "
+            "offload against hybrid and 0, 3, 4 and 5 draft tokens (one server start each), keeps the choice next to the "
             "`ft bench decode` rows and logs how long that took; later starts read the choice. "
             "'single-fast' is 'single' with --prefill-graph-tokens 448 --prefill-graph-chunks 1-64,128-384:64: a prompt "
             "that continues a cached one by up to 448 tokens starts sooner. Its replies are not always the text 'single' "

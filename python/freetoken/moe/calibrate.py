@@ -1,11 +1,16 @@
 """--preset single-measured: time what the static preset cannot choose, once, and keep the choice.
 
-The rule: every candidate (offload and hybrid, each with no drafts, 3 and 5 MTP draft tokens) is one server start
-that decodes DECODE tokens after WARM warm-up tokens on each of the two built-in prompts, PASSES times over. A
-candidate's lead over the static preset's choice is taken per prompt from the means over the passes, and is the
-smaller of the prompts'; a candidate behind the static choice in any single pass has none. The candidate with the
-largest lead runs, if that lead is above MARGIN; otherwise the static choice runs. (The lead was first the smallest
-single pass's: on a 16 GB card that kept offload over a hybrid that led by 25% to 36% in three passes and 9.7% in one.)
+The rule: every candidate (offload and hybrid, each with 3, 4 and 5 MTP draft tokens and with none) is one server
+start that decodes DECODE tokens after WARM warm-up tokens on each of the two built-in prompts, PASSES times over.
+With t(c, p, k) the tok/s of candidate c on prompt p in pass k, and s the static preset's choice:
+
+    lead(c) = min over the prompts p of [ mean over k of t(c, p, k) / mean over k of t(s, p, k) ] - 1
+    lead(c) is none where t(c, p, k) < t(s, p, k) for any prompt p and pass k
+
+The candidate with the largest lead runs, if that lead is above MARGIN; otherwise the static choice runs; of two equal
+leads the candidate timed first has it. The strategy and the draft depth are chosen together by this one rule: a
+depth is not chosen per prompt. (The lead was first the smallest single pass's: on a 16 GB card that kept offload
+over a hybrid that led by 25% to 36% in three passes and 9.7% in one.)
 
 A dimension the command line fixed (--moe-strategy, --speculative-algorithm) is not a candidate. Where the static
 preset serves every expert resident (fused: they fit on the GPU), fused is the only strategy and the depths are what
@@ -46,8 +51,8 @@ PASSES = 2                # per prompt, in one server start: the second pass run
 MARGIN = 0.10
 READY_S = 900             # the longest a candidate's server may take to load
 PROMPTS = ("math", "code")
-DEPTHS = (3, 0, 5)        # the static preset's first
-_VERSION = 2
+DEPTHS = (3, 4, 5, 0)     # the static preset's first
+_VERSION = 3
 
 # removed from the command line of a candidate's server: the bench names these itself, and the preset must not measure again
 _DROPPED = ("--model-path", "--model", "--host", "--port", "--api-key", "--moe-strategy", "--moe-backend", "--preset")

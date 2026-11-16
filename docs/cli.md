@@ -177,19 +177,20 @@ plan line says which. Both give the same output as the expert cache does.
 above, else with `offload` (or what `--moe-strategy auto` takes from an
 [`ft bench decode`](#ft-bench-decode) row), and 3 draft tokens. `--preset single-measured`
 is the same preset, and on its first start for a checkpoint, set of flags and machine it times the
-candidates the preset cannot choose between: `offload` and `hybrid`, each with no drafts, 3 and 5
-MTP draft tokens. Each candidate is one server start that decodes two built-in prompts (a math
+candidates the preset cannot choose between: `offload` and `hybrid`, each with 3, 4 and 5 MTP draft
+tokens and with none. Each candidate is one server start that decodes two built-in prompts (a math
 problem and a coding task) twice over, with the checkpoint's sampling: each time 512 timed tokens
 after 1024 warm-up tokens that fill the expert cache. A candidate's lead over `offload` with 3 draft
 tokens is taken per prompt from the means over the two passes and is the smaller of the two prompts';
 a candidate behind in any single pass has none. The candidate with the largest lead runs, if that
 lead is above 10%, and otherwise the static preset's choice runs, with `--moe-strategy` as
-the command line left it. This is measured on the first start, before the server loads; the log
-prints the time (`calibration took N s`): six model loads and about 37,000 decoded tokens, so
+the command line left it. The strategy and the number of draft tokens are chosen together by that
+one rule; a depth is not chosen per prompt. This is measured on the first start, before the server loads; the log
+prints the time (`calibration took N s`): eight model loads and about 49,000 decoded tokens, so
 expect it to take a while. A strategy or a speculative setting given on the command line is not
 timed, and a checkpoint that drafts nothing is timed for the strategy alone (two model loads).
 Where the static preset serves the experts resident, `fused` is every candidate's strategy and only
-the three draft settings are timed (three model loads): with every expert on the GPU `hybrid` has
+the four draft settings are timed (four model loads): with every expert on the GPU `hybrid` has
 nothing to compute on the CPU.
 SIGTERM, SIGHUP or Ctrl-C during the calibration stops the candidate's server and ends the launcher
 with exit code 128 + the signal.
