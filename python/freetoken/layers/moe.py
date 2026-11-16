@@ -26,6 +26,10 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 
+# Once every expert is resident, a prefill groups its routes over the layer's experts where the kernel can, not over the
+# pool's slots. Set FREETOKEN_PREFILL_EXPERT_ALIGN=0 for the grouping over the slots -- a measurement-only escape hatch.
+_PREFILL_EXPERT_ALIGN = os.getenv("FREETOKEN_PREFILL_EXPERT_ALIGN", "1") != "0"
+
 
 class MoELayer(BaseOP):
     """Resident routed experts.
@@ -382,17 +386,25 @@ class OffloadMoELayer(MoELayer):
         if self.layer_id == 0 and not demand:
             cache.begin_prefill(num_routes=topk_ids.numel())
         if cache.all_resident or demand:
-            # every expert has a slot (the host knows it from a prefill's snapshot): the slots are read as they are
-            slots = cache.resident_slots(self.layer_id, topk_ids) if cache.all_resident else cache.load_prefill_experts(self.layer_id, topk_ids)
+            slot_of = None
+            if not cache.all_resident:
+                routes = cache.load_prefill_experts(self.layer_id, topk_ids)
+            elif _PREFILL_EXPERT_ALIGN and self.quant_method.kernel.groups_prefill_by_expert:
+                # a GEMM grid sized for a padded block per slot of the pool is mostly empty programs: the kernel groups
+                # the expert ids and looks up one slot per block
+                routes, slot_of = topk_ids, cache.resident_slot_of(self.layer_id)
+            else:
+                # every expert has a slot (the host knows it from a prefill's snapshot): the slots are read as they are
+                routes = cache.resident_slots(self.layer_id, topk_ids)
             return self._expert_gemm(
                 cache,
                 hidden_states,
                 topk_weights,
-                slots,
+                routes,
                 views=cache.pool_bank_views(self.layer_id),
                 n=cache.pool_slots(self.layer_id),
                 alphas=cache.alphas_for_slots(self.layer_id),
-                routed=RoutedExperts(self.num_experts, cache.alphas_for_layer(self.layer_id)),
+                routed=RoutedExperts(self.num_experts, cache.alphas_for_layer(self.layer_id), slot_of),
                 is_prefill=True,
             )
         if cache.prefill_overlap:
@@ -435,7 +447,7 @@ class OffloadMoELayer(MoELayer):
         return cache.wait_prefill_layer(self.layer_id, topk_ids)
 
     # ------------------------------------------------------------------
-    # Kernel dispatch: ``views`` are the bank tensors the movement step produced (in bank registration order) and ``topk_ids`` already index their rows.
+    # Kernel dispatch: ``views`` are the bank tensors the movement step produced (in bank registration order) and ``topk_ids`` already index their rows, unless ``routed.slot_of`` maps them.
     # ------------------------------------------------------------------
 
     def _expert_gemm(
