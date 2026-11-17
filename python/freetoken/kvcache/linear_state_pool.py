@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import List
 
 import torch
@@ -373,6 +374,13 @@ def verify_scratch_bytes(config, rows_per_req: int) -> int:
     return stash + window + handlers
 
 
+# FREETOKEN_ONE_REQUEST_SNAPSHOT_FLOOR=1: a pool for one running request keeps at least 1 cross-request snapshot
+# instead of 4 (2 instead of 4 at the default ratio), about 62 MiB a slot on Qwen3.5/3.6-35B-A3B. The pool runs on
+# none (_linear_pool_min_slots); fewer snapshots only lose prefixes an older turn left, and a hit restores floats a
+# cold prefill does not reproduce (CacheManager.skips_prefix_cache), so it is off unless asked for.
+ONE_REQUEST_SNAPSHOT_FLOOR = os.getenv("FREETOKEN_ONE_REQUEST_SNAPSHOT_FLOOR", "0") == "1"
+
+
 def _linear_pool_num_slots(config) -> int:
     """LinearStatePool slot count. Hybrid-radix non-evictable peak is 4 slots per running request
     (1 live + 2 ping-pong + 1 committed snapshot locked through decode), plus a cross-request
@@ -381,7 +389,7 @@ def _linear_pool_num_slots(config) -> int:
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
     ratio = config.linear_state_cache_ratio
-    n_cache = max(4, int(ratio * mr))
+    n_cache = max(1 if mr == 1 and ONE_REQUEST_SNAPSHOT_FLOOR else 4, int(ratio * mr))
     return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
 
 
