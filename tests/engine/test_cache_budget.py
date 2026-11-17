@@ -1596,7 +1596,7 @@ def test_preset_loads_short_prefill_chunks_on_demand_only_into_a_gpu_decoded_cac
         assert cache.prefill_demand_tokens == config.moe_prefill_demand_tokens
         # only the preset's chunks may also go by the bytes each way copies, and FREETOKEN_PREFILL_DEMAND_BY_MISSES=0 stops that
         assert cache.prefill_demand_by_misses == (by_misses and "moe_prefill_demand_tokens" in config.preset_fields)
-        assert ("moe_prefill_demand_tokens" in config.preset_fields) == (bool(fields) and config.moe_prefill_demand_tokens in (512, 32))
+        assert ("moe_prefill_demand_tokens" in config.preset_fields) == (bool(fields) and config.moe_prefill_demand_tokens in (512, engine.PRESET_ROUTED_DEMAND_TOKENS))
         return config.moe_prefill_demand_tokens
 
     # 40 experts, 8 staging slots: a slot for every expert outside them, or one short of it
@@ -1604,8 +1604,8 @@ def test_preset_loads_short_prefill_chunks_on_demand_only_into_a_gpu_decoded_cac
     assert settled(0, decode_target="hybrid") == 0 and settled(0, decode_target="cpu") == 0
     assert settled(0, pool_sizes=[3, 37]) == 0  # a pool smaller than a layer: a chunk can route to every expert of one
     # where a streamed chunk copies only its routed misses up to the preset's length or past it, the preset loads on
-    # demand only chunks of up to 32 tokens; typed tokens stay as typed
-    assert settled(7, routed=2048) == 32 and settled(7, routed=512) == 32 and settled(7, routed=256) == 512
+    # demand only chunks of up to PRESET_ROUTED_DEMAND_TOKENS (192); typed tokens stay as typed
+    assert settled(7, routed=2048) == 192 and settled(7, routed=512) == 192 and settled(7, routed=256) == 512
     assert settled(7, routed=2048, usable=False) == 512  # no batch memcpy or no hit region: no routed copy either
     assert settled(8, routed=2048) == 0 and settled(8, fields=(), routed=2048) == 512
     # typed tokens are the command line's: kept on any cache, and refused by it as without the preset
@@ -1615,7 +1615,7 @@ def test_preset_loads_short_prefill_chunks_on_demand_only_into_a_gpu_decoded_cac
     # FREETOKEN_HYBRID_PREFILL_DEMAND=1: hybrid loads on demand as GPU decode does, unless a layer decodes on the CPU
     monkeypatch.setattr("freetoken.moe.offload_cache.HYBRID_PREFILL_DEMAND", True)
     assert settled(0, decode_target="hybrid") == 512 and settled(0, decode_target="hybrid", fields=()) == 512
-    assert settled(0, decode_target="hybrid", routed=2048) == 32 and settled(0, decode_target="cpu") == 0
+    assert settled(0, decode_target="hybrid", routed=2048) == 192 and settled(0, decode_target="cpu") == 0
     assert settled(0, decode_target="hybrid", cpu_layers=frozenset({3})) == 0
     with pytest.raises(ValueError, match="1 layer decode on the CPU"):
         settled(0, decode_target="hybrid", fields=(), cpu_layers=frozenset({3}))

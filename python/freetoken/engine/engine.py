@@ -314,9 +314,11 @@ _PREFILL_DEMAND_BY_MISSES = os.getenv("FREETOKEN_PREFILL_DEMAND_BY_MISSES", "1")
 # layer before; near 2048 tokens at 8 routes a token a chunk reaches nearly every expert of a 256-expert layer and
 # copies about what the stream does, without the overlap. 512 until the 1024 and 2048 arms are read.
 _PREFILL_ROUTED_COPY_TOKENS = int(os.getenv("FREETOKEN_PREFILL_ROUTED_COPY_TOKENS", "512"))
-# where the routed copy serves the chunks above it, a preset loads on demand only chunks this short: their routes
-# reach fewer experts than a layer has, and the demand path needs no host sync a layer
-PRESET_ROUTED_DEMAND_TOKENS = 32
+# where the routed copy serves the chunks above it, a preset loads on demand only chunks this short. On the 16 GB card
+# (box E, PCIe 4.0 x8) a resend of 33 to 186 new tokens started 50 to 100 ms sooner on demand, a turn of 204 to 444
+# new tokens 23 to 220 ms sooner with the routed copy; the routed copy's fixed cost there is a host sync a layer and
+# each layer's scales copied whole. unmeasured: the crossover on other cards and caches
+PRESET_ROUTED_DEMAND_TOKENS = 192
 
 
 def _settle_preset_demand(config, decode_target: str, pool_sizes: list[int], cache=None) -> None:
