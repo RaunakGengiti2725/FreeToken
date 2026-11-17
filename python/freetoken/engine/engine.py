@@ -1777,7 +1777,8 @@ class Engine:
         executor = self.cpu_moe_executor
         keys, labels, rows = layer_rows
         fractions = [fetch_fraction(rows.get(key)) for key in keys]
-        cache.hybrid_fetch_fraction = [f or 0.0 for f in fractions]
+        default = _hybrid_default_fetch()
+        cache.hybrid_fetch_fraction = [f if f is not None else (default or 0.0) for f in fractions]
         # locked layers fetch the fetch_plan share instead; their own log line lists it
         groups = collections.Counter((labels[l], fractions[l]) for l in range(len(keys)) if l not in cache.locked_hybrid)
         fetched = [f"{f:.1%} on {n} {label} layers" for (label, f), n in groups.items() if f is not None]
@@ -1788,9 +1789,10 @@ class Engine:
             )
         if missing := sorted({label for label, f in groups if f is None}):
             capped = sum(n for (_, f), n in groups.items() if f is None)
+            there = f"the default fetch share {default:.1%} (FREETOKEN_HYBRID_DEFAULT_FETCH)" if default else "a fixed fetch cap of 1"
             logger.warning_rank0(
                 f"--moe-hybrid-max-fetch auto: no `ft bench bw` row for {capped} MoE layers ({', '.join(missing)}) at "
-                f"{executor.num_threads} CPU threads; using a fixed fetch cap of 1 there. `ft bench bw --model <checkpoint>` benches each layer kind"
+                f"{executor.num_threads} CPU threads; using {there} there. `ft bench bw --model <checkpoint>` benches each layer kind"
             )
         benched_isas = {rows[key].get("cpu_moe_isa") for key, f in zip(keys, fractions) if f is not None} - {None}
         if other := sorted(benched_isas - set(executor.isa.split(","))):
@@ -2806,6 +2808,21 @@ def _measured_decode_strategy(config: EngineConfig) -> tuple[str, dict | None]:
             return _preset_without_row(config, objection) or offload(objection)
     logger.info_rank0(f"--moe-strategy auto: {decode_profile.explain(row, verdict)}")
     return "hybrid", row
+
+
+# A/B switch, unmeasured whether needed: FREETOKEN_HYBRID_DEFAULT_FETCH=<share> makes --moe-hybrid-max-fetch auto fetch
+# that share of a layer's expert misses where no `ft bench bw` row answers for the layer, in place of a cap of 1
+def _hybrid_default_fetch() -> float | None:
+    raw = os.getenv("FREETOKEN_HYBRID_DEFAULT_FETCH", "").strip()
+    if not raw:
+        return None
+    try:
+        share = float(raw)
+    except ValueError:
+        share = math.nan
+    if not 0.0 < share <= 1.0:
+        raise ValueError(f"FREETOKEN_HYBRID_DEFAULT_FETCH={raw!r}: a share of a decode step's expert misses, above 0 and at most 1")
+    return share
 
 
 # --preset single on an expert cache that holds part of the experts, where no decode row answers: hybrid with a CPU MoE
