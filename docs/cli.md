@@ -125,7 +125,7 @@ Speculative decoding needs `--tp 1` and runs without overlap scheduling; a targe
 
 `--preset single` is for one user at a time on a GPU that cannot hold every expert. It sets
 `--max-running-requests 1`, `--embed-weights host`, `--memory-ratio 0.95`, `--moe-prefill-hit-d2d` and
-`--moe-prefill-demand-tokens 96`, turns on `--speculative-algorithm mtp` with 3 draft tokens, and raises `--kv-reserve-tokens` to the
+`--moe-prefill-demand-tokens 512`, turns on `--speculative-algorithm mtp` with 3 draft tokens, and raises `--kv-reserve-tokens` to the
 default max output tokens plus a 4096-token prompt (36864), so that an answer of the default length is
 not cut off with `finish_reason: length`. What each of these costs or buys in expert slots is in
 [performance/decode.md](performance/decode.md#getting-more-slots).
@@ -181,8 +181,10 @@ plan line says which. Both give the same output as the expert cache does.
   takes two layers' worth of slots more than there are experts, out of the KV tokens above the
   reserve. The prefill staging buffers lie over that many slots, and only with every expert in a
   slot outside them does a prefill read the slots as decode does. With fewer slots a prefill keeps
-  streaming what is not resident (`--moe-prefill-hit-d2d`), and a chunk of at most 96 tokens (a
-  resend, a short turn) loads only the experts it routes to (`--moe-prefill-demand-tokens`). A longer
+  streaming what is not resident (`--moe-prefill-hit-d2d`), and a chunk of at most 512 tokens (a
+  resend, a short turn) loads only the experts it routes to (`--moe-prefill-demand-tokens`). On one
+  16 GB card, 512 started second turns of 64 and 256 new tokens 40% and 13% to 18% sooner than 96,
+  with the same text and nothing slower, and 1024 made a cold 1000-token prompt 14% slower. A longer
   chunk does the same when the routes of its first layer and the cache's contents say that this copies
   fewer bytes than streaming it, counting an expert it would evict as one more copy; a cache with
   empty slots keeps streaming, which fills them. `FREETOKEN_PREFILL_DEMAND_BY_MISSES=0` leaves the

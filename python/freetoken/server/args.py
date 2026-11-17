@@ -127,8 +127,9 @@ _PRESETS: dict[str, dict] = {
         "embed_weights": "host",
         "memory_ratio": 0.95,
         "moe_prefill_hit_d2d": True,
-        # only where the expert cache cannot hold every expert (engine._drop_preset_demand)
-        "moe_prefill_demand_tokens": 96,
+        # only where the expert cache cannot hold every expert (engine._drop_preset_demand). On a 16 GB card second turns
+        # of 64 and 256 new tokens started 40% and 13-18% sooner than at 96, and 1024 slowed a cold 1K-token prompt by 14%
+        "moe_prefill_demand_tokens": 512,
         "speculative_algorithm": "mtp",
         "speculative_num_steps": 3,
         "kv_reserve_tokens": None,  # the default max output tokens + PRESET_PROMPT_TOKENS (_apply_preset)

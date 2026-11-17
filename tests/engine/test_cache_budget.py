@@ -883,8 +883,9 @@ _KEY_SINGLE_FAST = _KEY_SINGLE + "|prefill_graph_chunks=1-64,128-384:64|prefill_
         (("--preset", "single"), _KEY_SINGLE),
         (("--preset", "single-measured"), _KEY_SINGLE),
         (("--preset", "single-fast"), _KEY_SINGLE_FAST),
-        # a demand length changes a prefill only: typed, it does not make another setup either
+        # a demand length changes a prefill only: typed, it does not make another setup either, nor did the preset's going from 96 to 512
         (("--preset", "single", "--moe-prefill-demand-tokens", "32"), _KEY_SINGLE),
+        (("--preset", "single", "--moe-prefill-demand-tokens", "96"), _KEY_SINGLE),
         (("--moe-prefill-demand-tokens", "32"), "ckpt@bf41ffe2|cache=auto:0.9|cpu=0/4@e5b47b|spec=off|tp=1|req=4|dtype=bfloat16"),
     ],
 )
@@ -1315,7 +1316,7 @@ def test_preset_loads_short_prefill_chunks_on_demand_only_into_a_gpu_decoded_cac
     engine = decode_rows.engine
     monkeypatch.setattr(OffloadMoeCache, "keeps_streamed_experts", property(lambda self: self.prefill_hit_d2d))
 
-    def settled(extra, decode_target="gpu", pool_sizes=None, fields=("moe_prefill_demand_tokens",), tokens=96, by_misses=True):
+    def settled(extra, decode_target="gpu", pool_sizes=None, fields=("moe_prefill_demand_tokens",), tokens=512, by_misses=True):
         monkeypatch.setattr(engine, "_PREFILL_DEMAND_BY_MISSES", by_misses)
         config = SimpleNamespace(
             preset="single", preset_fields=fields, moe_prefill_demand_tokens=tokens, model_config=SimpleNamespace(num_experts=4),
@@ -1331,24 +1332,24 @@ def test_preset_loads_short_prefill_chunks_on_demand_only_into_a_gpu_decoded_cac
         assert cache.prefill_demand_tokens == config.moe_prefill_demand_tokens
         # only the preset's chunks may also go by the bytes each way copies, and FREETOKEN_PREFILL_DEMAND_BY_MISSES=0 stops that
         assert cache.prefill_demand_by_misses == (by_misses and "moe_prefill_demand_tokens" in config.preset_fields)
-        assert ("moe_prefill_demand_tokens" in config.preset_fields) == (bool(fields) and config.moe_prefill_demand_tokens == 96)
+        assert ("moe_prefill_demand_tokens" in config.preset_fields) == (bool(fields) and config.moe_prefill_demand_tokens == 512)
         return config.moe_prefill_demand_tokens
 
     # 40 experts, 8 staging slots: a slot for every expert outside them, or one short of it
-    assert settled(7) == 96 and settled(0) == 96 and settled(8) == 0 and settled(7, by_misses=False) == 96
+    assert settled(7) == 512 and settled(0) == 512 and settled(8) == 0 and settled(7, by_misses=False) == 512
     assert settled(0, decode_target="hybrid") == 0 and settled(0, decode_target="cpu") == 0
     assert settled(0, pool_sizes=[3, 37]) == 0  # a pool smaller than a layer: a chunk can route to every expert of one
     # typed tokens are the command line's: kept on any cache, and refused by it as without the preset
-    assert settled(8, fields=()) == 96 and settled(8, fields=(), tokens=32) == 32
+    assert settled(8, fields=()) == 512 and settled(8, fields=(), tokens=32) == 32
     with pytest.raises(ValueError, match="needs GPU decode"):
         settled(0, decode_target="hybrid", fields=())
     # resident experts have no cache to load into
     fields = ("max_running_req", "moe_prefill_demand_tokens")
-    fused = _resolved(decode_rows, preset="single", preset_fields=fields, moe_strategy="fused", moe_prefill_demand_tokens=96)
+    fused = _resolved(decode_rows, preset="single", preset_fields=fields, moe_strategy="fused", moe_prefill_demand_tokens=512)
     assert (fused.moe_prefill_demand_tokens, fused.preset_fields) == (0, ("max_running_req",))
-    offload = _resolved(decode_rows, preset="single", preset_fields=fields, moe_prefill_demand_tokens=96)
-    assert (offload.moe_strategy, offload.moe_prefill_demand_tokens, offload.preset_fields) == ("offload", 96, fields)
-    assert _resolved(decode_rows, moe_strategy="fused", moe_prefill_demand_tokens=96).moe_prefill_demand_tokens == 96
+    offload = _resolved(decode_rows, preset="single", preset_fields=fields, moe_prefill_demand_tokens=512)
+    assert (offload.moe_strategy, offload.moe_prefill_demand_tokens, offload.preset_fields) == ("offload", 512, fields)
+    assert _resolved(decode_rows, moe_strategy="fused", moe_prefill_demand_tokens=512).moe_prefill_demand_tokens == 512
 
 
 # ---- --preset single-measured (moe/calibrate.py): its rule, the timings it keeps in the decode profile, its fallback ----
