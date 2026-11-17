@@ -1291,6 +1291,7 @@ def test_preset_serves_hybrid_on_a_partial_cache_without_a_decode_row_where_the_
     engine = decode_rows.engine
     assert PRESET_HYBRID_THREADS == 8
     monkeypatch.setattr(engine, "_preset_takes_fused", lambda config: resident)  # the full card's rule has a test of its own
+    monkeypatch.setattr(engine, "_preset_every_expert_fits", lambda config: resident)  # and so has the cache's (below)
     lines = []
     monkeypatch.setattr(engine.logger, "info_rank0", lines.append)
 
@@ -1325,6 +1326,36 @@ def test_preset_serves_hybrid_on_a_partial_cache_without_a_decode_row_where_the_
         assert served() == "hybrid" and _resolved(decode_rows, preset="single", preset_fields=("moe_strategy",), max_running_req=1, **flags).moe_decode_row is not None
 
 
+def test_preset_keeps_offload_where_an_expert_cache_would_hold_every_expert(decode_rows, monkeypatch):
+    """The band where the preset does not serve fused but every expert still fits on the GPU (here a model whose prefill
+    working memory is not known, which fused is never taken for): hybrid would have nothing to compute on the CPU and
+    would turn off the prefill that reads the slots, so offload stays, as in v5. So does a checkpoint whose bytes
+    cannot be counted. An expert cache that holds part of the experts takes hybrid."""
+    engine = decode_rows.engine
+    monkeypatch.setattr(engine, "resolve_pool_class", lambda model: SimpleNamespace(kv_cost=lambda config: (16_000, 500, 16, 0)))
+    monkeypatch.setattr(engine, "state_pool_bytes", lambda config: 300)
+    monkeypatch.setattr(engine, "_prefill_working_bytes", lambda config: (8192, 0))
+    monkeypatch.setattr(engine, "_cpu_pool_threads", lambda config: 16)
+    need = 100 + 2304 * 16_000 + 500 + 300  # the 100-byte checkpoint and the preset's 36864-token reserve
+
+    def strategy(free, **flags):
+        monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: free)
+        fields = ("moe_strategy", "max_running_req", "kv_reserve_tokens")
+        return _resolved(decode_rows, preset="single", preset_fields=fields, max_running_req=1, kv_reserve_tokens=36864,
+                         max_seq_len_override=40960, memory_ratio=0.95, **flags).moe_strategy
+
+    enough = -(-need * 20 // 19)
+    assert engine._preset_resident_need(_offload_engine_config(model_path=str(decode_rows.model))) is None  # fused is not taken
+    assert strategy(1 << 40) == strategy(enough) == "offload" and strategy(enough - 64) == "hybrid"
+    assert strategy(None) == "offload"  # the free memory cannot be read
+    # a cache the command line sized: by its slots against the 80 experts
+    assert strategy(enough - 64, moe_cache_size=80) == "offload" and strategy(1 << 40, moe_cache_size=79) == "hybrid"
+    assert strategy(1 << 40, moe_cache_rate=1.0) == "offload" and strategy(1 << 40, moe_cache_rate=0.2) == "hybrid"
+    assert strategy(enough - 64, moe_cache_mem=100) == "offload" and strategy(1 << 40, moe_cache_mem=99) == "hybrid"
+    monkeypatch.setattr(engine, "_checkpoint_bytes", lambda path: None)
+    assert strategy(enough - 64) == "offload"
+
+
 @pytest.mark.parametrize(
     "level, resident, flags, served8, served4, candidates8",
     [
@@ -1347,6 +1378,7 @@ def test_what_single_serves_and_single_measured_times_at_each_memory_level(decod
 
     engine = decode_rows.engine
     monkeypatch.setattr(engine, "_preset_takes_fused", lambda config: resident)
+    monkeypatch.setattr(engine, "_preset_every_expert_fits", lambda config: resident)
     monkeypatch.setattr(engine, "_adjust_spec_config", lambda config, override, windowed_kv: None)
     path = calibrate.token_map_path(str(decode_rows.model))
     os.makedirs(os.path.dirname(path))

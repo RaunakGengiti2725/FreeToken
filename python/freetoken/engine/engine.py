@@ -367,13 +367,38 @@ def _preset_resident_need(config) -> int | None:
     """GPU bytes a preset's server needs with every expert resident ('fused'): the checkpoint's weight files, the
     preset's KV reserve with the draft's share, the linear states and one prefill chunk's working memory. None where
     one of them cannot be counted before the load, or the command line asks for an expert cache."""
-    model = config.model_config
     sized = config.moe_cache_size > 0 or config.moe_cache_rate or config.moe_cache_mem is not None or config.moe_cache_auto
-    if sized or config.moe_cpu_layers or config.tp_info.size > 1 or not _fused_resident_ok(model):
+    if sized or config.moe_cpu_layers or config.tp_info.size > 1 or not _fused_resident_ok(config.model_config):
         return None
+    return _preset_gpu_need(config, need_working=True)
+
+
+def _preset_every_expert_fits(config) -> bool | None:
+    """Whether the GPU holds every expert of a preset's server, in an expert cache the command line sized or in one
+    planned from free memory: the checkpoint, the KV reserve, the states and a prefill chunk's working memory (where it
+    is known) within the memory ratio's share of the free memory. None where that cannot be counted before the load."""
+    model = config.model_config
+    total = model.num_moe_layers * model.num_experts
+    if config.moe_cache_size > 0:
+        return config.moe_cache_size >= total
+    if config.moe_cache_rate:
+        return config.moe_cache_rate >= 1.0
+    need = _preset_gpu_need(config, need_working=False)
+    if need is None:
+        return None
+    if config.moe_cache_mem is not None:
+        # the cache's own budget against the checkpoint's bytes: an upper bound of the experts' bytes
+        return config.moe_cache_mem >= _checkpoint_bytes(config.model_path)
+    free = _gpu_free_bytes()
+    return None if free is None else need <= int(config.memory_ratio * free)
+
+
+def _preset_gpu_need(config, need_working: bool) -> int | None:
+    """_preset_resident_need's count; without ``need_working`` a model whose prefill working memory is not known counts it as 0."""
+    model = config.model_config
     weights = _checkpoint_bytes(config.model_path)
     working = _prefill_working_bytes(config)[1]
-    if weights is None or not working:
+    if weights is None or (need_working and not working):
         return None
     if config.speculative_draft_model_path:
         draft = _checkpoint_bytes(config.speculative_draft_model_path)
@@ -2903,6 +2928,13 @@ def _preset_without_row(config, reason: str) -> tuple[str, None] | None:
         return None
     threads = _cpu_pool_threads(config)
     if threads < PRESET_HYBRID_THREADS:
+        return None
+    # decided before the load, as the kernels are picked for the decode target: hybrid has nothing to compute on the CPU
+    # where the cache would hold every expert, and it turns off the prefill that reads the slots and keeps what it streams
+    fits = _preset_every_expert_fits(config)
+    if fits is None or fits:
+        why = "every expert fits on the GPU" if fits else "whether every expert fits on the GPU cannot be counted before the load"
+        logger.info_rank0(f"--preset {config.preset}: offload, not hybrid ({why})")
         return None
     logger.info_rank0(
         f"--preset {config.preset}: hybrid ({reason}; the CPU MoE pool has {threads} threads, {PRESET_HYBRID_THREADS} or "
