@@ -235,10 +235,12 @@ expert cache that holds part of the experts: `hybrid` and `offload` with 3 draft
 with none; `offload` with none is the `offload` server where that one drops its drafts for the size
 of the cache (above), and is not timed where it keeps them. 4 and 5 draft tokens without the map are
 not candidates. Each candidate is one server start that decodes two built-in prompts (a math
-problem and a coding task) twice over, with the checkpoint's sampling: 512 timed tokens after 1024
-warm-up tokens that fill the expert cache, then 512 timed tokens after 256 warm-up tokens on the
-cache the first pass left (256 timed tokens put 5 drafts with a map 8% ahead of 3 on one prompt and
-3% behind on the other, where 2,048 put them 19% and 5% ahead). A candidate's lead over another is
+problem and a coding task) twice over, with the checkpoint's sampling: N timed tokens after 1024
+warm-up tokens that fill the expert cache, then N timed tokens after 256 warm-up tokens on the
+cache the first pass left. N is 512 with every expert resident (256 timed tokens put 5 drafts with a
+map 8% ahead of 3 on one prompt and 3% behind on the other, where 2,048 put them 19% and 5% ahead)
+and 256 on an expert cache, where a server load takes most of a candidate's time and the shorter
+window leaves the 300 s room for a second candidate. A candidate's lead over another is
 taken per prompt from the means over the two passes and is the smaller of the two prompts'; a
 candidate behind in any single pass has none. The static preset's choice is chosen first; then, in
 the order they are timed, a candidate replaces the one chosen so far where it leads that one by more

@@ -1625,7 +1625,7 @@ def test_calibration_takes_the_largest_worst_lead_above_the_margin_and_times_two
     seen = {}
 
     def run_arm(ns, extra, arm, rate, single, together, sampling, floors=None, passes=None, warm_after=None, deadline=None, grace=30.0):
-        seen.update(passes=ns.seeds, warm=ns.warm, warm_after=warm_after, timeout=ns.server_timeout, extra=extra,
+        seen.update(passes=ns.seeds, warm=ns.warm, decode=ns.decode, warm_after=warm_after, timeout=ns.server_timeout, extra=extra,
                     prompts=[name for name, _ in single], together=together)
         cols = [{"tok_s": (a + b) / 2, "seeds": [{"tok_s": a}, {"tok_s": b}], "draft_n": 4, "early": a, "gave_up": False} for a, b in ((90.0, 110.0), (180.0, 220.0))]
         return {"tok_s": [c["tok_s"] for c in cols], "results": cols, "cache_slots": 40, "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": None, "ready_s": 1.0}
@@ -1635,7 +1635,13 @@ def test_calibration_takes_the_largest_worst_lead_above_the_margin_and_times_two
     argv = ["--preset", "single-measured", "--calibrate-again", "--memory-ratio", "0.8"]
     timed = calibrate._time_candidate(SimpleNamespace(model_path="/models/anon"), argv, "offload", 3, ready_s=123.9)
     assert timed["tok_s"] == [[90.0, 110.0], [180.0, 220.0]] and timed["drafts"] == 8
-    assert seen["passes"] == calibrate.PASSES >= 2 and seen["warm"] == calibrate.WARM >= 1024 and calibrate.DECODE == 512
+    assert seen["passes"] == calibrate.PASSES >= 2 and seen["warm"] == calibrate.WARM >= 1024
+    # 512 timed tokens with every expert resident, where 256 misranked the map's depth; 256 on an expert cache, so that
+    # the budget holds a second load
+    assert seen["decode"] == calibrate.DECODE_PARTIAL == 256
+    calibrate._time_candidate(SimpleNamespace(model_path="/models/anon"), argv, "fused", 3, ready_s=123.9)
+    assert seen["decode"] == calibrate.DECODE == 512
+    calibrate._time_candidate(SimpleNamespace(model_path="/models/anon"), argv, "offload", 3, ready_s=123.9)
     # the later passes find the cache filled and warm up for less; the server has the seconds it was given to load, and
     # is the static preset with the rest of the command line, never one that calibrates again
     assert seen["warm_after"] == calibrate.WARM_AGAIN < calibrate.WARM and seen["timeout"] == 123

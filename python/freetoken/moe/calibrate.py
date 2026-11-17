@@ -1,7 +1,7 @@
 """--preset single-measured: time what the static preset cannot choose, once, and keep the choice.
 
 The rule: every candidate (candidates() lists them) is one server start that decodes each of the two built-in
-prompts PASSES times over, DECODE timed tokens after a warm-up: WARM tokens in the first pass, which fills the expert
+prompts PASSES times over, the timed tokens of _decode_window after a warm-up: WARM tokens in the first pass, which fills the expert
 cache, and WARM_AGAIN in the later ones, which find it filled. With t(c, p, k) the tok/s of candidate c on prompt p in
 pass k, the lead of c over another candidate b is
 
@@ -72,8 +72,10 @@ PRESET = "single-measured"
 # unmeasured: tokens that fill the expert cache, then tokens that are timed, per prompt and pass. The first warm-up is
 # the bench's own default: after fewer, a cold cache was timed, and a candidate that misses less from cold looked
 # faster. The later passes start on the cache the first one left. 256 timed tokens put 5 drafts with a map at +8% / -3%
-# against 3 drafts on a full card, where 2,048 put them at +19% / +5%: the window is 512.
-WARM, WARM_AGAIN, DECODE = 1024, 256, 512
+# against 3 drafts on a full card, where 2,048 put them at +19% / +5%: there the window is 512. On a cache that holds
+# part of the experts no depth is timed against another with the map, and the shorter window leaves the budget room for
+# a second load (_decode_window).
+WARM, WARM_AGAIN, DECODE, DECODE_PARTIAL = 1024, 256, 512, 256
 PASSES = 2                # per prompt, in one server start
 # seconds a calibration may take; a candidate is started only while SLACK times the longest one so far still fits
 BUDGET_S, SLACK = 300, 1.1
@@ -89,7 +91,7 @@ READY_S = 900             # the longest a candidate's server may take to load
 PROMPTS = ("math", "code")
 DEPTHS = (3, 0)           # the static preset's first; 4 and 5 drafts are a candidate only with the map
 MAP_DEPTH = 5             # draft tokens of the candidate with a draft token map
-_VERSION = 6
+_VERSION = 7
 _now, _sleep = time.monotonic, time.sleep
 
 # removed from the command line of a candidate's server: the bench names these itself, and the preset must not measure again
@@ -322,6 +324,11 @@ class _Slower(RuntimeError):
     """The bench stopped a candidate that started under half the static choice's speed: a result, not a failure."""
 
 
+def _decode_window(strategy: str) -> int:
+    """Timed tokens per prompt and pass of a candidate: DECODE with every expert resident, DECODE_PARTIAL on an expert cache."""
+    return DECODE if strategy == "fused" else DECODE_PARTIAL
+
+
 def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, floors: list[float] | None = None, ready_s: float = READY_S,
                     token_map: str | None = None, left_s: float | None = None) -> dict:
     """One server start of a candidate through the bench's own code: its tok/s per prompt and pass, and what it ran with.
@@ -334,7 +341,7 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
     if strategy == "hybrid":
         # the rounding mode the real server will run (moe/offload_kernels.py reads the same variable)
         arm = f"hybrid:{(os.getenv('FREETOKEN_HYBRID_FETCH_ROUND') or 'min-wait').strip().lower()}"
-    bench_argv = ["--model", args.model_path, "--seeds", str(PASSES), "--warm", str(WARM), "--decode", str(DECODE), "--streams", "1",
+    bench_argv = ["--model", args.model_path, "--seeds", str(PASSES), "--warm", str(WARM), "--decode", str(_decode_window(strategy)), "--streams", "1",
                   "--no-write", "--server-timeout", str(int(ready_s)), "--settle", "0", "--", *child_flags(argv, depth, token_map)]
     try:
         ns, extra = benchdecode.parse_args(bench_argv, "ft serve --preset " + PRESET)
@@ -519,7 +526,7 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
         tok_s[name] = r["tok_s"]
     return {
         "tok_s": tok_s, "failed": failed, "skipped": skipped, "columns": list(PROMPTS), "warm": WARM, "warm_again": WARM_AGAIN,
-        "decode": DECODE, "passes": PASSES, "budget_s": BUDGET_S, "wall_s": {n: round(v, 1) for n, v in wall.items()}, "tail_s": round(tail, 1),
+        "decode": _decode_window(static[1]), "passes": PASSES, "budget_s": BUDGET_S, "wall_s": {n: round(v, 1) for n, v in wall.items()}, "tail_s": round(tail, 1),
         "static": {"early": first.get("early"), "drafts": first["drafts"], "no_drafts": bool(first.get("no_drafts"))},
         "cache_slots": first["cache_slots"], "total_slots": first["total_slots"], "slot_bytes": first["slot_bytes"],
         "gpu_free_bytes": first["gpu_free_bytes"], "seconds": round(_now() - t0, 1),
@@ -639,7 +646,7 @@ def measured_choice(args, argv: list[str]) -> dict:
         if row is None:
             logger.info(
                 f"--preset {PRESET}: calibrating, up to {len(todo)} server starts within {BUDGET_S} s, each {PASSES} passes on "
-                f"{len(PROMPTS)} prompts of {DECODE} timed tokens after {WARM} warm-up tokens, {WARM_AGAIN} from the second pass on ({reason})"
+                f"{len(PROMPTS)} prompts of {_decode_window(todo[0][1])} timed tokens after {WARM} warm-up tokens, {WARM_AGAIN} from the second pass on ({reason})"
             )
             # the launcher's own reading of the free memory: a later start compares its reading with this one
             row = {**measure(args, argv, todo, known, free), "stamp": stamp, "gpu_free_bytes": free}
