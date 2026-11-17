@@ -1291,6 +1291,43 @@ def test_preset_serves_the_stores_draft_token_map_only_where_every_expert_is_res
     assert resolved(fields=drafts, moe_strategy="fused") == (("fused", 3, None), "")
 
 
+def test_preset_takes_hybrid_only_where_the_expert_cache_holds_a_fifth_of_the_experts(decode_rows, monkeypatch):
+    """4a's line: hybrid where the expert cache holds 20% of the experts or more, offload under it (box B's 8 GiB plan,
+    1609 of 10240, ran out of memory under hybrid where offload answered). A typed size or rate is the share; an
+    automatic cache's share is counted before the load from the experts' bytes, what the server needs beside them, the
+    staging buffers and the free memory; where it cannot be counted, offload."""
+    engine = decode_rows.engine
+    monkeypatch.setattr(engine, "_preset_takes_fused", lambda config: False)
+    monkeypatch.setattr(engine, "_preset_every_expert_fits", lambda config: False)
+    monkeypatch.setattr(engine, "_cpu_pool_threads", lambda config: 16)
+
+    def strategy(**flags):
+        return _resolved(decode_rows, preset="single", preset_fields=("moe_strategy", "max_running_req"), max_running_req=1,
+                         memory_ratio=0.95, **flags).moe_strategy
+
+    # the fixture's 80 experts: 16 slots is a fifth
+    assert strategy(moe_cache_size=16) == "hybrid" and strategy(moe_cache_size=15) == "offload"
+    # a rate is rounded up to slots: 0.19 of 80 is 16
+    assert strategy(moe_cache_rate=0.2) == "hybrid" and strategy(moe_cache_rate=0.18) == "offload"
+    assert strategy(moe_cache_rate=1609 / 10240) == "offload"
+    # automatic: 1000 bytes of experts, 1000 more the server needs, staging of two of ten layers' experts (200 bytes):
+    # 0.95 x free - 1200 must reach 200
+    monkeypatch.setattr(engine, "_checkpoint_expert_bytes", lambda path: 1000)
+    monkeypatch.setattr(engine, "_preset_gpu_need", lambda config, need_working: 2000)
+    for free, want in ((1474, "hybrid"), (1473, "offload"), (1 << 20, "hybrid")):
+        monkeypatch.setattr(engine, "_gpu_free_bytes", lambda free=free: free)
+        assert strategy() == want, free
+    assert strategy(moe_cache_mem=200) == "hybrid" and strategy(moe_cache_mem=199) == "offload"
+    monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: None)
+    assert strategy() == "offload"
+    monkeypatch.setattr(engine, "_checkpoint_expert_bytes", lambda path: None)
+    assert strategy(moe_cache_mem=1 << 30) == "offload"
+
+
+# the share of the experts each level's expert cache holds (box B's 8 GiB plan: 1609 of 10240)
+_LEVEL_SHARE = {"full card": 1.0, "12 GiB": 0.39, "8 GiB": 1609 / 10240, "20%": 0.2, "5%": 0.05}
+
+
 @pytest.mark.parametrize(
     "level, resident, flags",
     [("full card", True, {}), ("12 GiB", False, {}), ("8 GiB", False, {}), ("20%", False, {"moe_cache_rate": 0.2}), ("5%", False, {"moe_cache_rate": 0.05})],
@@ -1303,6 +1340,7 @@ def test_preset_serves_hybrid_on_a_partial_cache_without_a_decode_row_where_the_
     assert PRESET_HYBRID_THREADS == 8
     monkeypatch.setattr(engine, "_preset_takes_fused", lambda config: resident)  # the full card's rule has a test of its own
     monkeypatch.setattr(engine, "_preset_every_expert_fits", lambda config: resident)  # and so has the cache's (below)
+    monkeypatch.setattr(engine, "_preset_expert_share", lambda config: _LEVEL_SHARE[level])  # and the share's
     lines = []
     monkeypatch.setattr(engine.logger, "info_rank0", lines.append)
 
@@ -1311,10 +1349,13 @@ def test_preset_serves_hybrid_on_a_partial_cache_without_a_decode_row_where_the_
         config = _resolved(decode_rows, preset="single", preset_fields=fields, **{"max_running_req": 1, **flags, **more})
         return config.moe_strategy
 
-    partial = "fused" if resident else "hybrid"
+    # hybrid only where the cache holds a fifth of the experts or more: 12 GiB and 20%, not 8 GiB or 5%
+    partial = "fused" if resident else ("hybrid" if _LEVEL_SHARE[level] >= 0.2 else "offload")
     assert served() == partial and served(threads=16) == partial
-    if not resident:
+    if partial == "hybrid":
         assert any(line.startswith("--preset single: hybrid (") and "the CPU MoE pool has 8 threads" in line for line in lines)
+    elif partial == "offload":
+        assert any("offload, not hybrid (the share of the experts the expert cache holds is about" in line for line in lines)
     # a smaller pool, or a strategy, a request count or CPU layers from the command line: offload as before
     assert served(threads=PRESET_HYBRID_THREADS - 1) == ("fused" if resident else "offload")
     assert served(fields=("max_running_req",), moe_strategy="offload") == "offload"
@@ -1347,6 +1388,7 @@ def test_preset_keeps_offload_where_an_expert_cache_would_hold_every_expert(deco
     monkeypatch.setattr(engine, "state_pool_bytes", lambda config: 300)
     monkeypatch.setattr(engine, "_prefill_working_bytes", lambda config: (8192, 0))
     monkeypatch.setattr(engine, "_cpu_pool_threads", lambda config: 16)
+    monkeypatch.setattr(engine, "_preset_expert_share", lambda config: 0.5)  # a fifth or more: the share's rule has its own test
     need = 100 + 2304 * 16_000 + 500 + 300  # the 100-byte checkpoint and the preset's 36864-token reserve
 
     def strategy(free, **flags):
@@ -1386,9 +1428,9 @@ def test_preset_keeps_offload_where_an_expert_cache_would_hold_every_expert(deco
         # the store holds a map: --preset single serves it resident, and single-measured times 3 drafts without it next
         ("full card", True, {}, ("fused", 5, "map"), ("fused", 5, "map"), ["fused@5map", "fused@3"]),
         ("12 GiB", False, {}, ("hybrid", 3, None), ("offload", 3, None), ["hybrid@3", "hybrid@0", "offload@3", "offload@0"]),
-        ("8 GiB", False, {}, ("hybrid", 3, None), ("offload", 3, None), ["hybrid@3", "hybrid@0", "offload@3", "offload@0"]),
+        ("8 GiB", False, {}, ("offload", 3, None), ("offload", 3, None), ["offload@3", "hybrid@3", "hybrid@0", "offload@0"]),
         ("20%", False, {"moe_cache_rate": 0.2}, ("hybrid", 3, None), ("offload", 3, None), ["hybrid@3", "hybrid@0", "offload@3", "offload@0"]),
-        ("5%", False, {"moe_cache_rate": 0.05}, ("hybrid", 3, None), ("offload", 3, None), ["hybrid@3", "hybrid@0", "offload@3", "offload@0"]),
+        ("5%", False, {"moe_cache_rate": 0.05}, ("offload", 3, None), ("offload", 3, None), ["offload@3", "hybrid@3", "hybrid@0", "offload@0"]),
     ],
 )
 def test_what_single_serves_and_single_measured_times_at_each_memory_level(decode_rows, monkeypatch, level, resident, flags, served8, served4, candidates8):
@@ -1403,6 +1445,7 @@ def test_what_single_serves_and_single_measured_times_at_each_memory_level(decod
     engine = decode_rows.engine
     monkeypatch.setattr(engine, "_preset_takes_fused", lambda config: resident)
     monkeypatch.setattr(engine, "_preset_every_expert_fits", lambda config: resident)
+    monkeypatch.setattr(engine, "_preset_expert_share", lambda config: _LEVEL_SHARE[level])
     monkeypatch.setattr(engine, "_adjust_spec_config", lambda config, override, windowed_kv: None)
     path = calibrate.token_map_path(str(decode_rows.model))
     os.makedirs(os.path.dirname(path))

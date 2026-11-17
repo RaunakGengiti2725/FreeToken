@@ -455,6 +455,29 @@ def _preset_every_expert_fits(config) -> bool | None:
     return None if free is None else need <= int(config.memory_ratio * free)
 
 
+def _preset_expert_share(config) -> float | None:
+    """The share of all experts a preset's expert cache holds: a size or rate the command line gave, a --moe-cache-mem
+    against the experts' bytes, or, for an automatic cache, the memory ratio's share of the free memory less what the
+    server needs beside the experts (_preset_gpu_need without them) and the prefill staging buffers (two layers' experts),
+    against the experts' bytes. Counted before the load, so an estimate; None where it cannot be counted."""
+    model = config.model_config
+    total = model.num_moe_layers * model.num_experts
+    if config.moe_cache_size > 0:
+        return config.moe_cache_size / total
+    if config.moe_cache_rate:
+        return float(config.moe_cache_rate)
+    experts = _checkpoint_expert_bytes(config.model_path)
+    if not experts:
+        return None
+    if config.moe_cache_mem is not None:
+        return config.moe_cache_mem / experts
+    need, free = _preset_gpu_need(config, need_working=False), _gpu_free_bytes()
+    if need is None or free is None:
+        return None
+    staging = 2 * experts // model.num_moe_layers
+    return (int(config.memory_ratio * free) - (need - experts) - staging) / experts
+
+
 def _preset_gpu_need(config, need_working: bool) -> int | None:
     """_preset_resident_need's count; without ``need_working`` a model whose prefill working memory is not known counts it as 0."""
     model = config.model_config
@@ -2973,6 +2996,13 @@ def _preset_without_row(config, reason: str) -> tuple[str, None] | None:
     if fits is None or fits:
         why = "every expert fits on the GPU" if fits else "whether every expert fits on the GPU cannot be counted before the load"
         logger.info_rank0(f"--preset {config.preset}: offload, not hybrid ({why})")
+        return None
+    # under a fifth, as for the preset's drafts (PRESET_DRAFT_SHARE): with 8 GiB free on an RTX 5090, hybrid on a cache of
+    # 1609 of 10240 experts ran out of memory in long prefills where offload with the same cache answered to 32K tokens
+    share = _preset_expert_share(config)
+    if share is None or share < PRESET_DRAFT_SHARE:
+        held = "cannot be counted before the load" if share is None else f"is about {share:.0%}, under {PRESET_DRAFT_SHARE:.0%}"
+        logger.info_rank0(f"--preset {config.preset}: offload, not hybrid (the share of the experts the expert cache holds {held})")
         return None
     logger.info_rank0(
         f"--preset {config.preset}: hybrid ({reason}; the CPU MoE pool has {threads} threads, {PRESET_HYBRID_THREADS} or "
