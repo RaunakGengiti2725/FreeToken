@@ -356,3 +356,29 @@ def test_a_prefill_drain_sends_the_first_tokens_before_the_draft_pass_and_frees_
         assert pages == ([("free", 1), ("cache", 1)] if max_tokens == 1 else [("cache", 1)]) + [("cache", 2)]
         # without a draft pass the order is the drain's as before: page operations first, then the report and the send
         assert plain_events == pages + [("report",), ("send", [1, 2])]
+
+
+def test_a_warm_request_left_queued_or_running_is_dropped_with_what_it_holds():
+    """The first-request warmup takes out a warm request the pools could not finish: one still queued would stand at
+    the head of the queue for good. Queued, it leaves the queue; running, it leaves the running set and gives back its
+    pages, table row and state slots; a uid it does not hold is left alone."""
+    from freetoken.message import UserMsg
+
+    pool, cm, tm, dm, stub, events = _setup()
+    free_pages, free_rows, free_slots = cm.available_size, len(tm._free_slots), pool.num_free_slots
+    stub._drop_unserved_warm = lambda uid: Scheduler._drop_unserved_warm(stub, uid)
+    stub.prefill_manager.add_one_req(UserMsg(uid=-1, input_ids=torch.arange(1, 9, dtype=torch.int32),
+                                             sampling_params=SamplingParams(max_tokens=2)))
+    running = _decoding_req(pool, cm, tm, -2, 16)
+    # as in the warmup: seeded, under reproducible seeds, so its finish commits nothing to the tree
+    running.sampling_params.seed, cm.reproducible_seeds = 0, True
+    dm.filter_reqs([running])
+    assert stub.prefill_manager.runnable and dm.runnable
+
+    assert not Scheduler._drop_unserved_warm(stub, -3)
+    assert Scheduler._drop_unserved_warm(stub, -1)
+    assert not stub.prefill_manager.runnable and dm.runnable
+    assert Scheduler._drop_unserved_warm(stub, -2)
+    assert not dm.runnable and events == [("free", -2)]
+    assert (cm.available_size, len(tm._free_slots), pool.num_free_slots) == (free_pages, free_rows, free_slots)
+    cm.check_integrity()

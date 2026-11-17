@@ -261,6 +261,12 @@ class Scheduler(SchedulerIOMixin):
                             break
                         self._restore_linear_states(forward_input.batch)
                         self._process_last_data((forward_input, self._forward(forward_input)))
+                    if self._drop_unserved_warm(-uid):
+                        # the pools cannot seat it now; a longer one fits no better
+                        logger.warning_rank0(f"First-request warmup stopped: a {length}-token prompt could not be served")
+                        runs = runs[: uid - 1]
+                        break
+                assert not (self.prefill_manager.runnable or self.decode_manager.runnable), "a warm request is left"
                 torch.cuda.synchronize(self.device)
         finally:
             self.send_result = send
@@ -273,6 +279,16 @@ class Scheduler(SchedulerIOMixin):
             f"First-request warmup served prompts of {[length for length, _ in runs]} tokens "
             f"in {time.perf_counter() - started:.3f} s"
         )
+
+    def _drop_unserved_warm(self, uid: int) -> bool:
+        """Take warm request ``uid`` out of the queue or the running set and free what it holds; True if it was there.
+        A warm request left queued would stand at the head of the queue for good, and answer to a negative uid."""
+        queued = any(req.uid == uid for req in self.prefill_manager.pending_list)
+        running = self.decode_manager.abort_req(uid)
+        chunked = self.prefill_manager.abort_req(uid) if queued else None
+        for req in {r for r in (running, chunked) if r is not None}:
+            self._free_req_resources(req)
+        return queued or running is not None
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
