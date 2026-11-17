@@ -251,6 +251,21 @@ def _drop_preset_fields(config, *names: str) -> None:
 PRESET_CAPTURE_BYTES = 2304 << 20
 
 
+# the decode graphs of the batch sizes a preset names (--preset multi): on box F's RTX 5090, fused servers of 8 and 16
+# running requests at MTP-3 left 0.07 and 0.14 GiB less free after their captures, 2.24 MiB a verify row of the largest
+PRESET_DECODE_GRAPH_ROW_BYTES = 9 << 18
+
+
+def _preset_decode_graph_bytes(config) -> int:
+    """GPU bytes a preset counts for the decode graphs of the batch sizes it names (--cuda-graph-bs, which 'multi'
+    fills): the rows of the largest size, k + 1 a request with drafts. Nothing where the sizes are left to the engine."""
+    sizes = getattr(config, "cuda_graph_bs", None)
+    if not sizes or getattr(config, "preset", None) is None:
+        return 0
+    rows = 1 + (config.speculative_num_steps if config.speculative_algorithm is not None else 0)
+    return max(sizes) * rows * PRESET_DECODE_GRAPH_ROW_BYTES
+
+
 def _preset_capture_bytes(config) -> int:
     """GPU bytes a preset leaves free for the prefill graphs it asked for; a --prefill-graph-chunks from the command line gets none."""
     return PRESET_CAPTURE_BYTES if "prefill_graph_chunks" in getattr(config, "preset_fields", ()) else 0
@@ -383,7 +398,8 @@ def _checkpoint_bytes(path: str) -> int | None:
 
 def _preset_resident_need(config) -> int | None:
     """GPU bytes a preset's server needs with every expert resident ('fused'): the checkpoint's weight files, the
-    preset's KV reserve with the draft's share, the linear states and one prefill chunk's working memory. None where
+    preset's KV reserve with the draft's share, the linear states, one prefill chunk's working memory and the decode
+    graphs of the batch sizes it names. None where
     one of them cannot be counted before the load, or the command line asks for an expert cache."""
     sized = config.moe_cache_size > 0 or config.moe_cache_rate or config.moe_cache_mem is not None or config.moe_cache_auto
     if sized or config.moe_cpu_layers or config.tp_info.size > 1 or not _fused_resident_ok(config.model_config):
@@ -434,7 +450,7 @@ def _preset_gpu_need(config, need_working: bool) -> int | None:
         pages = -(-config.num_token_override // page_tokens)
     elif config.num_page_override is not None:
         pages = config.num_page_override
-    return weights + pages * page_bytes + fixed + state_pool_bytes(config) + working
+    return weights + pages * page_bytes + fixed + state_pool_bytes(config) + working + _preset_decode_graph_bytes(config)
 
 
 def _preset_takes_fused(config) -> bool:

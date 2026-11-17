@@ -412,3 +412,45 @@ def test_a_seeded_rows_probabilities_and_token_have_the_same_bits_alone_and_in_a
                 assert torch.equal(pb[i], p1[0]), (f, row, batch)
                 assert torch.equal(pb.cumsum(-1)[i], p1.expand(2, -1).cumsum(-1)[0]), (f, row, batch)
                 assert torch.equal(keyed_draw(pb, u[rows])[i], t1[0]), (f, row, batch)
+
+
+@cuda
+@pytest.mark.parametrize("seeded,width", [(8, 6), (16, 6), (32, 4)])
+def test_a_seeded_requests_verify_tokens_are_the_same_alone_and_among_many_keyed_rows(seeded, width):
+    """48, 96 and 128 keyed rows at Qwen3.6's vocabulary through Sampler: seeded requests with and without top-k,
+    top-p and min-p, at their own temperatures and positions, beside a greedy and an unseeded request, in a shuffled
+    order. Each seeded request's verify tokens must be the ones it draws in a batch of its own."""
+    from freetoken.core import Batch, Req, SamplingParams
+
+    device = torch.device("cuda")
+    vocab = 248320
+    sampler = _sampler(device, vocab)
+    g = torch.Generator(device=device).manual_seed(9)
+    filters = [{}, {"top_k": 20, "top_p": 0.95}, {"top_p": 0.9}, {"top_k": 50}, {"min_p": 0.05}]
+
+    def req(i, seed, **params):
+        n = 40 + 7 * i
+        return Req(input_ids=torch.zeros(n, dtype=torch.int32), table_idx=0, cached_len=n - 1, output_len=64, uid=i,
+                   sampling_params=SamplingParams(seed=seed, **params), cache_handle=None)
+
+    reqs = [req(i, 1000 + i, temperature=(0.7, 1.0, 1.3)[i % 3], **filters[i % len(filters)]) for i in range(seeded)]
+    reqs += [req(seeded, None, temperature=0.0), req(seeded + 1, None, temperature=1.0, top_k=40)]
+    logits = {r.uid: torch.randn(width, vocab, device=device, generator=g) * 4 for r in reqs}
+
+    def step(batch_reqs):
+        args = sampler.prepare(Batch(reqs=batch_reqs, phase="verify", rows_per_req=width))
+        drafts = torch.zeros(len(batch_reqs), width - 1, dtype=torch.int64, device=device)
+        out = sampler.sample_verify(torch.cat([logits[r.uid] for r in batch_reqs]), args, drafts).view(len(batch_reqs), width)
+        return {r.uid: out[i].tolist() for i, r in enumerate(batch_reqs)}
+
+    alone = {r.uid: step([r])[r.uid] for r in reqs[:seeded]}
+    order = torch.randperm(len(reqs), generator=torch.Generator().manual_seed(seeded)).tolist()
+    shuffled = [reqs[i] for i in order]
+    together = step(shuffled)
+    for r in reqs[:seeded]:
+        assert together[r.uid] == alone[r.uid], (r.uid, r.sampling_params)
+    greedy = reqs[seeded]
+    assert together[greedy.uid] == logits[greedy.uid].argmax(dim=-1).tolist()
+    # and the same again in another order: the keyed rows' places move
+    together = step(shuffled[::-1])
+    assert all(together[r.uid] == alone[r.uid] for r in reqs[:seeded])

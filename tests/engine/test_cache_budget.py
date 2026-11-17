@@ -1131,6 +1131,13 @@ def test_preset_serves_every_expert_resident_where_the_checkpoint_fits_and_the_s
     multi = dict(preset="multi", memory_ratio=0.95, kv_reserve_tokens=65536)
     assert strategy(context, max_running_req=2, **multi) == "offload" and strategy(whole, max_running_req=2, **multi) == "fused"
     assert strategy(context, max_running_req=1, **multi) == "fused"
+    # the decode graphs of the batch sizes a preset names count: 8 sizes of one row (no drafts here), and of 4 rows with 3 drafts
+    graphs = 8 * engine.PRESET_DECODE_GRAPH_ROW_BYTES
+    sized = dict(memory_ratio=0.95, max_running_req=8, cuda_graph_bs=list(range(1, 9)))
+    assert strategy(enough, **sized) == "offload" and strategy(-(-(need + graphs) * 20 // 19), **sized) == "fused"
+    assert engine._preset_decode_graph_bytes(SimpleNamespace(preset="multi", cuda_graph_bs=[1, 2, 8], speculative_algorithm="mtp", speculative_num_steps=3)) == 4 * graphs
+    assert engine._preset_decode_graph_bytes(SimpleNamespace(preset="single", cuda_graph_bs=None, speculative_algorithm="mtp", speculative_num_steps=3)) == 0
+    assert engine._preset_decode_graph_bytes(SimpleNamespace(preset=None, cuda_graph_bs=[1, 2], speculative_algorithm=None, speculative_num_steps=0)) == 0
     # a strategy from the command line, typed auto included, is never replaced; nor is one without the preset
     assert strategy(1 << 40, fields=()) == "offload" and strategy(1 << 40, fields=(), moe_strategy="hybrid") == "hybrid"
     assert _resolved(decode_rows, max_seq_len_override=40960).moe_strategy == "offload"
