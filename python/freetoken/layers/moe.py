@@ -385,7 +385,7 @@ class OffloadMoELayer(MoELayer):
         assert cache is not None
         demand = cache.loads_prefill_on_demand(hidden_states.shape[0])
         if self.layer_id == 0 and not demand:
-            cache.begin_prefill(num_routes=topk_ids.numel())
+            cache.begin_prefill(num_routes=topk_ids.numel(), num_tokens=hidden_states.shape[0])
             cache.choose_prefill_path(self.layer_id, topk_ids)
         demand = demand or cache.prefill_chunk_demand
         if cache.all_resident or demand:

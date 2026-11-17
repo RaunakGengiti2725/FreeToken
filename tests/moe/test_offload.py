@@ -298,7 +298,7 @@ def test_offload_moe_cache_loads_a_longer_chunk_on_demand_where_that_copies_less
     cache.all_resident = False
     layers = [_bf16_offload_layer(layer_id, E, 2, 8, 16) for layer_id in range(2)]
     events, answer = [], [True]
-    monkeypatch.setattr(cache, "begin_prefill", lambda num_routes=None: events.append("begin"))
+    monkeypatch.setattr(cache, "begin_prefill", lambda num_routes=None, num_tokens=None: events.append("begin"))
     monkeypatch.setattr(
         cache, "choose_prefill_path", lambda layer_id, routed: (events.append("choose"), setattr(cache, "prefill_chunk_demand", answer[0]))
     )
