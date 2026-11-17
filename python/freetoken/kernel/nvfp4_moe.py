@@ -19,6 +19,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from freetoken.env import ENV
 from freetoken.kernel.backend import is_rocm
 from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view, e4m3_native
 from freetoken.kernel.triton.nvfp4_fused_moe import (
@@ -544,6 +545,10 @@ def w4a4_available(device_index: int) -> bool:
 _W4A4_MIN_TOKENS_PER_EXPERT = 4
 # (min rho, tokens per expert where BLOCK_SIZE_M becomes 128), from the same sweeps
 _W4A4_BLOCK_M_STEPS = ((3.0, 128), (0.0, 64))
+# FREETOKEN_NVFP4_W4A4_ATOMIC_SUM: the down GEMM adds a token's routes with bf16 atomics as its tiles arrive. A bf16 sum
+# rounds at every add, so its last bits follow the arrival order. Unset, the GEMM stores each route's row and the routes
+# are summed in route order.
+W4A4_ATOMIC_SUM = ENV.NVFP4_W4A4_ATOMIC_SUM.value
 
 
 def w4a4_min_tokens(num_experts: int, top_k: int) -> int:
@@ -573,14 +578,16 @@ def w4a4_prefill_config(M: int, top_k: int, num_experts: int, H: int, I: int, ac
     # the gated tile holds BN / 2 gate rows and their up rows, so I must split into whole half tiles
     gate_up = dict(common, BLOCK_SIZE_N=256 if I % 128 == 0 else 128, BLOCK_SIZE_K=128 if H % 128 == 0 else 64,
                    N_GROUP=0, STAGES=3, LOAD_REGS=88)
+    route_out = not W4A4_ATOMIC_SUM
     if I < 1024:
-        # short K: the persistent kernel overlaps a tile's atomics with the next mainloop; N strips keep the [M, H] output
-        # in L2 once it outgrows half of it
-        down = dict(common, BLOCK_SIZE_N=256, BLOCK_SIZE_K=64, STAGES=4, N_GROUP=2 if M * H * 2 > l2_bytes // 2 else 0,
-                    LOAD_REGS=56, EPI_WARPS=4, EPI_REGS=72, PERSISTENT=True)
+        # short K: the persistent kernel overlaps a tile's output writes with the next mainloop; N strips keep the [M, H]
+        # output the atomics add into in L2 once it outgrows half of it
+        n_group = 2 if W4A4_ATOMIC_SUM and M * H * 2 > l2_bytes // 2 else 0
+        down = dict(common, BLOCK_SIZE_N=256, BLOCK_SIZE_K=64, STAGES=4, N_GROUP=n_group,
+                    LOAD_REGS=56, EPI_WARPS=4, EPI_REGS=72, PERSISTENT=True, ROUTE_OUT=route_out)
     else:
         down = dict(common, BLOCK_SIZE_N=256 if H % 256 == 0 else 128, BLOCK_SIZE_K=128 if I % 128 == 0 else 64,
-                    N_GROUP=0, STAGES=3, LOAD_REGS=88, PERSISTENT=False)
+                    N_GROUP=0, STAGES=3, LOAD_REGS=88, PERSISTENT=False, ROUTE_OUT=route_out)
     return dict(BLOCK_SIZE_M=block_m, gate_up=gate_up, down=down)
 
 

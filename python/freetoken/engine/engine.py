@@ -16,6 +16,7 @@ from freetoken.attention import AttnType, attention_backend_info, create_attenti
 from freetoken.attention.linear import ChunkCaptureLinearBackend, LinearAttnBackend, WideVerifyLinearBackend, gdn_slot
 from freetoken.core import DEFAULT_MAX_OUTPUT_TOKENS, Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.layers import OffloadMoELayer, ParallelLMHead, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
@@ -3442,10 +3443,10 @@ def _check_reproducible_seeds(config: EngineConfig, is_moe: bool) -> None:
             "--moe-cpu-layers): hybrid computes on the CPU the experts that are not resident, which follows earlier "
             "requests, and the CPU kernels round differently from the GPU's"
         )
-    if is_moe and getattr(config, "moe_expert_activation_scales", False):
+    if is_moe and ENV.NVFP4_W4A4_ATOMIC_SUM.value:
         raise ValueError(
-            "--reproducible-seeds does not work with --moe-expert-activation-scales: the W4A4 expert kernel adds its "
-            "routes with atomics, so the last bits of a prefill change from run to run"
+            "--reproducible-seeds does not work with FREETOKEN_NVFP4_W4A4_ATOMIC_SUM: the W4A4 expert kernel then adds "
+            "its routes with atomics, so the last bits of a prefill change from run to run"
         )
 
 

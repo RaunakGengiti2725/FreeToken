@@ -85,6 +85,9 @@ class EnvClassSingleton:
     # --moe-expert-activation-scales: a prefill forward of fewer tokens keeps the experts on 16-bit activations.
     # With the flag, prefill measured 30% faster at 4,096 and 8,192 tokens and 6% slower at 1,024, 12% at 128.
     NVFP4_ACT_SCALES_MIN_TOKENS = EnvInt(2048)
+    # W4A4 expert prefill: add each token's routes with bf16 atomics in the order the tiles arrive, without the buffer of
+    # route rows and its sum. The last bits of a prefill then change from run to run.
+    NVFP4_W4A4_ATOMIC_SUM = EnvBool(False)
 
     def __new__(cls):
         # single instance

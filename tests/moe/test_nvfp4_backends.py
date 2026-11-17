@@ -654,6 +654,50 @@ def test_w4a4_prefill_sizes_its_tiles_by_the_routed_experts_and_hands_them_to_it
     assert seen["fallback"][9] == slots and seen["fallback"][-2] == E and seen["fallback"][-1] is slot_of
 
 
+@pytest.mark.parametrize("atomic_sum", [False, True])
+def test_w4a4_prefill_sums_stored_route_rows_unless_told_to_add_with_atomics(monkeypatch, atomic_sum):
+    """The W4A4 down GEMM stores one row per route and the rows are summed in route order, which repeats bit for bit: a
+    bf16 atomic sum rounds at every add, in the order the tiles arrive. Only FREETOKEN_NVFP4_W4A4_ATOMIC_SUM hands the
+    GEMM the zeroed [tokens, H] output to add into, where a stored route row would land past the end."""
+    from types import SimpleNamespace
+
+    from freetoken.kernel import nvfp4_moe
+    from freetoken.moe import fused_nvfp4
+
+    tokens, top_k = 96, 3
+    g = torch.Generator().manual_seed(0)
+    topk_ids = torch.randint(0, E, (tokens, top_k), dtype=torch.int32, generator=g)
+    rows = torch.randn(tokens * top_k, H, generator=g).bfloat16()
+    seen = {}
+
+    def down(xq, xs, g_in, packed, scale, glob, out, tw, sorted_ids, expert_ids, ntpp, num_valid, k, cfg):
+        seen.update(shape=tuple(out.shape), cfg=cfg)
+        if cfg["ROUTE_OUT"]:
+            out.copy_(rows)
+        else:
+            assert not out.any()
+            out.index_add_(0, torch.arange(num_valid) // k, rows)
+
+    monkeypatch.setattr(nvfp4_moe, "W4A4_ATOMIC_SUM", atomic_sum)
+    monkeypatch.setattr(nvfp4_moe, "_w4a4_prefill", lambda device_index: SimpleNamespace(ACTIVATIONS={"silu": 0}, supports=lambda h, i: True))
+    # an L2 the [tokens, H] output outgrows half of: the atomics then add into N strips, which stored rows have no use for
+    monkeypatch.setattr(nvfp4_moe, "_w4a4_device", lambda device_index: (128, 1 << 16))
+    monkeypatch.setattr(nvfp4_moe, "w4a4_gate_up_gemm", lambda *args: None)
+    monkeypatch.setattr(nvfp4_moe, "w4a4_down_gemm", down)
+    monkeypatch.setattr(fused_nvfp4, "moe_align_block_size", _align_on_cpu)
+    monkeypatch.setattr(fused_nvfp4, "quantize_nvfp4", lambda x, scale: (None, None))
+    monkeypatch.setattr(fused_nvfp4, "moe_sum_reduce_triton", lambda routes, out: out.copy_(routes.float().sum(1)))
+    banks = [torch.zeros(E, 2 * I)] * 6
+    out = fused_nvfp4.fused_experts_nvfp4_w4a4(
+        torch.zeros(tokens, H, dtype=torch.bfloat16), *banks, torch.ones(E), torch.ones(E), torch.ones(tokens, top_k), topk_ids, E)
+
+    assert seen["cfg"]["ROUTE_OUT"] is not atomic_sum
+    assert seen["cfg"]["N_GROUP"] == (2 if atomic_sum else 0)
+    assert seen["shape"] == ((tokens, H) if atomic_sum else (tokens * top_k, H))
+    if not atomic_sum:
+        assert torch.equal(out, rows.view(tokens, top_k, H).float().sum(1).bfloat16())
+
+
 def test_prefill_tiles_override_replaces_only_what_it_names():
     """FREETOKEN_PREFILL_TILES reaches every _PrefillTuning field, leaves a class's other tiles alone and is a no-op unset."""
     from freetoken.kernel import nvfp4_moe
@@ -809,13 +853,16 @@ def _gated_ref(h: torch.Tensor, activation: str, inter: int, alpha: float, limit
 
 @cuda
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0), reason="needs sm_120")
-@pytest.mark.parametrize("hidden_size,inter,activation,tokens", [
-    (256, 128, "silu", 256), (320, 192, "gelu_tanh", 1024), (512, 1024, "swiglu_clamp", 256), (256, 128, "swigluoai", 256),
+@pytest.mark.parametrize("hidden_size,inter,activation,tokens,top_k", [
+    (256, 128, "silu", 256, 2), (320, 192, "gelu_tanh", 1024, 2), (512, 1024, "swiglu_clamp", 256, 2), (256, 128, "swigluoai", 256, 2),
+    (256, 128, "silu", 1024, 8), (256, 1024, "swiglu_clamp", 128, 8),
 ])
-def test_w4a4_prefill_matches_nvfp4_activation_reference(hidden_size, inter, activation, tokens):
-    """The w4a4 kernel from checkpoint pieces to the prefill output, against a torch emulation of the same NVFP4 activation rounding.
+def test_w4a4_prefill_matches_nvfp4_activation_reference(hidden_size, inter, activation, tokens, top_k):
+    """The w4a4 kernel from checkpoint pieces to the prefill output, against a torch emulation of the same NVFP4 activation rounding,
+    and against itself: every run of one input gives the same bits.
 
     Covers 256- / 128-row gated tiles, K % 256 != 0 in both GEMMs, the persistent down GEMM (I < 1024) and the other one, BLOCK_SIZE_M 64 and 128.
+    The top-8 rows are the ones that can tell a sum taken in the order the tiles arrive: two addends round the same in either order.
     """
     from types import SimpleNamespace
 
@@ -837,8 +884,8 @@ def test_w4a4_prefill_matches_nvfp4_activation_reference(hidden_size, inter, act
     gu, gus, gug = bank(2 * inter, hidden_size)
     dn, dns, dng = bank(hidden_size, inter)
     hidden = torch.randn(tokens, hidden_size, dtype=torch.bfloat16, device=device, generator=g)
-    topk_ids = torch.randint(0, E, (tokens, TOPK), dtype=torch.int32, device=device, generator=g)
-    topk_weights = torch.rand(tokens, TOPK, device=device, generator=g)
+    topk_ids = torch.randint(0, E, (tokens, top_k), dtype=torch.int32, device=device, generator=g)
+    topk_weights = torch.rand(tokens, top_k, device=device, generator=g)
 
     # static scales near a calibration's amax / (6 * 448), off by an irrational factor: with amax / 2688 itself many values sit exactly on an
     # e2m1 midpoint, where the kernel's approximate fp32 reciprocal and torch's exact one round apart; per expert, below the max for some experts
@@ -847,27 +894,30 @@ def test_w4a4_prefill_matches_nvfp4_activation_reference(hidden_size, inter, act
     w_gu = torch.stack([_dequant_ref(gu[e], gus[e], gug[e]) for e in range(E)])
     w_dn = torch.stack([_dequant_ref(dn[e], dns[e], dng[e]) for e in range(E)])
     routes = topk_ids.reshape(-1).long()
-    h = torch.bmm(w_gu[routes], xq.repeat_interleave(TOPK, 0).unsqueeze(-1)).squeeze(-1).bfloat16().float()
+    h = torch.bmm(w_gu[routes], xq.repeat_interleave(top_k, 0).unsqueeze(-1)).squeeze(-1).bfloat16().float()
     act = _gated_ref(h, activation, inter, alpha, limit or 0.0).bfloat16().float()
     g2 = float(act.abs().max()) / 2688 * math.pi / 3
     ref = torch.bmm(w_dn[routes], _nvfp4_qdq(act, g2).unsqueeze(-1)).squeeze(-1)
-    ref = (ref * topk_weights.reshape(-1, 1)).view(tokens, TOPK, hidden_size).sum(1)
+    ref = (ref * topk_weights.reshape(-1, 1)).view(tokens, top_k, hidden_size).sum(1)
 
     def input_scale(top):
         return torch.full((E, 1), top, device=device).index_fill_(0, torch.tensor([1, 2], device=device), top / 2)
 
     pieces = {"gate_up": gu, "gate_up_scale": gus, "gate_up_global": gug, "down": dn, "down_scale": dns, "down_global": dng,
               "gate_input": input_scale(g1), "up_input": input_scale(g1).roll(1, 0), "down_input": input_scale(g2)}
-    cfg = MoEConfig(num_experts=E, hidden=hidden_size, intermediate=inter, top_k=TOPK, activation=activation, alpha=alpha, limit=limit)
+    cfg = MoEConfig(num_experts=E, hidden=hidden_size, intermediate=inter, top_k=top_k, activation=activation, alpha=alpha, limit=limit)
     kernel = W4a4Nvfp4MoEKernel()
     layout = kernel.layout(cfg)
     banks = {role: torch.empty((E, *spec.shape), dtype=spec.dtype, device=device) for role, spec in layout.items() if not spec.resident}
     alphas = kernel.pack(pieces, cfg, banks)
     view = ExpertView(banks, n=E, alphas=(alphas["gate_up_alpha"], alphas["down_alpha"]))
-    layer = SimpleNamespace(activation=activation, alpha=alpha, limit=limit, apply_router_weight_on_input=False)
+    layer = SimpleNamespace(activation=activation, alpha=alpha, limit=limit, apply_router_weight_on_input=False,
+                            quant_method=SimpleNamespace(cfg=cfg))
     out = kernel.apply(layer, hidden, topk_weights, topk_ids, view, is_prefill=True)
     assert torch.equal(alphas["gate_up_alpha"], torch.maximum(pieces["gate_input"], pieces["up_input"]).squeeze(1))
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2 * float(ref.abs().max()))
+    for _ in range(4):
+        assert torch.equal(kernel.apply(layer, hidden, topk_weights, topk_ids, view, is_prefill=True), out)
 
 
 def _triton_cache(device, *, cache_size=S, prefill_overlap=False):

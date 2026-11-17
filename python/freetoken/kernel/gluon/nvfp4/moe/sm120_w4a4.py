@@ -1,7 +1,7 @@
 """NVFP4 W4A4 MoE prefill GEMMs for sm_120: NVFP4 weights times NVFP4 activations on mma.sync kind::mxf4nvf4.
 
 The activations are quantized under static global scales (the checkpoint's input_scale), so each GEMM input is e2m1 codes, per-16 e4m3 scales and one fp32 scalar.
-:func:`gate_up_gemm` applies the gated activation in its epilogue and writes the down GEMM's NVFP4 input; :func:`down_gemm` scales by the routing weight and adds each route into its token's output row with bf16 atomics (the sum order, and so the result, varies from run to run).
+:func:`gate_up_gemm` applies the gated activation in its epilogue and writes the down GEMM's NVFP4 input; :func:`down_gemm` scales by the routing weight and stores each route's row, which the caller sums in route order; with ``ROUTE_OUT`` off it adds each route into its token's row with bf16 atomics instead, in the order the tiles arrive, so the last bits vary from run to run.
 Routing follows the W4A16 kernels (moe_align sorted ids, expert per M block, swap-AB accumulator [BN, BM]); :mod:`freetoken.kernel.nvfp4_moe` picks the constexprs.
 """
 
@@ -228,7 +228,7 @@ def _w4a4_moe_kernel(
     BLOCK_SIZE_M: gl.constexpr, BLOCK_SIZE_N: gl.constexpr, BLOCK_SIZE_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr, N_GROUP: gl.constexpr, STAGES: gl.constexpr, MMA_WARPS_N: gl.constexpr,
     LOAD_WARPS: gl.constexpr, LOAD_REGS: gl.constexpr, K_TAIL: gl.constexpr, GATED: gl.constexpr,
-    ACT: gl.constexpr, top_k: gl.constexpr, wsl: gl.constexpr, xsl: gl.constexpr,
+    ROUTE_OUT: gl.constexpr, ACT: gl.constexpr, top_k: gl.constexpr, wsl: gl.constexpr, xsl: gl.constexpr,
 ):
     BM: gl.constexpr = BLOCK_SIZE_M
     BN: gl.constexpr = BLOCK_SIZE_N
@@ -282,13 +282,18 @@ def _w4a4_moe_kernel(
         wg = gl.load(wg_ptr + slot.to(gl.int64) * stride_ge + offs_n, mask=n_mask, other=0.0).to(gl.float32) * g_in
         tw = gl.load(topk_weights_ptr + route * stride_tw, mask=route_mask, other=0.0)
         acc = acc * wg[:, None] * tw[None, :]
-        out_ptrs = out_ptr + (route // top_k).to(gl.int64)[None, :] * stride_out + offs_n[:, None]
-        gl.atomic_add(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=route_mask[None, :] & n_mask[:, None], sem="relaxed")
+        row = route if ROUTE_OUT else route // top_k
+        out_ptrs = out_ptr + row.to(gl.int64)[None, :] * stride_out + offs_n[:, None]
+        out_mask = route_mask[None, :] & n_mask[:, None]
+        if ROUTE_OUT:
+            gl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=out_mask)
+        else:
+            gl.atomic_add(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=out_mask, sem="relaxed")
 
 
-# Persistent down GEMM: the 256 x 128 tile and 8 MMA warps of the kernel above, with the routing-weight scale and the atomics on
-# separate epilogue warps. The accumulator is two 128 x 128 halves that go to the epilogue one at a time through one 32 KB buffer,
-# so the next tile's mainloop overlaps the atomics of the last half.
+# Persistent down GEMM: the 256 x 128 tile and 8 MMA warps of the kernel above, with the routing-weight scale and the output
+# writes on separate epilogue warps. The accumulator is two 128 x 128 halves that go to the epilogue one at a time through one
+# 32 KB buffer, so the next tile's mainloop overlaps the writes of the last half.
 
 
 @gluon.jit
@@ -320,7 +325,7 @@ def _down_load_partition(xq_ptr, xs_ptr, ids_ptr, eid_ptr, ntpp_ptr, w_desc, ws_
 
 @gluon.jit
 def _down_epi_partition(ids_ptr, ntpp_ptr, out_ptr, bufs, bars, N, num_valid, stride_out, top_k: gl.constexpr,
-                        N_GROUP: gl.constexpr, GROUP_SIZE_M: gl.constexpr):
+                        N_GROUP: gl.constexpr, GROUP_SIZE_M: gl.constexpr, ROUTE_OUT: gl.constexpr):
     h_buf = bufs[4]
     acc_ready, acc_empty = bars[4], bars[5]
     HB: gl.constexpr = h_buf.type.shape[0]
@@ -328,7 +333,7 @@ def _down_epi_partition(ids_ptr, ntpp_ptr, out_ptr, bufs, bars, N, num_valid, st
     BN: gl.constexpr = 2 * HB
     CH: gl.constexpr = 64
     NWE: gl.constexpr = gl.num_warps()
-    # 8 consecutive n of one route per thread: one 16-byte bf16 atomic; 64 rows per pass keep the registers low
+    # 8 consecutive n of one route per thread: one 16-byte bf16 store or atomic; 64 rows per pass keep the registers low
     el: gl.constexpr = gl.BlockedLayout([8, 1], [CH // 8, 32 * 8 // CH], [1, NWE], [0, 1])
     offs_cl = gl.arange(0, CH, layout=gl.SliceLayout(1, el))
     offs_tl = gl.arange(0, BM, layout=gl.SliceLayout(0, el))
@@ -338,13 +343,17 @@ def _down_epi_partition(ids_ptr, ntpp_ptr, out_ptr, bufs, bars, N, num_valid, st
         pid_m, pid_n = _tile(t, num_pid_m, num_pid_n, GROUP_SIZE_M, N_GROUP)
         route = gl.load(ids_ptr + pid_m * BM + offs_tl)
         rmask = (route < num_valid)[None, :]
-        rows = (route // top_k).to(gl.int64)[None, :] * stride_out
+        row = route if ROUTE_OUT else route // top_k
+        rows = row.to(gl.int64)[None, :] * stride_out
         for half in gl.static_range(2):
             mbarrier.wait(acc_ready.index(0), hc & 1)
             for ch in gl.static_range(HB // CH):
                 offs_n = pid_n * BN + half * HB + ch * CH + offs_cl
                 h = h_buf.slice(ch * CH, CH).load(el)
-                gl.atomic_add(out_ptr + rows + offs_n[:, None], h, mask=rmask & (offs_n < N)[:, None], sem="relaxed")
+                if ROUTE_OUT:
+                    gl.store(out_ptr + rows + offs_n[:, None], h, mask=rmask & (offs_n < N)[:, None])
+                else:
+                    gl.atomic_add(out_ptr + rows + offs_n[:, None], h, mask=rmask & (offs_n < N)[:, None], sem="relaxed")
             mbarrier.arrive(acc_empty.index(0))
             hc += 1
 
@@ -427,7 +436,7 @@ def _w4a4_down_persistent_kernel(
     BLOCK_SIZE_M: gl.constexpr, BLOCK_SIZE_N: gl.constexpr, BLOCK_SIZE_K: gl.constexpr, STAGES: gl.constexpr,
     K_TAIL: gl.constexpr, N_GROUP: gl.constexpr, GROUP_SIZE_M: gl.constexpr, MMA_WARPS_N: gl.constexpr,
     LOAD_WARPS: gl.constexpr, LOAD_REGS: gl.constexpr, EPI_WARPS: gl.constexpr, EPI_REGS: gl.constexpr,
-    top_k: gl.constexpr, wsl: gl.constexpr, xsl: gl.constexpr,
+    ROUTE_OUT: gl.constexpr, top_k: gl.constexpr, wsl: gl.constexpr, xsl: gl.constexpr,
 ):
     BM: gl.constexpr = BLOCK_SIZE_M
     BN: gl.constexpr = BLOCK_SIZE_N
@@ -468,7 +477,7 @@ def _w4a4_down_persistent_kernel(
                                 stride_xq, ks4, n_rows, K_TAIL, N_GROUP, GROUP_SIZE_M)),
         (_down_epi_partition, (sorted_token_ids_ptr, num_tokens_post_padded_ptr, out_ptr,
                                (x_bufs, w_bufs, sw_bufs, sx_bufs, h_buf), (ready, empty, s_ready, s_empty, acc_ready, acc_empty),
-                               N, num_valid_tokens, stride_out, top_k, N_GROUP, GROUP_SIZE_M)),
+                               N, num_valid_tokens, stride_out, top_k, N_GROUP, GROUP_SIZE_M, ROUTE_OUT)),
     ], [LOAD_WARPS, EPI_WARPS], [LOAD_REGS, EPI_REGS])
 
 
@@ -504,19 +513,23 @@ def gate_up_gemm(xq, xs, g_in, packed, scale, glob, q, qs, g_out, sorted_ids, ex
         xq, xs.view(torch.uint8), g_in, _weight_desc(packed, BN // 2, BK), scale.view(torch.uint8), glob, None, None,
         sorted_ids, expert_ids, num_tokens_post_padded, q, qs.view(torch.uint8), g_out, act_alpha, act_limit,
         N, K, sorted_ids.shape[0], num_valid_tokens, K // 64, S * N, xq.stride(0), glob.stride(0), 0, 0,
-        K_TAIL=K % 256 != 0, GATED=True, ACT=ACTIVATIONS[activation], top_k=top_k, wsl=wsl, xsl=xsl, **cfg,
+        K_TAIL=K % 256 != 0, GATED=True, ROUTE_OUT=False, ACT=ACTIVATIONS[activation], top_k=top_k, wsl=wsl, xsl=xsl, **cfg,
     )
 
 
 def down_gemm(xq, xs, g_in, packed, scale, glob, out, topk_weights_flat, sorted_ids, expert_ids, num_tokens_post_padded,
               num_valid_tokens, top_k, cfg):
-    """out[route // top_k] += (xq * xs * g_in)[route] W4A4 packed[expert]^T * glob * topk_weights_flat[route]; out starts zeroed."""
+    """out[route] = (xq * xs * g_in)[route] W4A4 packed[expert]^T * glob * topk_weights_flat[route], out [routes, N].
+
+    With cfg["ROUTE_OUT"] off, out is [tokens, N], starts zeroed and takes out[route // top_k] += the same, in arrival order."""
     S, N, KB = packed.shape
     K = KB * 2
     cfg = dict(cfg)
     persistent = cfg.pop("PERSISTENT")
     BM, BN, BK = cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"], cfg["BLOCK_SIZE_K"]
     assert K % BK == 0 and xs.stride(0) == K // 16
+    # a route row stored into a [tokens, N] buffer would land past its end
+    assert out.shape == (num_valid_tokens if cfg["ROUTE_OUT"] else num_valid_tokens // top_k, N)
     args = (xq, xs.view(torch.uint8), g_in, _weight_desc(packed, BN, BK), scale.view(torch.uint8), glob, out,
             topk_weights_flat, sorted_ids, expert_ids, num_tokens_post_padded)
     if persistent:

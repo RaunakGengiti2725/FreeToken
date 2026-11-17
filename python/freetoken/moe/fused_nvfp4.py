@@ -213,7 +213,9 @@ def fused_experts_nvfp4_w4a4(
 
     ``*_input_scale`` are the per-expert static activation scales of the experts the routes are drawn from: the
     ``num_experts`` banks, or a demand prefill chunk's layer of ``routed_experts`` where the banks are cache slots.
-    Each GEMM input is quantized under their max, as vLLM does.
+    Each GEMM input is quantized under their max, as vLLM does. The down GEMM stores each route's row and the routes are
+    summed in route order, as the W4A16 prefill does, so the output repeats bit for bit; under
+    FREETOKEN_NVFP4_W4A4_ATOMIC_SUM it adds them into the output with atomics instead.
     """
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
@@ -238,11 +240,15 @@ def fused_experts_nvfp4_w4a4(
         xq, xs, g[0:1], gate_up_packed, gate_up_scale, gate_up_global, q, qs, g[1:2], sorted_ids, expert_ids, ntpp,
         num_valid, top_k, activation, act_alpha, act_limit, cfg["gate_up"],
     )
-    out = torch.zeros_like(hidden_states)
+    route_out = cfg["down"]["ROUTE_OUT"]
+    out = torch.empty_like(hidden_states) if route_out else torch.zeros_like(hidden_states)
+    dst = torch.empty((num_valid, H), device=dev, dtype=out.dtype) if route_out else out
     nvfp4_moe.w4a4_down_gemm(
-        q, qs, g[1:2], down_packed, down_scale, down_global, out, tw, sorted_ids, expert_ids, ntpp, num_valid, top_k,
+        q, qs, g[1:2], down_packed, down_scale, down_global, dst, tw, sorted_ids, expert_ids, ntpp, num_valid, top_k,
         cfg["down"],
     )
+    if route_out:
+        moe_sum_reduce_triton(dst.view(M, top_k, H), out)
     return out
 
 

@@ -1167,9 +1167,7 @@ def parse_args(
             "activations (W4A16). On sm_120 a prefill forward of at least 2048 tokens (the "
             "FREETOKEN_NVFP4_ACT_SCALES_MIN_TOKENS environment variable sets the length) then runs the W4A4 expert "
             "kernel; shorter prefill forwards and every decode step keep the W4A16 kernels, so a prompt prefilled in "
-            "shorter chunks is unchanged. The reference runtime serves such a checkpoint as W4A16, and the W4A4 down kernel adds "
-            "its routes with atomics, so the last bits of a prefill can differ from run to run. Refused with "
-            "--reproducible-seeds."
+            "shorter chunks is unchanged. The reference runtime serves such a checkpoint as W4A16."
         ),
     )
 
