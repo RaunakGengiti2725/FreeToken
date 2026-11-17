@@ -1227,7 +1227,8 @@ class Scheduler(SchedulerIOMixin):
         """A prefill batch of the request at the head of the queue where it is a full hit (scheduler/full_hit.py): it
         holds the tree's pages for its whole prompt, fresh state slots and a copy of the stored state to restore."""
         store, pending_list = self.full_hits, self.prefill_manager.pending_list
-        if store is None or not len(store) or not pending_list or self.table_manager.available_size == 0:
+        # alone: a request decoding beside it would share the step its drafts and state were stored for
+        if store is None or not len(store) or not pending_list or self.table_manager.available_size == 0 or self.decode_manager.runnable:
             return None
         pending = pending_list[0]
         if pending.chunked_req is not None or pending.mm_items or self.cache_manager.skips_prefix_cache(pending):
@@ -1243,7 +1244,9 @@ class Scheduler(SchedulerIOMixin):
         handle, pages = found
         cm, tm, pool = self.cache_manager, self.table_manager, self.cache_manager.linear_state_pool
         n, page = pending.input_len, cm.page_size
+        # as the prefill adder counts it, with what the running requests may still take
         reserve = (div_ceil(n + pending.output_len + self.prefill_manager.token_headroom, page) - div_ceil(n, page)) * page
+        reserve += self.decode_manager.inflight_tokens
         if reserve > cm.available_size:
             return None
         cm.lock(handle)

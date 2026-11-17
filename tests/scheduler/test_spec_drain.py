@@ -551,3 +551,20 @@ def test_the_first_token_key_names_what_decides_a_deterministic_first_token():
     seeded = first_token_key(SamplingParams(temperature=0.7, top_p=0.9, seed=3))
     assert seeded is not None and seeded != first_token_key(SamplingParams(temperature=0.7, top_p=0.9, seed=4))
     assert greedy != first_token_key(SamplingParams(presence_penalty=1.5))
+
+
+def test_a_full_hit_waits_for_running_requests(monkeypatch):
+    """No full hit while another request decodes: the resend stays queued for the normal prefill."""
+    from freetoken.message import UserMsg
+    from freetoken.scheduler.full_hit import FullHitEntry, first_token_key
+
+    pool, cm, tm, dm, pm, store, stub = _full_hit_setup(monkeypatch)
+    prompt = torch.arange(1, PROMPT + 1, dtype=torch.int32)
+    greedy = SamplingParams(max_tokens=8, ignore_eos=True)
+    store.add(FullHitEntry(prompt.clone(), torch.arange(PROMPT, dtype=torch.int32), pool.alloc(1)[0], torch.zeros(1, 50), None, 31,
+                           first_token_key(greedy)))
+    running = Req(input_ids=torch.arange(60, 70, dtype=torch.int32), table_idx=tm.allocate(), cached_len=9, output_len=4,
+                  uid=9, sampling_params=greedy, cache_handle=None)
+    dm.filter_reqs([running])
+    pm.add_one_req(UserMsg(uid=2, input_ids=prompt.clone(), sampling_params=greedy))
+    assert Scheduler._full_hit_batch(stub) is None and len(pm.pending_list) == 1 and len(store) == 1
