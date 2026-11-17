@@ -1469,13 +1469,10 @@ class Engine:
         if floor <= default:
             _drop_preset_fields(config, "kv_reserve_tokens")
         after, _ = _plan_or_short(self._auto_cache_terms(config, banks, method, max_slots))
-        # the KV pool bounds a request (_seq_limits): the scheduler refuses a longer prompt and caps the answer to what is left
-        held = min(after[1] * page if after is not None else floor, config.max_seq_len)
         logger.warning_rank0(
             f"--preset {config.preset}: the KV reserve is {floor} tokens, not {asked}: at {asked} the plan holds {plan[0]} of "
             f"{total} experts, under {PRESET_SMALL_PLAN_SHARE:.0%}" + (f", and at {floor} {after[0]}" if after is not None else "")
-            + f". A request then holds about {held} tokens of prompt and answer: a longer prompt is refused (context_length_exceeded), "
-            "and an answer is cut where the pool ends (finish_reason length); --kv-reserve-tokens or --max-output-tokens keeps a larger reserve"
+            + ". A longer prompt and answer end with finish_reason length; --kv-reserve-tokens or --max-output-tokens keeps a larger one"
         )
 
     def _prefill_tokens_within(self, config: EngineConfig, room: int) -> int:
