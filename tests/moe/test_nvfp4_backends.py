@@ -448,7 +448,8 @@ def _align_on_cpu(topk_ids: torch.Tensor, block_m: int, num_experts: int):
 def test_triton_prefill_over_resident_slots_groups_its_routes_over_the_layers_experts(monkeypatch, tokens, demand):
     """The grouping a resident prefill hands its GEMMs: sized by the layer's experts whatever the pool, every route in
     a block that names the slot of its expert, and no block, run or not, naming a row outside the banks. After a
-    demand chunk's admission the experts it does not route to may have no slot (-1)."""
+    demand chunk's admission the experts it does not route to may have no slot (-1); a routed one without a slot
+    is an error, not a read of row 0."""
     from freetoken.kernel import nvfp4_moe
     from freetoken.moe import fused_nvfp4
 
@@ -490,9 +491,15 @@ def test_triton_prefill_over_resident_slots_groups_its_routes_over_the_layers_ex
     assert by_expert[0].numel() <= by_slot[0].numel()
     assert torch.equal(slot_read_by_each_route(*by_expert), slots.view(-1))
     assert torch.equal(slot_read_by_each_route(*by_slot), slots.view(-1))
-    named = by_expert[1]
+    named, runs = by_expert[1], int(by_expert[2]) // block_m
     assert ((named >= 0) & (named < pool)).all()
-    assert demand or torch.isin(named, slot_of).all()
+    # the blocks that run name their expert's slot; the others, row 0
+    assert torch.isin(named[:runs], slot_of[slot_of >= 0]).all() and not named[runs:].any()
+    # a routed expert without a slot stops the forward
+    unloaded = slot_of.clone()
+    unloaded[topk_ids[0, 0].long()] = -1
+    with pytest.raises(RuntimeError):
+        fused_nvfp4.fused_experts_nvfp4(hidden, *banks, weights, topk_ids, pool, routed_experts=E, slot_of=unloaded)
 
 
 def test_triton_prefill_over_cache_slots_sizes_its_tiles_by_the_routed_layer(monkeypatch):
