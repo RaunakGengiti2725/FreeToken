@@ -1308,6 +1308,10 @@ def test_preset_serves_hybrid_on_a_partial_cache_without_a_decode_row_where_the_
     assert served(fields=("max_running_req",), moe_strategy="offload") == "offload"
     assert served(fields=("moe_strategy",), max_running_req=2) == ("fused" if resident else "offload")
     assert resident or served(moe_cpu_layers="2") == "offload"  # CPU layers are never resident (_preset_resident_need)
+    # typed flags hybrid cannot serve: seeded text that must not follow the cache, and a typed demand length (GPU decode)
+    assert served(reproducible_seeds=True) == ("fused" if resident else "offload")
+    assert served(moe_prefill_demand_tokens=256) == ("fused" if resident else "offload")
+    assert served(fields=("moe_strategy", "max_running_req", "moe_prefill_demand_tokens"), moe_prefill_demand_tokens=512) == partial
     # nor where hybrid cannot run, and a decode row measured for the setup decides before the rule: offload where it says so
     with monkeypatch.context() as m:
         m.setattr(engine, "_cpu_moe_executor_viable", lambda model_config: False)
@@ -1367,6 +1371,9 @@ def test_what_single_serves_and_single_measured_times_at_each_memory_level(decod
     assert [c[0] for c in calibrate.candidates(args, static, path)] == candidates8
     if not resident:
         assert [c[0] for c in calibrate.candidates(args, (fewer[0], fewer[1], None), path)] == ["offload@3", "hybrid@3", "hybrid@0", "offload@0"]
+        # nor is hybrid a candidate where its server would not start
+        for typed in ({"reproducible_seeds": True}, {"moe_prefill_demand_tokens": 256}):
+            assert [c[0] for c in calibrate.candidates(SimpleNamespace(**vars(args), **typed), ("offload", 3, None), path)] == ["offload@3", "offload@0"]
 
 
 def test_preset_keeps_its_drafts_only_where_the_offload_cache_holds_a_fifth_of_the_experts(monkeypatch):
