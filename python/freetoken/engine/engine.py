@@ -275,6 +275,9 @@ PRESET_CHUNK_ANSWER_TOKENS = 1024
 PRESET_DRAFT_SHARE = 0.20
 # the log line of a start that drops them; moe/calibrate.py reads it from the server of its static candidate
 PRESET_NO_DRAFTS = "serving without the preset's draft tokens"
+# a one-request preset's KV reserve is at its floor where the plan holds under this share of the experts. At 8 GiB free
+# the preset held 701 of 10240 slots, and a server without it about twice that; the share is the drafts' own
+PRESET_SMALL_PLAN_SHARE = PRESET_DRAFT_SHARE
 
 
 def _drop_preset_demand(config, reason: str) -> None:
@@ -419,13 +422,14 @@ PRESET_MAP_DEPTH = 5
 
 
 def _settle_preset_map_drafts(config, override, windowed_kv: bool) -> None:
-    """--preset single and single-fast where their plan holds every expert resident (_preset_takes_fused): PRESET_MAP_DEPTH
-    MTP draft tokens with the store's draft token map for this checkpoint (moe/calibrate.py), whose sha256 must be the
-    one its manifest records; the preset's own draft tokens without a map elsewhere. Drafts the command line set are
-    served as typed. One log line says which and why."""
+    """--preset single, single-measured and single-fast where their plan holds every expert resident (_preset_takes_fused):
+    PRESET_MAP_DEPTH MTP draft tokens with the store's draft token map for this checkpoint (moe/calibrate.py), whose sha256
+    must be the one its manifest records; the preset's own draft tokens without a map elsewhere. Drafts the command line
+    set are served as typed. One log line says which and why. For single-measured this is its static choice, which its
+    calibration times first."""
     from freetoken.moe import calibrate
 
-    if config.preset not in ("single", "single-fast") or config.speculative_algorithm is None:
+    if config.preset not in ("single", "single-measured", "single-fast") or config.speculative_algorithm is None:
         return
     head = f"--preset {config.preset} with every expert resident"
     typed = [flag for flag, on in (
@@ -1347,6 +1351,37 @@ class Engine:
             f"where a longer prompt and answer end with finish_reason length. {more}"
         )
 
+    def _settle_preset_small_plan_reserve(self, config: EngineConfig, banks, method, max_slots) -> None:
+        """A one-request preset's KV reserve goes down to its floor, a prefill chunk and PRESET_CHUNK_ANSWER_TOKENS of
+        answer (never under the default), where the plan at the reserve settled so far holds under
+        PRESET_SMALL_PLAN_SHARE of all experts: there every slot the reserve's pages take is a miss more on each decode
+        step. One warning says so; a longer prompt and answer then end with finish_reason length. A typed
+        --max-output-tokens, which the reserve was sized for, keeps it."""
+        from freetoken.engine.cache_budget import _plan_or_short
+
+        if config.max_running_req != 1 or getattr(config, "max_output_tokens", None) is not None:
+            return
+        terms = self._auto_cache_terms(config, banks, method, max_slots)
+        plan, _ = _plan_or_short(terms)
+        total = terms["total_experts"]
+        if plan is None or plan[0] >= PRESET_SMALL_PLAN_SHARE * total:
+            return
+        page, default = terms["page_size"], EngineConfig.kv_reserve_tokens
+        chunk = _prefill_working_bytes(config)[0]
+        floor = max(default, min(_preset_kv_target(config), align_ceil(chunk + PRESET_CHUNK_ANSWER_TOKENS, page)))
+        if floor >= config.kv_reserve_tokens:
+            return
+        asked = config.kv_reserve_tokens
+        object.__setattr__(config, "kv_reserve_tokens", floor)
+        if floor <= default:
+            _drop_preset_fields(config, "kv_reserve_tokens")
+        after, _ = _plan_or_short(self._auto_cache_terms(config, banks, method, max_slots))
+        logger.warning_rank0(
+            f"--preset {config.preset}: the KV reserve is {floor} tokens, not {asked}: at {asked} the plan holds {plan[0]} of "
+            f"{total} experts, under {PRESET_SMALL_PLAN_SHARE:.0%}" + (f", and at {floor} {after[0]}" if after is not None else "")
+            + ". A longer prompt and answer end with finish_reason length; --kv-reserve-tokens or --max-output-tokens keeps a larger one"
+        )
+
     def _prefill_tokens_within(self, config: EngineConfig, room: int) -> int:
         """The longest prefill chunk whose working memory (_prefill_working_bytes) is at most ``room`` bytes."""
         probe = copy.copy(config)
@@ -1592,6 +1627,8 @@ class Engine:
             self._settle_preset_captures(config, banks, method, size_cap, spare)
             if "kv_reserve_tokens" in config.preset_fields:
                 self._settle_preset_kv_reserve(config, banks, method, size_cap)
+            if "kv_reserve_tokens" in config.preset_fields:
+                self._settle_preset_small_plan_reserve(config, banks, method, size_cap)
             self._settle_preset_chunk_reserve(config, banks, method, size_cap)
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
             if spare:
@@ -1790,7 +1827,8 @@ class Engine:
         executor = self.cpu_moe_executor
         keys, labels, rows = layer_rows
         fractions = [fetch_fraction(rows.get(key)) for key in keys]
-        cache.hybrid_fetch_fraction = [f or 0.0 for f in fractions]
+        default = _hybrid_default_fetch()
+        cache.hybrid_fetch_fraction = [f if f is not None else (default or 0.0) for f in fractions]
         # locked layers fetch the fetch_plan share instead; their own log line lists it
         groups = collections.Counter((labels[l], fractions[l]) for l in range(len(keys)) if l not in cache.locked_hybrid)
         fetched = [f"{f:.1%} on {n} {label} layers" for (label, f), n in groups.items() if f is not None]
@@ -1801,9 +1839,10 @@ class Engine:
             )
         if missing := sorted({label for label, f in groups if f is None}):
             capped = sum(n for (_, f), n in groups.items() if f is None)
+            there = f"the default fetch share {default:.1%} (FREETOKEN_HYBRID_DEFAULT_FETCH)" if default else "a fixed fetch cap of 1"
             logger.warning_rank0(
                 f"--moe-hybrid-max-fetch auto: no `ft bench bw` row for {capped} MoE layers ({', '.join(missing)}) at "
-                f"{executor.num_threads} CPU threads; using a fixed fetch cap of 1 there. `ft bench bw --model <checkpoint>` benches each layer kind"
+                f"{executor.num_threads} CPU threads; using {there} there. `ft bench bw --model <checkpoint>` benches each layer kind"
             )
         benched_isas = {rows[key].get("cpu_moe_isa") for key, f in zip(keys, fractions) if f is not None} - {None}
         if other := sorted(benched_isas - set(executor.isa.split(","))):
@@ -2784,7 +2823,7 @@ def _gpu_free_bytes() -> int | None:
 
 
 def _measured_decode_strategy(config: EngineConfig) -> tuple[str, dict | None]:
-    """``(strategy, row)`` for --moe-strategy auto on a model that would take offload: hybrid only on a decode row measured for this setup, on this machine and release (moe/decode_profile.py); offload otherwise, as before."""
+    """``(strategy, row)`` for --moe-strategy auto on a model that would take offload: hybrid on a decode row measured for this setup, on this machine and release (moe/decode_profile.py); where no row answers, what a one-request preset takes there (_preset_without_row); offload otherwise, as before."""
     from freetoken.moe import decode_profile
 
     def offload(reason: str) -> tuple[str, None]:
@@ -2805,7 +2844,7 @@ def _measured_decode_strategy(config: EngineConfig) -> tuple[str, dict | None]:
         # a hand-edited row below the cache's floor would cap the cache under it and fail the start
         row, reason = None, f"the decode row's hybrid cache is below this model's floor of {floor} slots"
     if row is None:
-        return offload(reason)
+        return _preset_without_row(config, reason) or offload(reason)
     # the rounding mode this server will run (moe/offload_kernels.py reads the same variable)
     round_mode = (os.getenv("FREETOKEN_HYBRID_FETCH_ROUND") or "min-wait").strip().lower()
     verdict = decode_profile.verdict_for(row, round_mode)
@@ -2816,9 +2855,53 @@ def _measured_decode_strategy(config: EngineConfig) -> tuple[str, dict | None]:
         return "offload", None
     if _moe_cache_is_auto(config):
         if objection := decode_profile.auto_size_objection(row, _gpu_free_bytes(), config.memory_ratio):
-            return offload(objection)
+            return _preset_without_row(config, objection) or offload(objection)
     logger.info_rank0(f"--moe-strategy auto: {decode_profile.explain(row, verdict)}")
     return "hybrid", row
+
+
+# A/B switch, unmeasured whether needed: FREETOKEN_HYBRID_DEFAULT_FETCH=<share> makes --moe-hybrid-max-fetch auto fetch
+# that share of a layer's expert misses where no `ft bench bw` row answers for the layer, in place of a cap of 1
+def _hybrid_default_fetch() -> float | None:
+    raw = os.getenv("FREETOKEN_HYBRID_DEFAULT_FETCH", "").strip()
+    if not raw:
+        return None
+    try:
+        share = float(raw)
+    except ValueError:
+        share = math.nan
+    if not 0.0 < share <= 1.0:
+        raise ValueError(f"FREETOKEN_HYBRID_DEFAULT_FETCH={raw!r}: a share of a decode step's expert misses, above 0 and at most 1")
+    return share
+
+
+# --preset single on an expert cache that holds part of the experts, where no decode row answers: hybrid with a CPU MoE
+# pool of this many threads or more. On one box's 12 GiB, 8 GiB, 20% and 5% cells --preset single stayed on offload and
+# was 31% to 51% under the best typed flags, and single-measured's hybrid with 3 drafts 1% to 19%; the count is unmeasured
+PRESET_HYBRID_THREADS = 8
+
+
+def _cpu_pool_threads(config) -> int:
+    """Threads of the CPU MoE pool this server would start (moe/cpu_executor.py), counted without its log lines."""
+    from freetoken.moe.cpu_executor import pool_threads
+
+    return pool_threads(config.moe_cpu_threads)
+
+
+def _preset_without_row(config, reason: str) -> tuple[str, None] | None:
+    """('hybrid', None) for a one-request preset that left the strategy to it, where no decode row answers for this
+    setup (``reason``) and the CPU MoE pool has PRESET_HYBRID_THREADS threads or more; None elsewhere. A row that was
+    measured still decides, and a typed --moe-strategy, --moe-cpu-layers or running-request count is left alone."""
+    if "moe_strategy" not in getattr(config, "preset_fields", ()) or config.max_running_req != 1 or config.moe_cpu_layers:
+        return None
+    threads = _cpu_pool_threads(config)
+    if threads < PRESET_HYBRID_THREADS:
+        return None
+    logger.info_rank0(
+        f"--preset {config.preset}: hybrid ({reason}; the CPU MoE pool has {threads} threads, {PRESET_HYBRID_THREADS} or "
+        "more); `ft bench decode` measures it against offload, and --moe-strategy offload keeps offload"
+    )
+    return "hybrid", None
 
 
 # expert activations the CPU MoE executor supports (csrc ActKind)

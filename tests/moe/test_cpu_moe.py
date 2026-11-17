@@ -1172,6 +1172,7 @@ def test_auto_cpu_pool_fits_the_cgroup_cpu_quota(tmp_path, monkeypatch, cores, p
 
     n, core_ids = cpu_executor.resolve_threads_and_affinity(requested)
     assert (n, len(core_ids)) == (threads, threads)
+    assert cpu_executor.pool_threads(requested) == threads  # the count --preset single's strategy rule reads
     if not requested:
         assert core_ids == list(range(threads))
 

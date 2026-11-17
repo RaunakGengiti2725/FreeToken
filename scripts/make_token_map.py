@@ -23,7 +23,7 @@ No benchmark's text may shape the map: a map built from a test set's own tokens 
 - content: it names a test set (BENCHMARK_TEXT: GSM8K, AIME, MMLU, Hendrycks, competition_math, MATH-500, HumanEval, MBPP, SWE-bench, GPQA, HellaSwag, TruthfulQA), or has a line that is GSM8K's answer mark ("#### 42").
 A --text or --answers file that is refused ends the run with an error. Under --corpus a refused file is left out and listed. The check reads names and text only: it cannot tell a copy of a test set that carries no such mark.
 
-<out>.json is written beside the map: its sha256, size and strategy, every file that was counted (path, role, bytes, sha256, tokens), one sha256 over those, the files refused and why, and the checks above. --store writes the map where `ft serve --preset single-measured` looks for this checkpoint's map and times it as a candidate, and where `--preset single` and `single-fast` serve it when every expert is resident. --install MAP copies a map built before and its MAP.json there, if the sha256 its manifest records is the file's, and prints where it went.
+<out>.json is written beside the map: its sha256, size and strategy, every file that was counted (path, role, bytes, sha256, tokens), one sha256 over those, the files refused and why, and the checks above. --store writes the map where `ft serve --preset single-measured` looks for this checkpoint's map and times it as a candidate, and where `--preset single` and `single-fast` serve it when every expert is resident. --install MAP copies a map built before and its MAP.json there, if the sha256 its manifest records is the file's and the map fits MODEL's tokenizer (the vocabulary size its manifest records, where it records one, and every id below it), and prints where it went. The map is read from the store under MODEL's fingerprint, or under another fingerprint with the same hash: a Hugging Face snapshot folder of the same checkpoint finds a map installed from a copy with another folder name.
 """
 
 from __future__ import annotations
@@ -115,6 +115,15 @@ def install(p: argparse.ArgumentParser, model: str, src: str) -> int:
     recorded = {manifest[k] for k in ("map_sha256", "sha256") if k in manifest}
     if recorded != {sha}:
         p.error(f"--install {src}: the file's sha256 is {sha}, its manifest records {', '.join(map(str, sorted(recorded, key=str))) or 'none'}; nothing installed")
+    # a map built with another tokenizer names other tokens, or ids the draft head does not have
+    vocab = len(load_tokenizer(model))
+    if manifest.get("vocab") is not None and manifest["vocab"] != vocab:
+        p.error(f"--install {src}: its manifest records a vocabulary of {manifest['vocab']} tokens, {model}'s tokenizer has {vocab}; nothing installed")
+    if len(data) % 4:
+        p.error(f"--install {src}: {len(data)} bytes is not a whole number of int32 token ids; nothing installed")
+    ids = np.frombuffer(data, dtype="<i4")
+    if ids.size and not 0 <= int(ids.min()) <= int(ids.max()) < vocab:
+        p.error(f"--install {src}: it holds token ids from {int(ids.min())} to {int(ids.max())}, outside {model}'s vocabulary of {vocab}; nothing installed")
     out = token_map_path(model)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "wb") as f:

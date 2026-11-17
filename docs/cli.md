@@ -141,7 +141,12 @@ or a slot in the expert cache), the cache decodes on the CPU or `hybrid`, or one
 smaller than a layer's experts, and the KV reserve where the expert cache's minimum does not fit beside it (the
 warning names the largest `--kv-reserve-tokens` that does). The KV reserve is never more than the
 model's context, and it is lowered, to the default at the least, where it would leave fewer expert
-slots than a server without the preset plans. The preset's memory ratio comes with the working memory
+slots than a server without the preset plans. Where the automatic plan at that reserve still holds
+under 20% of all experts, with one running request, the reserve goes down to a prompt as long as a
+prefill chunk and 1024 tokens of answer (never under the default): there each slot its pages take is
+one miss more on every decode step (about 310 slots of Qwen3.6-35B-A3B NVFP4 with 8 GiB free). A
+longer prompt and answer then end with finish_reason length, and a warning says so. A typed
+`--kv-reserve-tokens`, `--max-output-tokens`, `--moe-cache-rate` or `--moe-cache-size` is left as it is. The preset's memory ratio comes with the working memory
 of one prefill chunk of `--max-prefill-length` tokens left free on top of its headroom (0.65 GiB for
 8192 tokens on Qwen3.6-35B-A3B, counted from the GatedDeltaNet layer's tensor shapes; the layer runs
 its chunk rule over one request in calls of 2048 tokens, `FREETOKEN_GDN_RULE_TOKENS`, with the output
@@ -202,8 +207,15 @@ plan line says which. Both give the same output as the expert cache does.
   choice to the token count alone.
 
 `--preset single` measures nothing: it serves with `fused` where every expert fits as described
-above, else with `offload` (or what `--moe-strategy auto` takes from an
-[`ft bench decode`](#ft-bench-decode) row), and 3 draft tokens. Where it serves `fused` (the
+above, else with what `--moe-strategy auto` takes from an [`ft bench decode`](#ft-bench-decode)
+row, and 3 draft tokens. Where no row answers for the setup it serves `hybrid` if the CPU MoE pool
+has 8 threads or more (`--moe-cpu-threads`, or one a physical core within the CPU quota), and
+`offload` otherwise: on one box's 12 GiB, 8 GiB, 20% and 5% cells, `offload` there was 31% to 51%
+under the fastest typed flags, and `--preset single-measured`, which took `hybrid` with 3 draft
+tokens, within 1% to 19%. A typed `--moe-strategy`,
+`--max-running-requests` or `--moe-cpu-layers` keeps what it set. Under `hybrid` a prefill chunk
+does not load its experts on demand (above), and hybrid's text can differ from offload's where two
+tokens are nearly tied (below). Where it serves `fused` (the
 first way above) and the store below holds a draft token map for the checkpoint whose sha256 is
 the one its manifest records, it serves 5 MTP draft tokens with that map instead; on two cards
 that held every expert of Qwen3.6-35B-A3B NVFP4, 5 drafts with a 32K map decoded 19% and 5%
@@ -211,39 +223,46 @@ faster than 3 drafts without one on a math and a coding prompt. With no such map
 checks of a typed `--speculative-token-map` refuse, it serves 3 draft tokens without one. An
 expert cache, `--speculative-algorithm`, `--speculative-num-steps` or `--speculative-token-map`
 on the command line, and a typed `--moe-strategy fused`, leave the drafts as they are. One log line
-says which and why. `--preset single-fast` does the same; `--preset single-measured` does not, it
-times the map instead (below). `--preset single-measured`
+says which and why. `--preset single-fast` and `--preset single-measured` do the same: for
+`single-measured` that is its static choice, the first candidate it times (below). `--preset single-measured`
 is the same preset, and on its first start for a checkpoint, set of flags and machine it times the
-candidates the preset cannot choose between: `offload` and `hybrid`, each with 3, 4 and 5 MTP draft
-tokens and with none. Each candidate is one server start that decodes two built-in prompts (a math
-problem and a coding task) twice over, with the checkpoint's sampling: 256 timed tokens after 1024
-warm-up tokens that fill the expert cache, then 256 timed tokens after 256 warm-up tokens on the
-cache the first pass left. A candidate's lead over the static preset's choice is taken per prompt
-from the means over the two passes and is the smaller of the two prompts'; a candidate behind in any
-single pass has none. The candidate with the largest lead runs, if that lead is above 10%, and
-otherwise the static preset's choice runs, with `--moe-strategy` as the command line left it. The
-strategy and the number of draft tokens are chosen together by that one rule; a depth is not chosen
-per prompt.
+candidates the preset cannot choose between, the static preset's choice first. With every expert
+resident: `fused` with 5 draft tokens and the store's draft token map (below), where the static
+preset serves it, and with 3 draft tokens; with only one of the two, nothing is timed. With an
+expert cache that holds part of the experts: `hybrid` and `offload` with 3 draft tokens and `hybrid`
+with none; `offload` with none is the `offload` server where that one drops its drafts for the size
+of the cache (above), and is not timed where it keeps them. 4 and 5 draft tokens without the map are
+not candidates. Each candidate is one server start that decodes two built-in prompts (a math
+problem and a coding task) twice over, with the checkpoint's sampling: 512 timed tokens after 1024
+warm-up tokens that fill the expert cache, then 512 timed tokens after 256 warm-up tokens on the
+cache the first pass left (256 timed tokens put 5 drafts with a map 8% ahead of 3 on one prompt and
+3% behind on the other, where 2,048 put them 19% and 5% ahead). A candidate's lead over another is
+taken per prompt from the means over the two passes and is the smaller of the two prompts'; a
+candidate behind in any single pass has none. The static preset's choice is chosen first; then, in
+the order they are timed, a candidate replaces the one chosen so far where it leads that one by more
+than 10%, so a candidate barely ahead of another that leads is not taken. What is chosen runs; the
+static choice runs with `--moe-strategy` as the command line left it. The strategy and the number of
+draft tokens are chosen together by that one rule; a depth is not chosen per prompt.
 
-A draft token map is one more candidate where the calibration's store holds one for the checkpoint:
-5 draft tokens with the map, per strategy. The store is the directory of the decode profile, and
+The draft token map is the store's for the checkpoint: under a typed `--moe-strategy fused`, 5 draft
+tokens with it are a candidate against the static 3. The store is the directory of the decode profile, and
 `python scripts/make_token_map.py MODEL --store ...` writes the map there under the checkpoint's
 fingerprint with its manifest; a file whose manifest is missing or names another sha256 is not timed.
 `python scripts/make_token_map.py MODEL --install MAP` copies a map built before and its `MAP.json`
-there, if the sha256 the manifest records (as `map_sha256` or `sha256`) is the file's, and prints
-where it went.
+there, if the sha256 the manifest records (as `map_sha256` or `sha256`) is the file's and the map
+fits MODEL's tokenizer (the vocabulary size the manifest records, where it records one, and every id
+below it), and prints where it went. The fingerprint is the checkpoint's folder name and a hash of
+its weight files and `config.json`; where no map is stored under the full fingerprint, one stored
+under the same hash is read, so the Hugging Face snapshot folder of a checkpoint finds a map
+installed from a copy of it with another folder name.
 A `--speculative-token-map` on the command line is not a candidate: every server then has that map.
 No map is shipped: one has to be built for the checkpoint, from text that no benchmark uses.
 
 The calibration runs before the server loads and has 300 seconds. Every candidate is a model load,
 because a running server cannot change its strategy or its draft depth, so the candidates are timed
-in a fixed order and only as many as fit, the static choice first. Where it serves every expert
-from the GPU (`fused`, or an expert cache with a slot for each), the next are 5 draft tokens with
-the map (5 without one where there is no map), then 4 draft tokens, then the other strategy with 3,
-then the rest: on full cards 5 drafts with a 32K map was the one setting measured ahead of the
-static choice. Where the cache holds part of the experts, the next is the other strategy with 3
-draft tokens, then 5 draft tokens with the map, 4, 5 and no draft tokens for the strategy that is
-ahead of those two, then for the other one: there the strategy decided most. A candidate is started only while 1.1 times the longest candidate so far still fits in
+in the order above and only as many as fit, the static choice first; where it is `hybrid`,
+`hybrid` with no draft tokens comes second (the fastest setting with 8 GiB free on one box), then
+`offload`. A candidate is started only while 1.1 times the longest candidate so far still fits in
 what is left, and its server is stopped if it is not ready with time left for its requests. The end
 of the 300 seconds is also a deadline for every load and every request, the static choice's
 included: what is still running then is ended, and that server is gone at most 30 seconds later,
@@ -254,10 +273,9 @@ the time (`calibration took N s`). A candidate that was not timed is stored as s
 and is not timed on a later start; `--calibrate-again` keeps the stored timings and spends another
 300 seconds on the candidates not timed yet. A strategy or a speculative setting given on the command line is not
 timed, and a checkpoint that drafts nothing is timed for the strategy alone (two model loads).
-Where the static preset serves the experts resident, `fused` is every candidate's strategy and only
-the draft settings are timed: with every expert on the GPU `hybrid` has
-nothing to compute on the CPU. Where the static preset dropped its drafts for the size of an
-`offload` cache (above), that is the static choice, and `offload` is not timed with drafts.
+Where the static preset serves the experts resident, `fused` is every candidate's strategy: with
+every expert on the GPU `hybrid` has nothing to compute on the CPU. Where what the static preset
+serves on the GPU cannot be read, nothing is timed and the static preset runs.
 SIGTERM, SIGHUP or Ctrl-C during the calibration stops the candidate's server and ends the launcher
 with exit code 128 + the signal.
 
@@ -506,8 +524,9 @@ to split each layer's misses.
 - A row's key is the layer's CPU format and options, expert shape, top_k and CPU worker
   threads. A layer without an exact row takes the nearest row of the same format and top_k
   whose expert size is within 2x and whose thread count is within 25%, and the server logs
-  which; without one it keeps a fetch cap of 1. Bench with the same `--cpu-threads` as the
-  server's `--moe-cpu-threads`.
+  which; without one it keeps a fetch cap of 1, or, with `FREETOKEN_HYBRID_DEFAULT_FETCH=<share>`
+  (above 0, at most 1; off by default), fetches that share of the layer's misses. Bench with the
+  same `--cpu-threads` as the server's `--moe-cpu-threads`.
 - Each run replaces the rows it benched and keeps the others.
 - What to measure: `--model` (checkpoint paths or presets), `--dtype`, `--formats`, `--isa`.
 - `--threshold` (default 2.0) sets each row's `recommended`: hybrid when CPU bandwidth beats
@@ -594,7 +613,7 @@ profile from a build whose rows held one number per column is not read, and the 
 `--preset single-measured` keeps its own timings in the same file, under its own key: `auto`
 does not read them, and the preset does not read the rows of this command.
 
-Without such a row `auto` stays on `offload`. Rows are Linux only: the machine is read from `/proc`
+Without such a row `auto` stays on `offload` (`--preset single` may take `hybrid` there, see [Presets](#presets)). Rows are Linux only: the machine is read from `/proc`
 and `/sys`, and where that cannot be done no row is filed and `auto` stays on `offload`.
 Tensor-parallel servers are never picked from rows.
 Hybrid computes some experts on the CPU, so where two tokens are nearly tied its output can differ

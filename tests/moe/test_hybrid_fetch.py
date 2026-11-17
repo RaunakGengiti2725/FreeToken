@@ -371,6 +371,22 @@ def test_engine_takes_the_nearest_benched_shape_but_not_a_far_one(tmp_path, monk
     assert _resolve_with_profile(tmp_path, monkeypatch, [("nvfp4", 2048, 512)], exact).hybrid_fetch_fraction == [pytest.approx(0.6)]
 
 
+def test_engine_fetches_the_default_share_where_no_row_answers_only_when_asked(tmp_path, monkeypatch):
+    row = {"cpu_moe_overlap_gbs": 60.0, "pcie_gather_overlap_gbs": 30.0}
+    benched = {layer_kind_key("nvfp4", {}, 2048, 512, 8, 12): row}
+    layers = [("nvfp4", 2048, 512), ("mxfp4", 2048, 512)]
+    monkeypatch.delenv("FREETOKEN_HYBRID_DEFAULT_FETCH", raising=False)
+    assert _resolve_with_profile(tmp_path, monkeypatch, layers, benched).hybrid_fetch_fraction == [pytest.approx(1 / 3), 0.0]
+    # the switch fills only the layers without a row, and an empty profile alike; a benched row still decides its layer
+    monkeypatch.setenv("FREETOKEN_HYBRID_DEFAULT_FETCH", "0.25")
+    assert _resolve_with_profile(tmp_path, monkeypatch, layers, benched).hybrid_fetch_fraction == [pytest.approx(1 / 3), 0.25]
+    assert _resolve_with_profile(tmp_path, monkeypatch, layers, {}).hybrid_fetch_fraction == [0.25, 0.25]
+    for bad in ("0", "1.5", "a third"):
+        monkeypatch.setenv("FREETOKEN_HYBRID_DEFAULT_FETCH", bad)
+        with pytest.raises(ValueError, match="FREETOKEN_HYBRID_DEFAULT_FETCH"):
+            _resolve_with_profile(tmp_path, monkeypatch, layers, benched)
+
+
 def test_over_seeds_takes_passes_with_different_warmups():
     """A calibration's later passes warm up with fewer tokens: each pass has its own by_warm key."""
     from freetoken.moe import benchdecode
