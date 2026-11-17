@@ -144,7 +144,18 @@ _PRESETS["single-measured"] = dict(_PRESETS["single"])
 # 'single' and the captured prefill forwards, which cut a chunk in other pieces than the eager forward: other text.
 # The engine drops them where not every expert is resident (engine._drop_preset_captures).
 _PRESETS["single-fast"] = {**_PRESETS["single"], "prefill_graph_tokens": 448, "prefill_graph_chunks": "1-64,128-384:64"}
+# 'single' for several requests at a time: 8 unless the command line names another number. The KV reserve and the decode
+# batch sizes captured as graphs follow that number (_apply_preset).
+_PRESETS["multi"] = {**_PRESETS["single"], "max_running_req": 8, "cuda_graph_bs": None}
+# unmeasured: the largest number of running requests for which 'multi' captures a graph of every batch size
+PRESET_GRAPH_EVERY_BS = 16
 _UNSET = object()
+
+
+def _multi_graph_bs(running: int) -> list[int]:
+    """The decode batch sizes --preset multi captures: every size up to PRESET_GRAPH_EVERY_BS, so that a batch is not
+    padded to the next one, then the multiples of 8 and the number of running requests itself."""
+    return [bs for bs in range(1, running + 1) if bs <= PRESET_GRAPH_EVERY_BS or bs % 8 == 0 or bs == running]
 
 
 def _apply_preset(kwargs: dict, left: set[str]) -> tuple[str, ...]:
@@ -152,8 +163,17 @@ def _apply_preset(kwargs: dict, left: set[str]) -> tuple[str, ...]:
     from freetoken.server.generation import DEFAULT_MAX_OUTPUT_TOKENS
 
     values = dict(_PRESETS[kwargs["preset"]])
-    values["kv_reserve_tokens"] = (kwargs["max_output_tokens"] or DEFAULT_MAX_OUTPUT_TOKENS) + PRESET_PROMPT_TOKENS
+    output = kwargs["max_output_tokens"] or DEFAULT_MAX_OUTPUT_TOKENS
+    values["kv_reserve_tokens"] = output + PRESET_PROMPT_TOKENS
     theirs = set(values) - left
+    if kwargs["preset"] == "multi":
+        running = max(1, kwargs["max_running_req"] if "max_running_req" in theirs else values["max_running_req"])
+        # a prompt and as long an answer for each running request, and never less than one request of 'single' gets
+        each = PRESET_PROMPT_TOKENS + min(output, PRESET_PROMPT_TOKENS)
+        values["kv_reserve_tokens"] = max(values["kv_reserve_tokens"], running * each)
+        values["cuda_graph_bs"] = _multi_graph_bs(running)
+        if kwargs["cuda_graph_max_bs"] is not None:
+            theirs.add("cuda_graph_bs")  # they chose the captured sizes by their largest
     if "speculative_algorithm" in theirs:
         theirs.add("speculative_num_steps")  # 0 there is the default k of the method they chose
     if kwargs["num_page_override"] is not None or kwargs["num_token_override"] is not None:
@@ -1211,7 +1231,12 @@ def parse_args(
             "that continues a cached one by up to 448 tokens starts sooner. Its replies are not always the text 'single' "
             "gives: such a chunk is computed in one or two captured pieces instead of one forward, which changes the last "
             "bits of the numbers and, where two tokens are nearly tied, the token. It needs every expert on the GPU and "
-            "leaves 2.25 GiB free for the captures; where that does not fit it serves as 'single' and the log says so."
+            "leaves 2.25 GiB free for the captures; where that does not fit it serves as 'single' and the log says so. "
+            "'multi' is 'single' for several requests at a time: --max-running-requests 8 (a typed number is kept, e.g. "
+            f"16), a --kv-reserve-tokens of a {PRESET_PROMPT_TOKENS}-token prompt and as long an answer for each of them, and "
+            f"a decode graph for every batch size up to {PRESET_GRAPH_EVERY_BS} (--cuda-graph-bs) so that a batch is not "
+            "padded to the next captured size. Every running request takes GPU memory for its states, so the experts "
+            "stay resident on fewer cards than under 'single'; the text of a reply depends on the requests decoded beside it."
         ),
     )
 
@@ -1261,6 +1286,8 @@ def parse_args(
 
     if run_shell:
         kwargs["cuda_graph_bs"] = None
+        if kwargs["preset"] == "multi":
+            parser.error("--preset multi serves several requests at a time; the shell runs one")
     if kwargs["cuda_graph_bs"] is not None and kwargs["cuda_graph_max_bs"] is not None:
         parser.error("--cuda-graph-bs lists the captured batch sizes itself; give it without --cuda-graph-max-bs")
 

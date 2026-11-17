@@ -1109,9 +1109,9 @@ def test_preset_serves_every_expert_resident_where_the_checkpoint_fits_and_the_s
     monkeypatch.setattr(engine, "_prefill_working_bytes", lambda config: (8192, 7000))
     need = 100 + 8192 * 1000 + 500 + 300 + 7000
 
-    def strategy(free, fields=("moe_strategy",), **flags):
+    def strategy(free, fields=("moe_strategy",), preset="single", **flags):
         monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: free)
-        config = _resolved(decode_rows, preset="single", preset_fields=fields, max_seq_len_override=40960, **flags)
+        config = _resolved(decode_rows, preset=preset, preset_fields=fields, max_seq_len_override=40960, **flags)
         return config.moe_strategy
 
     enough = -(-need * 20 // 19)  # the preset's memory ratio is the user's here: the default 0.9 would need more
@@ -1122,6 +1122,13 @@ def test_preset_serves_every_expert_resident_where_the_checkpoint_fits_and_the_s
     assert strategy(enough, memory_ratio=0.95, num_token_override=8192) == "fused"
     assert strategy(enough, memory_ratio=0.95, num_token_override=8193) == "offload"
     assert strategy(enough, memory_ratio=0.95, num_page_override=8193) == "offload"
+    # a reserve above the context: 'single' counts one context of it, 'multi' the whole of it up to a context a running request
+    context = -(-(need + (40960 - 8192) * 1000) * 20 // 19)
+    whole = -(-(need + (65536 - 8192) * 1000) * 20 // 19)
+    assert strategy(context, memory_ratio=0.95, kv_reserve_tokens=65536, max_running_req=2) == "fused"
+    multi = dict(preset="multi", memory_ratio=0.95, kv_reserve_tokens=65536)
+    assert strategy(context, max_running_req=2, **multi) == "offload" and strategy(whole, max_running_req=2, **multi) == "fused"
+    assert strategy(context, max_running_req=1, **multi) == "fused"
     # a strategy from the command line, typed auto included, is never replaced; nor is one without the preset
     assert strategy(1 << 40, fields=()) == "offload" and strategy(1 << 40, fields=(), moe_strategy="hybrid") == "hybrid"
     assert _resolved(decode_rows, max_seq_len_override=40960).moe_strategy == "offload"

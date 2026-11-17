@@ -44,7 +44,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--port` | 1919 | Bind port |
 | `--api-key` | `$FREETOKEN_API_KEY`, else off | Require the key on every route except `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`; other requests get a 401 |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
-| `--preset` | — | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. `single-fast`: `single` with captured prefill forwards, whose replies can differ from `single`'s. See [Presets](#presets) |
+| `--preset` | — | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. `single-fast`: `single` with captured prefill forwards, whose replies can differ from `single`'s. `multi`: `single` for several requests at a time, 8 unless `--max-running-requests` names another number. See [Presets](#presets) |
 | `--calibrate-again` | off | With `--preset single-measured`: time on this start also when a choice is stored for this checkpoint, flags and machine: the candidates the stored calibration had no time for, or all of them once none is left. See [Presets](#presets) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
@@ -296,6 +296,33 @@ NVFP4 on an RTX 5090, and not measured elsewhere. Where the plan with that memor
 keep every expert resident and the KV reserve, or speculative decoding is off, the server runs as
 `--preset single` and one log line says why. `--prefill-graph-tokens` or `--prefill-graph-chunks`
 on the command line are kept as typed; typed chunks get no memory left free for them.
+
+`--preset multi` is `--preset single` for several requests at a time. It sets
+`--max-running-requests 8`; a typed number is kept (`--preset multi --max-running-requests 16`), and
+the two settings below follow it. Everything else is `single`'s, chosen and dropped by the same
+rules.
+
+- `--kv-reserve-tokens` is a 4096-token prompt and as long an answer (the output limit, where
+  `--max-output-tokens` is shorter) for each running request, 65536 tokens for 8, and never less
+  than `single`'s reserve. It is at most one context for each running request.
+- `--cuda-graph-bs` names every batch size up to 16, then the multiples of 8 and the number of
+  running requests itself, so that a decode batch of 3, 5, 6 or 7 requests runs on a graph of its
+  own size instead of the next captured one with padded rows. A typed `--cuda-graph-bs` or
+  `--cuda-graph-max-bs` is kept. The graphs come out of the memory ratio's headroom; what the
+  sizes above 8 take has not been measured.
+
+Every running request takes GPU memory before the first token: a hybrid GatedDeltaNet model keeps 4
+state slots for each and a snapshot cache of 2 more, and a slot of Qwen3.6-35B-A3B is 61 MiB
+(counted from the layer's tensor shapes), so 8 requests hold 49 slots (2.9 GiB) and 16 hold 97
+(5.8 GiB), against 9 slots under `single`. That memory counts where the preset decides whether
+every expert fits, so the experts stay resident on fewer cards than under `single`, and with more
+requests on fewer still; the plan line says which it is and how many KV tokens are left. A typed
+`--moe-strategy fused` keeps the experts resident whatever the reserve; the plan line then warns
+when the KV pool is smaller than the reserve.
+
+The text of a reply depends on the requests decoded beside it: a decode step computes the rows of
+every running request together, and a row's last bits change with the rows beside it. A seeded
+request gives one text only when it runs alone (`--max-running-requests 1`).
 
 ### API behaviour
 

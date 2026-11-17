@@ -169,6 +169,27 @@ def test_preset_kv_reserve_follows_the_output_limit_and_leaves_a_sized_kv_pool_a
     assert sized.kv_reserve_tokens == ServerArgs.kv_reserve_tokens and "kv_reserve_tokens" not in sized.preset_fields
 
 
+def test_preset_multi_is_single_for_the_running_requests_the_command_line_names():
+    single, multi = _parse("--preset", "single"), _parse("--preset", "multi")
+    differ = {f.name: getattr(multi, f.name) for f in dataclasses.fields(single) if getattr(single, f.name) != getattr(multi, f.name)}
+    # a 4096-token prompt and as long an answer for each of 8 requests, and a graph for every batch size
+    assert differ == {
+        "preset": "multi", "preset_fields": (*single.preset_fields, "cuda_graph_bs"), "max_running_req": 8,
+        "kv_reserve_tokens": 8 * 8192, "cuda_graph_bs": [1, 2, 3, 4, 5, 6, 7, 8],
+    }
+    # a typed number of requests is kept, and the reserve and the captured sizes follow it
+    wide = _parse("--preset", "multi", "--max-running-requests", "24")
+    assert (wide.max_running_req, wide.kv_reserve_tokens) == (24, 24 * 8192) and "max_running_req" not in wide.preset_fields
+    assert wide.cuda_graph_bs == [*range(1, 17), 24]
+    # never less than one request of 'single' gets; an answer no longer than the output limit
+    assert _parse("--preset", "multi", "--max-running-requests", "2").kv_reserve_tokens == single.kv_reserve_tokens
+    assert _parse("--preset", "multi", "--max-output-tokens", "1024").kv_reserve_tokens == 8 * (4096 + 1024)
+    # captured sizes the command line chose, by list or by their largest, are kept
+    assert _parse("--preset", "multi", "--cuda-graph-bs", "8", "1").cuda_graph_bs == [1, 8]
+    capped = _parse("--preset", "multi", "--cuda-graph-max-bs", "4")
+    assert (capped.cuda_graph_bs, capped.cuda_graph_max_bs) == (None, 4) and "cuda_graph_bs" not in capped.preset_fields
+
+
 def test_cuda_graph_bs_is_the_sorted_sizes_within_the_running_requests():
     assert _parse().cuda_graph_bs is None  # the engine's own rule: 1, 2, 4 and the multiples of 8
     assert _parse("--max-running-requests", "16", "--cuda-graph-bs", "16", "3", "12", "3").cuda_graph_bs == [3, 12, 16]

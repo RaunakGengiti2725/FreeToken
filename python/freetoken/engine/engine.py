@@ -307,8 +307,17 @@ def _settle_preset_demand(config, decode_target: str, pool_sizes: list[int], cac
 
 
 def _preset_kv_target(config) -> int:
-    """The KV reserve a preset asks for, at most the model's context (no request holds more) and at least the default reserve."""
-    return max(min(config.kv_reserve_tokens, config.max_seq_len), EngineConfig.kv_reserve_tokens)
+    """The KV reserve a preset asks for, at most the model's context (no request holds more; 'multi' reserves for every
+    running request) and at least the default reserve."""
+    requests = config.max_running_req if config.preset == "multi" else 1
+    return max(min(config.kv_reserve_tokens, requests * config.max_seq_len), EngineConfig.kv_reserve_tokens)
+
+
+def _preset_kv_words(config) -> str:
+    """What a preset's KV reserve holds, for its log lines."""
+    if config.preset == "multi":
+        return f"a prompt and an answer for each of {config.max_running_req} running requests"
+    return "the default max output tokens and a prompt"
 
 
 def _prefill_working_bytes(config) -> tuple[int, int]:
@@ -1333,7 +1342,7 @@ class Engine:
         else:
             more = "no larger --kv-reserve-tokens fits: the expert cache is at its minimum"
         logger.warning_rank0(
-            f"--preset {config.preset}: a KV reserve of {target} tokens (the default max output tokens and a prompt) does not fit "
+            f"--preset {config.preset}: a KV reserve of {target} tokens ({_preset_kv_words(config)}) does not fit "
             f"beside the expert cache's minimum; keeping the default plan of {kept[0]} expert slots and {kept[1] * page} KV tokens, "
             f"where a longer prompt and answer end with finish_reason length. {more}"
         )
@@ -1475,7 +1484,7 @@ class Engine:
         if "kv_reserve_tokens" in config.preset_fields and num_tokens < _preset_kv_target(config):
             # only where the expert cache was not sized by --moe-cache-auto, which keeps the reserve
             logger.warning_rank0(
-                f"{line}; fewer KV tokens than the default max output tokens and a prompt ({_preset_kv_target(config)}): "
+                f"{line}; fewer KV tokens than {_preset_kv_words(config)} ({_preset_kv_target(config)}): "
                 "a longer prompt and answer end with finish_reason length"
             )
         else:
