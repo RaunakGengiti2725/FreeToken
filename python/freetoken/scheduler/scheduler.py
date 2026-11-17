@@ -184,7 +184,7 @@ class Scheduler(SchedulerIOMixin):
         self.full_hits: FullHitStore | None = None
         # stored at a prefill's drain, which must come before the next step of the request: the normal loop's order
         normal_loop = ENV.DISABLE_OVERLAP_SCHEDULING or self.spec is not None
-        if ENV.FULL_HIT and self.cache_manager.is_hybrid and normal_loop and not config.model_config.model_is_mrope:
+        if ENV.FULL_HIT and self.cache_manager.is_hybrid and normal_loop:
             if self.spec is None or self.spec.keeps_full_hits:
                 self.full_hits = FullHitStore(self.cache_manager.linear_state_pool.free)
                 self.cache_manager.on_evict = self.full_hits.clear
@@ -1233,7 +1233,9 @@ class Scheduler(SchedulerIOMixin):
         if store is None or not len(store) or not pending_list or self.table_manager.available_size == 0 or self.decode_manager.runnable:
             return None
         pending = pending_list[0]
-        if pending.chunked_req is not None or pending.mm_items or self.cache_manager.skips_prefix_cache(pending):
+        # text only: an mrope model's text positions are its plain ones, as the stored step had them
+        text = not pending.mm_items and pending.mrope_positions_full is None and not pending.mrope_delta
+        if pending.chunked_req is not None or not text or self.cache_manager.skips_prefix_cache(pending):
             return None
         entry = store.find(pending.input_ids, pending.sampling_params)
         if entry is None:
@@ -1325,10 +1327,11 @@ class Scheduler(SchedulerIOMixin):
         store, cm = self.full_hits, self.cache_manager
         pool = cm.linear_state_pool
         key = first_token_key(req.sampling_params)
-        if key is None or req.mm_items or cm.skips_prefix_cache(req):
+        text = not req.mm_items and req.mrope_positions_full is None and not req.mrope_delta
+        if key is None or not text or cm.skips_prefix_cache(req):
             return
-        # an admission needs three slots: the store never takes the last of them
-        if pool.num_free_slots < 4:
+        # a free slot only, no eviction for it; an admission short of slots takes the store's back (cache.on_evict)
+        if pool.num_free_slots < 1:
             return
         rows = self.spec.full_hit_rows(req.table_idx) if self.spec is not None else None
         slot = pool.alloc(1)[0]

@@ -463,7 +463,10 @@ def test_an_identical_resend_takes_the_first_sends_state_logits_and_pages_with_n
     logits[0, 31] = 1.0
     out = _FullHitOutput(torch.tensor([31], dtype=torch.int32), torch.tensor([31], dtype=torch.int32),
                          SimpleNamespace(synchronize=lambda: None), None, logits.clone())
+    # a one-request server's pool: 7 slots, 3 the request's, 1 a tree snapshot's; the capture takes one of the 3 left
+    held = pool.alloc(pool.num_free_slots - 3)
     Scheduler._process_last_data(stub, (SimpleNamespace(batch=Batch(reqs=[first], phase="prefill")), out))
+    pool.free(held)
     (entry,) = store.entries
     assert entry.first_token == 31 and torch.equal(entry.input_ids, prompt) and torch.equal(entry.logits, logits)
     assert entry.state_slot != first.linear_slot_idx
