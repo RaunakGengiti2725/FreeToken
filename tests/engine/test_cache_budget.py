@@ -1255,6 +1255,55 @@ def test_preset_serves_hybrid_on_a_partial_cache_without_a_decode_row_where_the_
         assert served() == "hybrid" and _resolved(decode_rows, preset="single", preset_fields=("moe_strategy",), max_running_req=1, **flags).moe_decode_row is not None
 
 
+@pytest.mark.parametrize(
+    "level, resident, flags, served8, served4, candidates8",
+    [
+        # the store holds a map: --preset single serves it resident, and single-measured times 3 drafts without it next
+        ("full card", True, {}, ("fused", 5, "map"), ("fused", 5, "map"), ["fused@5map", "fused@3"]),
+        ("12 GiB", False, {}, ("hybrid", 3, None), ("offload", 3, None), ["hybrid@3", "hybrid@0", "offload@3", "offload@0"]),
+        ("8 GiB", False, {}, ("hybrid", 3, None), ("offload", 3, None), ["hybrid@3", "hybrid@0", "offload@3", "offload@0"]),
+        ("20%", False, {"moe_cache_rate": 0.2}, ("hybrid", 3, None), ("offload", 3, None), ["hybrid@3", "hybrid@0", "offload@3", "offload@0"]),
+        ("5%", False, {"moe_cache_rate": 0.05}, ("hybrid", 3, None), ("offload", 3, None), ["hybrid@3", "hybrid@0", "offload@3", "offload@0"]),
+    ],
+)
+def test_what_single_serves_and_single_measured_times_at_each_memory_level(decode_rows, monkeypatch, level, resident, flags, served8, served4, candidates8):
+    """The two presets' choices per memory level: what --preset single resolves to (with a CPU
+    pool of 8 threads and of 4), and the candidates --preset single-measured times from it, in order. The drafts the
+    share rule drops under offload and the KV reserve's floor are decided once the banks are counted (their own tests);
+    only an automatic cache gets the floor."""
+    import hashlib
+
+    from freetoken.moe import calibrate
+
+    engine = decode_rows.engine
+    monkeypatch.setattr(engine, "_preset_takes_fused", lambda config: resident)
+    monkeypatch.setattr(engine, "_adjust_spec_config", lambda config, override, windowed_kv: None)
+    path = calibrate.token_map_path(str(decode_rows.model))
+    os.makedirs(os.path.dirname(path))
+    with open(path, "wb") as f:
+        f.write(b"\x00\x00\x00\x00\x01\x00\x00\x00")
+    with open(path + ".json", "w") as f:
+        json.dump({"map_sha256": hashlib.sha256(open(path, "rb").read()).hexdigest()}, f)
+    fields = ("moe_strategy", "max_running_req", "speculative_algorithm", "speculative_num_steps", "kv_reserve_tokens")
+
+    def single(threads):
+        monkeypatch.setattr(engine, "_cpu_pool_threads", lambda config: threads)
+        config = _resolved(decode_rows, preset="single", preset_fields=fields, max_running_req=1, speculative_algorithm="mtp",
+                           speculative_num_steps=3, kv_reserve_tokens=36864, max_seq_len_override=40960, **flags)
+        served = (config.moe_strategy, config.speculative_num_steps, "map" if config.speculative_token_map == path else config.speculative_token_map)
+        return served, config
+
+    (served, config), (fewer, _) = single(8), single(4)
+    assert (served, fewer) == (served8, served4)
+    # the KV reserve's floor is a rule of the automatic plan only: a fixed rate or resident experts never reach it
+    assert bool(config.moe_cache_auto) == (not resident and "moe_cache_rate" not in flags)
+    args = SimpleNamespace(preset_fields=fields, moe_strategy="auto")
+    static = (served[0], served[1], path if served[2] == "map" else None)
+    assert [c[0] for c in calibrate.candidates(args, static, path)] == candidates8
+    if not resident:
+        assert [c[0] for c in calibrate.candidates(args, (fewer[0], fewer[1], None), path)] == ["offload@3", "hybrid@3", "hybrid@0", "offload@0"]
+
+
 def test_preset_keeps_its_drafts_only_where_the_offload_cache_holds_a_fifth_of_the_experts(monkeypatch):
     from freetoken.engine import engine as eng
     from freetoken.engine.engine import PRESET_DRAFT_SHARE, PRESET_NO_DRAFTS, Engine
@@ -1591,6 +1640,10 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     assert (choice["moe_strategy"], choice["speculative_num_steps"], choice["speculative_algorithm"]) == ("offload", 0, None)
     speeds["offload", 3] = [60.0, 90.0]
     assert starts(*parsed("--memory-ratio", "0.93")) == ({"speculative_num_steps": 3}, 3)  # hybrid with 3 drafts leads them all
+    # an offload server that does not start leaves offload without drafts untimed too: it would be that same server
+    kept_offload = speeds.pop(("offload", 3))
+    assert starts(*parsed("--memory-ratio", "0.931")) == ({"speculative_num_steps": 3}, 3) and started[-1] == ("offload", 3)
+    speeds["offload", 3] = kept_offload
     # where what the static preset serves cannot be read, a guess is not timed: the static preset runs
     monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: None)
     assert starts(*parsed("--memory-ratio", "0.94")) == ({}, 0)

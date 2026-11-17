@@ -492,6 +492,9 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
                 skipped[name] = OUT_OF_TIME  # still loading when its time was up: not a server that cannot start
             else:
                 (skipped if isinstance(exc, _Slower) else failed)[name] = str(exc).splitlines()[0][:300]
+            if strategy == "offload" and depth == DEPTHS[0] and not token_map and offload_none:
+                # offload without drafts would be that same server (above)
+                skipped.setdefault(offload_none, f"it is the server of {name}, which was not timed")
             continue
         wall[name] = _now() - began
         tail = max(tail, wall[name] - float(r.get("ready_s") or 0.0))
