@@ -238,6 +238,14 @@ class FrontendManager:
 
         threading.Thread(target=_warm, daemon=True, name="frontend-tokenizer-warm").start()
 
+    def warm_frontend_tokenizer_now(self) -> None:
+        """Build the frontend tokenizer and render and encode one conversation with it, on this thread: the first
+        streamed request prerenders its prompt with it and would otherwise load it."""
+        try:
+            self.frontend_tokenizer().warm()
+        except Exception as exc:  # noqa: BLE001 -- warmup only; real faults surface on use
+            logger.info("frontend tokenizer warmup skipped: %r", exc)
+
     def new_user(self) -> int:
         if self.maintenance_state != "serving":
             raise AdmissionClosedError(
@@ -1070,6 +1078,11 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     from .supervisor import LoadProgress, run_backend_supervisor
 
     _GLOBAL_STATE.load_progress = LoadProgress()
+    # loads while the engine does; the gate opens after it
+    frontend_warm = threading.Thread(
+        target=_GLOBAL_STATE.warm_frontend_tokenizer_now, name="frontend-tokenizer-warm", daemon=True
+    )
+    frontend_warm.start()
     handle = start_backend()
     # Hold the worker handles so the orderly-shutdown path can tear them down itself (after
     # setting _SHUTTING_DOWN) rather than relying on OS signal-delivery order.
@@ -1079,6 +1092,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         # A stop requested while weights were loading has already sealed admission.  The backend
         # may finish its ready handshake before SIGTERM arrives; never reopen that gate after the
         # daemon has received a final accounting snapshot.
+        frontend_warm.join()
         if _GLOBAL_STATE.maintenance_state == "loading":
             _GLOBAL_STATE.maintenance_state = "serving"
             _GLOBAL_STATE.ready_at = time.monotonic()

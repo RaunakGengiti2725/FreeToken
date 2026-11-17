@@ -158,6 +158,12 @@ def tokenize_worker(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
 
+    try:
+        # the first request's template compile and tokenizer setup happen here, before the ack
+        detokenize_manager.warm(tokenize_manager.warm()[-32:].tolist())
+    except Exception as exc:  # noqa: BLE001 -- a model without a chat template still serves raw prompts
+        logger.info(f"tokenizer warmup skipped: {exc!r}")
+
     if ack_queue is not None:
         ack_queue.put(f"Tokenize server {tokenizer_id} is ready")
 

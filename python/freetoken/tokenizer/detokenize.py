@@ -90,6 +90,12 @@ class DetokenizeManager:
         accumulated ids and text stay in ``decode_map`` for the life of the worker."""
         self.decode_map.pop(uid, None)
 
+    def warm(self, ids: List[int]) -> str:
+        """Decode ``ids`` as one streamed request would, a token a step, under a uid no request has; keeps no state."""
+        out = [self.detokenize([DetokenizeMsg(uid=-1, next_tokens=[t], finished=False)])[0] for t in ids[:-1]]
+        out += self.detokenize([DetokenizeMsg(uid=-1, next_tokens=ids[-1:], finished=True)])
+        return "".join(out)
+
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []

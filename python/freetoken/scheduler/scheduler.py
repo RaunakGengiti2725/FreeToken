@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import math
 import os
 import time
+from dataclasses import replace
 
 from typing import TYPE_CHECKING, Iterable, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
-from freetoken.core import Batch, Req
+from freetoken.core import Batch, Req, SamplingParams
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.message import (
@@ -26,6 +28,7 @@ from freetoken.message import (
 from freetoken.utils import (
     init_logger,
     load_eos_token_ids,
+    load_generation_sampling,
     load_tokenizer,
     load_toolcall_anchor_id,
     load_turn_anchor_tails,
@@ -50,6 +53,38 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
+
+
+# The prompt text of the first-request warmup, repeated to each length: plain words, no special or image tokens.
+_WARM_TEXT = "The quick brown fox jumps over the lazy dog, and then it runs back across the field to the river. "
+
+
+def warm_lengths(points: Iterable[int], limit: int) -> List[int]:
+    """Prompt lengths of the first-request warmup: one past each token count ``points`` where a prefill kernel takes
+    another compiled variant, at most ``limit``. Each is odd: Triton compiles an integer argument that is a multiple
+    of 16 apart from one that is not, and most prompts are not."""
+    return sorted({p + 1 if p % 2 == 0 else p for p in points if 2 <= p + 1 <= limit})
+
+
+def _warm_points(model_config, device: torch.device) -> List[int]:
+    """Token counts of one prefill chunk where the code picks another kernel variant (see warm_lengths)."""
+    from freetoken.kvcache.linear_state_pool import gdn_rule_tokens
+
+    # 2: the shortest prompt; 16, 32, 64: the GDN output kernel's BT and the small-M dense GEMM tiles (chunk_o.py,
+    # nvfp4_linear.py), and the FP8 BLOCK_M (fp8_pertensor_linear.py); 1024: the norm and shared-gate warps
+    # (norm.py, moe_shared_gate.py); 4096: the activation tile (activation.py)
+    points = [2, 16, 32, 64, 1024, 4096]
+    rule = gdn_rule_tokens()
+    if rule:
+        # past it the GDN rule runs in more than one call
+        points.append(rule)
+    if getattr(model_config, "expert_quant", "none") == "nvfp4" and getattr(model_config, "num_experts_per_tok", 0):
+        from freetoken.kernel.nvfp4_moe import _prefill_block_m_steps
+
+        # where the routed GEMM's BLOCK_SIZE_M grows: tokens per expert are M * top_k / experts
+        per_token = model_config.num_experts_per_tok / model_config.num_experts
+        points += [math.ceil(step / per_token) for step in _prefill_block_m_steps(device.index) if math.isfinite(step)]
+    return points
 
 
 def _gib(n_bytes: int) -> str:
@@ -178,6 +213,61 @@ class Scheduler(SchedulerIOMixin):
         # on the engine stream, so the read and the zeroing fall between decode replays
         with torch.cuda.stream(self.engine.stream):
             return self.engine.moe_offload_cache.decode_stats_line()
+
+    @torch.inference_mode()
+    def warm_first_request(self) -> None:
+        """Serve a few requests nobody sent, before the readiness ack, so that the first real request finds the kernel
+        variants of its prompt length loaded: the prefill forward, the sampler, the draft's prompt pass and a verify step.
+
+        They carry a seed and run under reproducible seeds, so they match nothing in the prefix cache and leave nothing
+        in it; the sampling stream is put back after them, so an unseeded request draws what it drew without them.
+        With an expert cache they do not run: they would change which experts the first real request finds resident.
+        """
+        if not ENV.WARM_FIRST_REQUEST or self.device.type != "cuda" or self.engine.moe_offload_cache is not None:
+            return
+        limit = min(self.prefill_budget, self.engine.max_seq_len - self.config.decode_rows_per_req - 2)
+        ids = self.tokenizer.encode(_WARM_TEXT, add_special_tokens=False)
+        lengths = warm_lengths(_warm_points(self.config.model_config, self.device), limit)
+        if not ids or not lengths:
+            return
+        greedy = SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True, seed=0)
+        sampled = load_generation_sampling(self.config.model_path) if getattr(self.config, "sampling_defaults", None) == "model" else {}
+        runs = [(length, greedy) for length in lengths]
+        if sampled.get("temperature", 0.0) > 0.0:
+            # the sampled request's kernels too, at the default sampling of a request that names none
+            keep = {key: sampled[key] for key in ("temperature", "top_k", "top_p") if key in sampled}
+            runs.append((lengths[min(1, len(lengths) - 1)], SamplingParams(**keep, max_tokens=2, ignore_eos=True, seed=0)))
+
+        send, seeds = self.send_result, self.cache_manager.reproducible_seeds
+        cuda_rng, cpu_rng = torch.cuda.get_rng_state(self.device), torch.get_rng_state()
+        self.send_result = lambda reply: None
+        self.cache_manager.reproducible_seeds = True
+        started = time.perf_counter()
+        try:
+            with self.engine_stream_ctx:
+                self.engine.stream.wait_stream(self.stream)
+                for uid, (length, params) in enumerate(runs, start=1):
+                    prompt = torch.tensor((ids * (length // len(ids) + 1))[:length], dtype=torch.int32)
+                    self._process_one_msg(UserMsg(uid=-uid, input_ids=prompt, sampling_params=replace(params)))
+                    while self.prefill_manager.runnable or self.decode_manager.runnable:
+                        forward_input = self._schedule_next_batch()
+                        if forward_input is None:
+                            break
+                        self._restore_linear_states(forward_input.batch)
+                        self._process_last_data((forward_input, self._forward(forward_input)))
+                torch.cuda.synchronize(self.device)
+        finally:
+            self.send_result = send
+            self.cache_manager.reproducible_seeds = seeds
+        torch.cuda.set_rng_state(cuda_rng, self.device)
+        torch.set_rng_state(cpu_rng)
+        self.engine.sampler._sent = None
+        self.finished_reqs = set()
+        self.cache_manager.check_integrity()
+        logger.info_rank0(
+            f"First-request warmup served prompts of {[length for length, _ in runs]} tokens "
+            f"in {time.perf_counter() - started:.3f} s"
+        )
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""

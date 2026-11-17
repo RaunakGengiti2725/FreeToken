@@ -926,3 +926,28 @@ def test_tokenize_manager_takes_the_prefix_cache_for_templated_prompts_only():
     # a raw prompt takes its bos from the tokenizer, which a prompt cut in two would get twice or not at all
     for _ in range(2):
         assert tokenize(9, "hello world")[1].tolist() == tokenizer.encode("hello world")
+
+
+def _hub_tokenizer(repo: str):
+    from transformers import AutoTokenizer
+
+    try:
+        return AutoTokenizer.from_pretrained(repo, local_files_only=True)
+    except Exception:  # noqa: BLE001 -- not in the local HF cache
+        pytest.skip(f"{repo} is not in the local HF cache")
+
+
+def test_warm_leaves_no_prompt_in_the_prefix_cache_and_no_decode_state():
+    from freetoken.tokenizer.detokenize import DetokenizeManager
+    from freetoken.tokenizer.tokenize import _WARM_CONVERSATION
+
+    tokenizer = _hub_tokenizer("Qwen/Qwen3-0.6B")
+    manager = TokenizeManager(tokenizer)
+    ids = manager.warm()
+    assert manager._prefix_cache.prompts == [] and manager._prefix_cache.reused_tokens == 0
+    msg = TokenizeMsg(uid=1, text=[dict(m) for m in _WARM_CONVERSATION], sampling_params=SamplingParams())
+    assert torch.equal(ids, TokenizeManager(tokenizer).tokenize([msg])[0].input_ids)
+
+    detokenizer = DetokenizeManager(tokenizer)
+    assert detokenizer.warm(ids[-32:].tolist()) == tokenizer.decode(ids[-32:].tolist())
+    assert detokenizer.decode_map == {}

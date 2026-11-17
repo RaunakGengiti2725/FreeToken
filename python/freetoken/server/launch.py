@@ -80,6 +80,8 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         try:
             scheduler = Scheduler(args)
             scheduler.sync_all_ranks()
+            scheduler.warm_first_request()
+            scheduler.sync_all_ranks()
         except Exception as exc:  # noqa: BLE001 -- surface the reason, then let it propagate
             # A startup failure (bad config, OOM, corrupt weights) would otherwise reach the
             # parent only as a dead process -> a generic "exited during load". Push the real

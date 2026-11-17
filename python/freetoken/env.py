@@ -78,6 +78,8 @@ class EnvClassSingleton:
     # Tokens of one request that one call of a prefill's GatedDeltaNet chunk rule covers; 0 runs a forward's
     # tokens in one call, whose temporaries then grow with the whole prefill chunk.
     GDN_RULE_TOKENS = EnvInt(2048)
+    # Serve a few internal requests before the readiness ack so that the first real one finds its kernels loaded.
+    WARM_FIRST_REQUEST = EnvBool(True)
 
     def __new__(cls):
         # single instance

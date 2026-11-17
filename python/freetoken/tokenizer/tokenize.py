@@ -51,6 +51,13 @@ def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: An
 
 _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
+_WARM_CONVERSATION = (
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What is the capital of France?"},
+    {"role": "assistant", "content": "The capital of France is Paris."},
+    {"role": "user", "content": "And of Italy?"},
+)
+
 # Rendered chat prompts whose token ids a TokenizeManager keeps. A turn replaces the prompt it extends, so one serves a whole conversation.
 _PREFIX_CACHE_PROMPTS = 4
 
@@ -105,6 +112,18 @@ class TokenizeManager:
                     UserMsg(uid=msg.uid, input_ids=input_ids, sampling_params=msg.sampling_params)
                 )
         return results
+
+    def warm(self) -> torch.Tensor:
+        """Render and encode one conversation, so that the first request does not compile the chat template or
+        warm the tokenizer; returns its ids. The prefix cache is left as it was."""
+        from freetoken.core import SamplingParams
+
+        prompts, reused = self._prefix_cache.prompts, self._prefix_cache.reused_tokens
+        try:
+            (msg,) = self.tokenize([TokenizeMsg(uid=-1, text=[dict(m) for m in _WARM_CONVERSATION], sampling_params=SamplingParams())])
+        finally:
+            self._prefix_cache.prompts, self._prefix_cache.reused_tokens = prompts, reused
+        return msg.input_ids
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
         """The template/encoder half of ``tokenize``, exposed so the frontend can
