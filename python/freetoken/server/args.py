@@ -1178,7 +1178,7 @@ def parse_args(
             "token map scripts/make_token_map.py --store or --install put in the store for the checkpoint, if there is one. "
             "The log says what it set. "
             "'single-measured' is 'single', and on its first start for a checkpoint, flags and machine it also times "
-            "offload against hybrid and 0, 3, 4 and 5 draft tokens (one server start each, as many as fit in 300 s), "
+            "the static choice against 3 drafts without the map (every expert resident) or against offload, hybrid and hybrid without drafts (one server start each, as many as fit in 300 s), "
             "keeps the choice next to the `ft bench decode` rows and logs how long that took; later starts read the "
             "choice, and --calibrate-again times again. "
             "'single-fast' is 'single' with --prefill-graph-tokens 448 --prefill-graph-chunks 1-64,128-384:64: a prompt "

@@ -1412,7 +1412,9 @@ def test_calibration_takes_the_largest_worst_lead_above_the_margin_and_times_two
     assert choose({**static, "hybrid@3": both(109.0, 240.0)}, names)[0] == "offload@3"  # +9% on its worse prompt
     assert choose({**static, "hybrid@3": both(120.0, 250.0)}, names) == ("hybrid@3", pytest.approx(0.2))
     assert choose({**static, "hybrid@3": both(120.0, 240.0), "hybrid@0": both(120.0, 240.0)}, names)[0] == "hybrid@3"  # a tie: the one named first
-    assert choose({**static, "hybrid@3": both(120.0, 240.0), "hybrid@0": both(126.0, 250.0)}, names)[0] == "hybrid@0"
+    # a candidate must lead the one chosen so far by the margin, not only the static choice: +26% / +25% is 5% / 4% over hybrid@3
+    assert choose({**static, "hybrid@3": both(120.0, 240.0), "hybrid@0": both(126.0, 250.0)}, names) == ("hybrid@3", pytest.approx(0.2))
+    assert choose({**static, "hybrid@3": both(120.0, 240.0), "hybrid@0": both(140.0, 270.0)}, names) == ("hybrid@0", pytest.approx(0.35))
     assert choose({**static, "offload@0": both(60.0, 90.0), "hybrid@0": both(95.0, 230.0)}, names)[0] == "offload@3"  # slower ones change nothing
     # a pass behind the static choice is no lead, whatever the other pass says
     assert choose({**static, "hybrid@3": [[150.0, 95.0], [300.0, 260.0]]}, names)[0] == "offload@3"
@@ -1440,7 +1442,7 @@ def test_calibration_takes_the_largest_worst_lead_above_the_margin_and_times_two
     argv = ["--preset", "single-measured", "--calibrate-again", "--memory-ratio", "0.8"]
     timed = calibrate._time_candidate(SimpleNamespace(model_path="/models/anon"), argv, "offload", 3, ready_s=123.9)
     assert timed["tok_s"] == [[90.0, 110.0], [180.0, 220.0]] and timed["drafts"] == 8
-    assert seen["passes"] == calibrate.PASSES >= 2 and seen["warm"] == calibrate.WARM >= 1024
+    assert seen["passes"] == calibrate.PASSES >= 2 and seen["warm"] == calibrate.WARM >= 1024 and calibrate.DECODE == 512
     # the later passes find the cache filled and warm up for less; the server has the seconds it was given to load, and
     # is the static preset with the rest of the command line, never one that calibrates again
     assert seen["warm_after"] == calibrate.WARM_AGAIN < calibrate.WARM and seen["timeout"] == 123
@@ -1487,55 +1489,73 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     free_now(_ROW_FREE)
     args, argv = parsed()
     hybrid_3 = {"moe_strategy": "hybrid", "moe_cache_auto": True, "speculative_num_steps": 3}
+    # a CPU pool under 8 threads: the static preset serves offload with 3 drafts. The candidates are hybrid at its depth
+    # and without drafts; offload without drafts is timed only where offload's server drops its drafts (below)
+    assert [c[0] for c in calibrate.candidates(args, ("offload", 3, None))] == ["offload@3", "hybrid@3", "hybrid@0", "offload@0"]
     # the faster candidate does not start, once: the static choice runs, and the next start times again and takes it
     hybrid = speeds.pop(("hybrid", 3))
-    assert starts(args, argv) == ({"speculative_num_steps": 3}, 8)
+    assert starts(args, argv) == ({"speculative_num_steps": 3}, 3)
     speeds["hybrid", 3] = hybrid
-    assert starts(args, argv) == (hybrid_3, 8) and starts(args, argv) == (hybrid_3, 0)
+    assert starts(args, argv) == (hybrid_3, 3) and starts(args, argv) == (hybrid_3, 0)
+    assert started[-3:] == [("offload", 3), ("hybrid", 3), ("hybrid", 0)]  # offload kept its drafts: no offload@0
     # a candidate that fails on two starts in a row is left out from then on, not timed at every start
-    del speeds["hybrid", 5]
+    del speeds["hybrid", 0]
     again, again_argv = parsed("--memory-ratio", "0.6")
-    assert [starts(again, again_argv)[1] for _ in range(3)] == [8, 8, 0]
-    speeds["hybrid", 5] = [110.0, 195.0]
+    assert [starts(again, again_argv)[1] for _ in range(3)] == [3, 3, 0]
+    speeds["hybrid", 0] = [70.0, 120.0]
     args, argv = parsed("--memory-ratio", "0.65")
-    assert starts(args, argv) == (hybrid_3, 8)
+    assert starts(args, argv) == (hybrid_3, 3)
     # the same checkpoint, flags, machine and release: the stored timings answer and no server is started
     assert starts(args, argv) == (hybrid_3, 0)
-    # a strategy from the command line is not a candidate: the four depths of that strategy are another setup
-    assert starts(*parsed("--moe-strategy", "offload")) == ({"speculative_num_steps": 3}, 4)
+    # a strategy from the command line is not a candidate: offload's two depths are another setup, and its server
+    # keeps its drafts here, so it is the one candidate timed
+    assert starts(*parsed("--moe-strategy", "offload")) == ({"speculative_num_steps": 3}, 1)
     # a cache rate or size from the command line is its own setup, not the automatic size: each is timed for itself
     for flags in (("--moe-cache-rate", "0.2"), ("--moe-cache-rate", "0.05"), ("--moe-cache-size", "512")):
         sized = {"moe_strategy": "hybrid", "speculative_num_steps": 3}
-        assert starts(*parsed(*flags)) == (sized, 8), flags
+        assert starts(*parsed(*flags)) == (sized, 3), flags
         assert starts(*parsed(*flags)) == (sized, 0)
     # an automatically sized cache follows the free memory (40 slots of 1 MiB were timed): two slots more or less are the
     # same setup; clearly more, clearly less, or a row that does not say how much was free, is timed again
-    for free, timed in ((_ROW_FREE - (1 << 20), 0), (_ROW_FREE + (1 << 20), 0), (_ROW_FREE - (8 << 30), 8), (_ROW_FREE - (8 << 30) + (1 << 20), 0),
-                        (_ROW_FREE + (8 << 30), 8)):
+    for free, timed in ((_ROW_FREE - (1 << 20), 0), (_ROW_FREE + (1 << 20), 0), (_ROW_FREE - (8 << 30), 3), (_ROW_FREE - (8 << 30) + (1 << 20), 0),
+                        (_ROW_FREE + (8 << 30), 3)):
         free_now(free)
         assert starts(args, argv) == (hybrid_3, timed), free
     profile = decode_rows.tmp / "benchdecode.json"
     kept = json.loads(profile.read_text())
     assert all(row.pop("gpu_free_bytes") for row in kept["decisions"].values())
     profile.write_text(json.dumps(kept))
-    assert starts(args, argv) == (hybrid_3, 8) and starts(args, argv) == (hybrid_3, 0)
+    assert starts(args, argv) == (hybrid_3, 3) and starts(args, argv) == (hybrid_3, 0)
     assert starts(*parsed("--moe-cache-rate", "0.2")) == (sized, 0)  # a cache of a fixed size is the same at any free memory
     # another release: timed again
     monkeypatch.setattr("freetoken.version.__version__", "9.9.10")
-    assert starts(args, argv) == (hybrid_3, 8)
+    assert starts(args, argv) == (hybrid_3, 3)
     # a checkpoint that drafts nothing: the depths are one server, so only the strategies are timed
     speeds.update({("offload", 3): [60.0, 90.0], ("hybrid", 3): [80.0, 120.0]})
     monkeypatch.setattr(calibrate, "_time_candidate", lambda args, argv, s, d, floors=None, ready_s=None, left_s=None: {**time_candidate(args, argv, s, d), "drafts": 0})
     assert starts(*parsed("--memory-ratio", "0.9")) == (hybrid_3, 2)
-    # the static preset dropped its drafts for the size of the cache: that is the static choice, the other depths of its
-    # strategy are not timed against it, and hybrid's are
+    # the static preset dropped its drafts for the size of the cache: that is the static choice, offload is not timed
+    # with drafts against it, and hybrid is
     def no_drafts(args, argv, s, d, floors=None, ready_s=None, left_s=None):
         return {**time_candidate(args, argv, s, d), "drafts": 0 if (s, d) == ("offload", 3) else 100, "no_drafts": (s, d) == ("offload", 3)}
 
     monkeypatch.setattr(calibrate, "_time_candidate", no_drafts)
     choice, timed = starts(*parsed("--memory-ratio", "0.91"))
-    assert timed == 5 and started[-5:] == [("offload", 3), ("hybrid", 3), ("hybrid", 4), ("hybrid", 5), ("hybrid", 0)]
-    assert (choice["moe_strategy"], choice["speculative_num_steps"]) == ("hybrid", 5) and "speculative_num_steps" not in choice["preset_fields"]
+    assert timed == 3 and started[-3:] == [("offload", 3), ("hybrid", 3), ("hybrid", 0)] and choice == hybrid_3
+    # a CPU pool of 8 threads or more: the static preset serves hybrid, then hybrid without drafts and offload are
+    # timed. Offload's server drops its drafts for this cache: its timing is offload without drafts, from one start
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: ("hybrid", 3, None))
+    assert [c[0] for c in calibrate.candidates(args, ("hybrid", 3, None))] == ["hybrid@3", "hybrid@0", "offload@3", "offload@0"]
+    speeds["offload", 3] = [100.0, 150.0]
+    choice, timed = starts(*parsed("--memory-ratio", "0.92"))
+    assert timed == 3 and started[-3:] == [("hybrid", 3), ("hybrid", 0), ("offload", 3)]
+    assert (choice["moe_strategy"], choice["speculative_num_steps"], choice["speculative_algorithm"]) == ("offload", 0, None)
+    speeds["offload", 3] = [60.0, 90.0]
+    assert starts(*parsed("--memory-ratio", "0.93")) == ({"speculative_num_steps": 3}, 3)  # hybrid with 3 drafts leads them all
+    # where what the static preset serves cannot be read, a guess is not timed: the static preset runs
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: None)
+    assert starts(*parsed("--memory-ratio", "0.94")) == ({}, 0)
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: (static_strategy[0], 3, None))
     # the static choice cannot be timed, or the GPU cannot be read: the static preset, and nothing is kept
     monkeypatch.setattr(calibrate, "_time_candidate", time_candidate)
     del speeds["offload", 3]
@@ -1544,30 +1564,25 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     # hybrid with 3 drafts is now the slower one: the static choice, measured. The strategy stays as the command line
     # left it (auto), so that auto still resolves it as it does for --preset single
     speeds["offload", 3] = [100.0, 200.0]
-    assert third.moe_strategy == "auto" and starts(third, third_argv) == ({"speculative_num_steps": 3}, 8)
+    assert third.moe_strategy == "auto" and starts(third, third_argv) == ({"speculative_num_steps": 3}, 3)
     # the timings cannot be written (a full or read-only disk): their choice is served all the same, and the next start times again
     free_now(_ROW_FREE)
     fourth, fourth_argv = parsed("--memory-ratio", "0.7")
     with monkeypatch.context() as m:
         m.setattr(calibrate.decode_profile, "store", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left on device")))
-        assert starts(fourth, fourth_argv) == ({"speculative_num_steps": 3}, 8)
-    assert starts(fourth, fourth_argv) == ({"speculative_num_steps": 3}, 8) and starts(fourth, fourth_argv) == ({"speculative_num_steps": 3}, 0)
-    # every expert fits and the static preset serves them resident: fused is the strategy of every candidate, no hybrid
-    # is timed against it, and the timings are a row of their own. A deeper draft that leads keeps fused
+        assert starts(fourth, fourth_argv) == ({"speculative_num_steps": 3}, 3)
+    assert starts(fourth, fourth_argv) == ({"speculative_num_steps": 3}, 3) and starts(fourth, fourth_argv) == ({"speculative_num_steps": 3}, 0)
+    # every expert fits and the static preset serves them resident with 3 drafts, no map in the store: that is the only
+    # candidate, as no deeper draft is one without the map, and hybrid is never timed against fused
     static_strategy[0] = "fused"
     speeds.update({("fused", 3): [100.0, 200.0], ("fused", 0): [60.0, 90.0], ("fused", 5): [120.0, 230.0], ("fused", 4): [101.0, 201.0]})
     fifth, fifth_argv = parsed("--memory-ratio", "0.75")
-    measured_depth = tuple(n for n in fifth.preset_fields if n != "speculative_num_steps")  # as its server was started: the depth typed
-    assert starts(fifth, fifth_argv) == ({"moe_strategy": "fused", "speculative_num_steps": 5, "preset_fields": measured_depth}, 4)
-    # every expert on the GPU: the deeper drafts of the static strategy come right after it
-    assert started[-4:] == [("fused", 3), ("fused", 5), ("fused", 4), ("fused", 0)] and starts(fifth, fifth_argv)[1] == 0
-    speeds["fused", 5] = [105.0, 190.0]
-    assert starts(*parsed("--memory-ratio", "0.72")) == ({"speculative_num_steps": 3}, 4)  # the static choice: the strategy stays auto
-    # a typed strategy is not asked about and stays, and typed drafts leave nothing to time
-    assert starts(*parsed("--moe-strategy", "hybrid", "--memory-ratio", "0.75"))[1] == 4 and started[-1] == ("hybrid", 0)
+    assert [c[0] for c in calibrate.candidates(fifth, ("fused", 3, None))] == ["fused@3"] and starts(fifth, fifth_argv) == ({}, 0)
+    # typed drafts leave nothing to time
     assert starts(*parsed("--speculative-algorithm", "off", "--memory-ratio", "0.75")) == ({}, 0)
-    # a draft token map for this checkpoint in the store, with the manifest its builder wrote: 5 drafts with it are a
-    # candidate, timed right after the static choice, and the choice carries the map
+    # a draft token map for this checkpoint in the store, with the manifest its builder wrote, which the static preset
+    # serves (as --preset single does): 5 drafts with it are the static choice, timed first and served by the engine's
+    # own rule, depth and map together; 3 drafts without it are the one other candidate
     import hashlib
 
     map_path = calibrate.token_map_path(str(decode_rows.model))
@@ -1582,31 +1597,30 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
 
     store_map(b"\x01\x00\x00\x00\x02\x00\x00\x00")
     speeds["fused", "5map"] = [140.0, 240.0]
-    mapped, mapped_argv = parsed("--memory-ratio", "0.76")
-    with_map = {"moe_strategy": "fused", "speculative_num_steps": 5, "preset_fields": measured_depth, "speculative_token_map": map_path}
-    assert starts(mapped, mapped_argv) == (with_map, 5)
-    assert started[-5:] == [("fused", 3), ("fused", "5map"), ("fused", 4), ("fused", 5), ("fused", 0)]
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: ("fused", 5, map_path))
+    own_map, own_map_argv = parsed("--memory-ratio", "0.761")
+    assert starts(own_map, own_map_argv) == ({}, 2) and started[-2:] == [("fused", "5map"), ("fused", 3)]
+    assert starts(own_map, own_map_argv) == ({}, 0)
+    speeds["fused", 3] = [160.0, 270.0]  # 3 drafts lead the map by more than the margin on both prompts
+    assert starts(*parsed("--memory-ratio", "0.762")) == ({"moe_strategy": "fused", "speculative_num_steps": 3}, 2)
+    speeds["fused", 3] = [100.0, 200.0]
+    # a typed --moe-strategy fused: the static preset serves 3 drafts without the map, and the map is the candidate
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: ("fused", 3, None))
+    mapped, mapped_argv = parsed("--moe-strategy", "fused", "--memory-ratio", "0.76")
+    measured_depth = tuple(n for n in mapped.preset_fields if n != "speculative_num_steps")  # as its server was started: the depth typed
+    with_map = {"speculative_num_steps": 5, "preset_fields": measured_depth, "speculative_token_map": map_path}
+    assert starts(mapped, mapped_argv) == (with_map, 2) and started[-2:] == [("fused", 3), ("fused", "5map")]
     assert starts(mapped, mapped_argv) == (with_map, 0)
     flags = calibrate.child_flags(mapped_argv, 5, map_path)
     assert flags[-6:] == ["--preset", "single", "--speculative-num-steps", "5", "--speculative-token-map", map_path]
-    # where the static preset serves the map itself (as --preset single does), 5 drafts with it are the static choice:
-    # timed first, and served by the engine's own rule, depth and map together; 3 drafts without it come next
-    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: ("fused", 5, map_path))
-    own_map, own_map_argv = parsed("--memory-ratio", "0.761")
-    assert starts(own_map, own_map_argv) == ({}, 5)
-    assert started[-5:] == [("fused", "5map"), ("fused", 3), ("fused", 4), ("fused", 5), ("fused", 0)]
-    speeds["fused", 3] = [160.0, 270.0]  # 3 drafts lead the map by more than the margin on both prompts
-    assert starts(*parsed("--memory-ratio", "0.762")) == ({"moe_strategy": "fused", "speculative_num_steps": 3}, 5)
-    speeds["fused", 3] = [100.0, 200.0]
-    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: (static_strategy[0], 3, None))
     # another map is another candidate, timed again; a file that is not the one its manifest describes is not timed,
     # and a map on the command line is every server's, not a candidate
     store_map(b"\x01\x00\x00\x00\x03\x00\x00\x00")
-    assert starts(mapped, mapped_argv) == (with_map, 5)
+    assert starts(mapped, mapped_argv) == (with_map, 2)
     store_map(b"\x01\x00\x00\x00\x04\x00\x00\x00", recorded="0" * 64)
-    assert starts(*parsed("--memory-ratio", "0.77"))[1] == 4 and ("fused", "5map") not in started[-4:]
+    assert starts(*parsed("--moe-strategy", "fused", "--memory-ratio", "0.77")) == ({}, 0)
     store_map(b"\x01\x00\x00\x00\x04\x00\x00\x00")
-    assert starts(*parsed("--memory-ratio", "0.78", "--speculative-token-map", map_path))[1] == 4
+    assert starts(*parsed("--moe-strategy", "fused", "--memory-ratio", "0.78", "--speculative-token-map", map_path)) == ({}, 0)
     # a map the engine refuses leaves that server without drafts: it is not the candidate it is named for, and however
     # fast it was it is not chosen
     def refused(args, argv, s, d, floors=None, ready_s=None, token_map=None, left_s=None):
@@ -1614,8 +1628,9 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
 
     monkeypatch.setattr(calibrate, "_time_candidate", refused)
     speeds["fused", "5map"] = [400.0, 800.0]
-    assert starts(*parsed("--memory-ratio", "0.79")) == ({"speculative_num_steps": 3}, 5)
+    assert starts(*parsed("--moe-strategy", "fused", "--memory-ratio", "0.79")) == ({"speculative_num_steps": 3}, 2)
     monkeypatch.setattr(calibrate, "_time_candidate", time_candidate)
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: (static_strategy[0], 3, None))
     os.rename(map_path, map_path + ".off")  # no map from here on
     static_strategy[0] = "offload"
     # a calibration has 300 s. A candidate is started only while 1.1 times the longest one so far still fits: at 100 s a
@@ -1641,33 +1656,25 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
         return timed
 
     assert calibrate.BUDGET_S == 300 and calibrate.SLACK == 1.1
-    speeds.update({("offload", 3): [100.0, 200.0], ("hybrid", 3): [130.0, 250.0], ("hybrid", 4): [140.0, 260.0], ("offload", 4): [102.0, 195.0]})
+    speeds.update({("offload", 3): [100.0, 200.0], ("hybrid", 3): [130.0, 250.0], ("hybrid", 0): [150.0, 280.0]})
     monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0))
     boxed, boxed_argv = parsed("--memory-ratio", "0.85")
     assert starts(boxed, boxed_argv) == (hybrid_3, 2) and started[-2:] == [("offload", 3), ("hybrid", 3)]
     assert starts(boxed, boxed_argv) == (hybrid_3, 0)
-    # --calibrate-again keeps those timings and spends a budget of its own on what was not reached: the other depths of
-    # the strategy that was ahead. A start without the flag reads the larger row
+    # --calibrate-again keeps those timings and spends a budget of its own on what was not reached. hybrid without
+    # drafts leads hybrid with 3, the one chosen so far, by more than the margin. A start without the flag reads the larger row
     again = parsed("--memory-ratio", "0.85", "--calibrate-again")
     choice, timed = starts(*again)
-    assert timed == 2 and started[-2:] == [("hybrid", 4), ("hybrid", 5)] and (choice["moe_strategy"], choice["speculative_num_steps"]) == ("hybrid", 4)
+    assert timed == 1 and started[-1] == ("hybrid", 0) and (choice["moe_strategy"], choice["speculative_num_steps"]) == ("hybrid", 0)
     assert starts(boxed, boxed_argv) == (choice, 0)
-    assert [starts(*again)[1] for _ in range(2)] == [2, 2] and started[-4:] == [("hybrid", 0), ("offload", 4), ("offload", 5), ("offload", 0)]
-    # nothing is left untimed: the flag times every candidate again, from the static choice
+    # nothing is left untimed: the flag times every candidate again, from the static choice, and the next one what that left
     assert starts(*again)[1] == 2 and started[-2:] == [("offload", 3), ("hybrid", 3)]
-    # an expert cache with a slot for every expert is ordered as fused is: 5 drafts, 4 drafts, then the other strategy
-    whole = lambda args, argv, s, d, floors=None, ready_s=None, left_s=None: {**time_candidate(args, argv, s, d), "cache_slots": 80}
-    monkeypatch.setattr(calibrate, "_time_candidate", whole)
-    assert starts(*parsed("--memory-ratio", "0.83"))[1] == 8
-    assert started[-8:-4] == [("offload", 3), ("offload", 5), ("offload", 4), ("hybrid", 3)]
-    monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0))
-    # at 60 s a candidate that is four: then the other depths of the strategy that is ahead of the two, nearest first
+    assert starts(*again)[1] == 1 and started[-1] == ("hybrid", 0)
+    # at 60 s a candidate, three fit
     monkeypatch.setattr(calibrate, "_time_candidate", taking(60.0))
     choice, timed = starts(*parsed("--memory-ratio", "0.86"))
-    assert timed == 4 and started[-4:] == [("offload", 3), ("hybrid", 3), ("hybrid", 4), ("hybrid", 5)]
-    assert (choice["moe_strategy"], choice["speculative_num_steps"]) == ("hybrid", 4)
-    speeds["hybrid", 3] = [90.0, 250.0]  # behind the static choice on one prompt: offload's depths come first
-    assert starts(*parsed("--memory-ratio", "0.87"))[1] == 4 and started[-2:] == [("offload", 4), ("offload", 5)]
+    assert timed == 3 and started[-3:] == [("offload", 3), ("hybrid", 3), ("hybrid", 0)] and choice["speculative_num_steps"] == 0
+    speeds["hybrid", 0] = [70.0, 120.0]
     # a server still loading when the budget ends was not given the time, which is not a server that cannot start:
     # the next start does not time for it again
     monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0, late={("hybrid", 3)}))
@@ -1732,7 +1739,7 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     assert starts(slow, slow_argv) == ({"speculative_num_steps": 3}, 1)
     monkeypatch.setattr(calibrate, "_time_candidate", taking(100.0))
     choice, timed = starts(*parsed("--memory-ratio", "0.802", "--calibrate-again"))
-    assert timed == 2 and started[-2:] == [("hybrid", 3), ("hybrid", 4)] and choice["moe_strategy"] == "hybrid"
+    assert timed == 2 and started[-2:] == [("hybrid", 3), ("hybrid", 0)] and choice["moe_strategy"] == "hybrid"
     monkeypatch.setattr(calibrate, "_now", time.monotonic)
     monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (_ for _ in ()).throw(RuntimeError("the GPU could not be read")))
     assert starts(third, third_argv) == ({}, 0)

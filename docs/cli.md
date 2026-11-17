@@ -210,19 +210,26 @@ on the command line, and a typed `--moe-strategy fused`, leave the drafts as the
 says which and why. `--preset single-fast` and `--preset single-measured` do the same: for
 `single-measured` that is its static choice, the first candidate it times (below). `--preset single-measured`
 is the same preset, and on its first start for a checkpoint, set of flags and machine it times the
-candidates the preset cannot choose between: `offload` and `hybrid`, each with 3, 4 and 5 MTP draft
-tokens and with none. Each candidate is one server start that decodes two built-in prompts (a math
-problem and a coding task) twice over, with the checkpoint's sampling: 256 timed tokens after 1024
-warm-up tokens that fill the expert cache, then 256 timed tokens after 256 warm-up tokens on the
-cache the first pass left. A candidate's lead over the static preset's choice is taken per prompt
-from the means over the two passes and is the smaller of the two prompts'; a candidate behind in any
-single pass has none. The candidate with the largest lead runs, if that lead is above 10%, and
-otherwise the static preset's choice runs, with `--moe-strategy` as the command line left it. The
-strategy and the number of draft tokens are chosen together by that one rule; a depth is not chosen
-per prompt.
+candidates the preset cannot choose between, the static preset's choice first. With every expert
+resident: `fused` with 5 draft tokens and the store's draft token map (below), where the static
+preset serves it, and with 3 draft tokens; with only one of the two, nothing is timed. With an
+expert cache that holds part of the experts: `hybrid` and `offload` with 3 draft tokens and `hybrid`
+with none; `offload` with none is the `offload` server where that one drops its drafts for the size
+of the cache (above), and is not timed where it keeps them. 4 and 5 draft tokens without the map are
+not candidates. Each candidate is one server start that decodes two built-in prompts (a math
+problem and a coding task) twice over, with the checkpoint's sampling: 512 timed tokens after 1024
+warm-up tokens that fill the expert cache, then 512 timed tokens after 256 warm-up tokens on the
+cache the first pass left (256 timed tokens put 5 drafts with a map 8% ahead of 3 on one prompt and
+3% behind on the other, where 2,048 put them 19% and 5% ahead). A candidate's lead over another is
+taken per prompt from the means over the two passes and is the smaller of the two prompts'; a
+candidate behind in any single pass has none. The static preset's choice is chosen first; then, in
+the order they are timed, a candidate replaces the one chosen so far where it leads that one by more
+than 10%, so a candidate barely ahead of another that leads is not taken. What is chosen runs; the
+static choice runs with `--moe-strategy` as the command line left it. The strategy and the number of
+draft tokens are chosen together by that one rule; a depth is not chosen per prompt.
 
-A draft token map is one more candidate where the calibration's store holds one for the checkpoint:
-5 draft tokens with the map, per strategy. The store is the directory of the decode profile, and
+The draft token map is the store's for the checkpoint: under a typed `--moe-strategy fused`, 5 draft
+tokens with it are a candidate against the static 3. The store is the directory of the decode profile, and
 `python scripts/make_token_map.py MODEL --store ...` writes the map there under the checkpoint's
 fingerprint with its manifest; a file whose manifest is missing or names another sha256 is not timed.
 `python scripts/make_token_map.py MODEL --install MAP` copies a map built before and its `MAP.json`
@@ -237,13 +244,9 @@ No map is shipped: one has to be built for the checkpoint, from text that no ben
 
 The calibration runs before the server loads and has 300 seconds. Every candidate is a model load,
 because a running server cannot change its strategy or its draft depth, so the candidates are timed
-in a fixed order and only as many as fit, the static choice first. Where it serves every expert
-from the GPU (`fused`, or an expert cache with a slot for each), the next are 5 draft tokens with
-the map (5 without one where there is no map), then 4 draft tokens, then the other strategy with 3,
-then the rest: on full cards 5 drafts with a 32K map was the one setting measured ahead of the
-static choice. Where the cache holds part of the experts, the next is the other strategy with 3
-draft tokens, then 5 draft tokens with the map, 4, 5 and no draft tokens for the strategy that is
-ahead of those two, then for the other one: there the strategy decided most. A candidate is started only while 1.1 times the longest candidate so far still fits in
+in the order above and only as many as fit, the static choice first; where it is `hybrid`,
+`hybrid` with no draft tokens comes second (the fastest setting with 8 GiB free on one box), then
+`offload`. A candidate is started only while 1.1 times the longest candidate so far still fits in
 what is left, and its server is stopped if it is not ready with time left for its requests. The end
 of the 300 seconds is also a deadline for every load and every request, the static choice's
 included: what is still running then is ended, and that server is gone at most 30 seconds later,
@@ -254,10 +257,9 @@ the time (`calibration took N s`). A candidate that was not timed is stored as s
 and is not timed on a later start; `--calibrate-again` keeps the stored timings and spends another
 300 seconds on the candidates not timed yet. A strategy or a speculative setting given on the command line is not
 timed, and a checkpoint that drafts nothing is timed for the strategy alone (two model loads).
-Where the static preset serves the experts resident, `fused` is every candidate's strategy and only
-the draft settings are timed: with every expert on the GPU `hybrid` has
-nothing to compute on the CPU. Where the static preset dropped its drafts for the size of an
-`offload` cache (above), that is the static choice, and `offload` is not timed with drafts.
+Where the static preset serves the experts resident, `fused` is every candidate's strategy: with
+every expert on the GPU `hybrid` has nothing to compute on the CPU. Where what the static preset
+serves on the GPU cannot be read, nothing is timed and the static preset runs.
 SIGTERM, SIGHUP or Ctrl-C during the calibration stops the candidate's server and ends the launcher
 with exit code 128 + the signal.
 
