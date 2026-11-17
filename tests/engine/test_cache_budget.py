@@ -1135,7 +1135,11 @@ def test_preset_serves_every_expert_resident_where_the_checkpoint_fits_and_the_s
     graphs = 8 * engine.PRESET_DECODE_GRAPH_ROW_BYTES
     sized = dict(memory_ratio=0.95, max_running_req=8, cuda_graph_bs=list(range(1, 9)))
     assert strategy(enough, **sized) == "offload" and strategy(-(-(need + graphs) * 20 // 19), **sized) == "fused"
-    assert engine._preset_decode_graph_bytes(SimpleNamespace(preset="multi", cuda_graph_bs=[1, 2, 8], speculative_algorithm="mtp", speculative_num_steps=3)) == 4 * graphs
+    multi_graphs = dict(preset="multi", speculative_algorithm="mtp", speculative_num_steps=3)
+    assert engine._preset_decode_graph_bytes(SimpleNamespace(cuda_graph_bs=[1, 2, 8], max_running_req=8, **multi_graphs)) == 4 * graphs
+    # a size above the running requests adds nothing beyond what can run
+    assert engine._preset_decode_graph_bytes(SimpleNamespace(cuda_graph_bs=[1, 2, 16], max_running_req=8, **multi_graphs)) == 4 * graphs
+    assert engine._preset_decode_graph_bytes(SimpleNamespace(cuda_graph_bs=[1, 2, 16], max_running_req=2, **multi_graphs)) == graphs
     assert engine._preset_decode_graph_bytes(SimpleNamespace(preset="single", cuda_graph_bs=None, speculative_algorithm="mtp", speculative_num_steps=3)) == 0
     assert engine._preset_decode_graph_bytes(SimpleNamespace(preset=None, cuda_graph_bs=[1, 2], speculative_algorithm=None, speculative_num_steps=0)) == 0
     # a strategy from the command line, typed auto included, is never replaced; nor is one without the preset

@@ -259,12 +259,13 @@ PRESET_DECODE_GRAPH_ROW_BYTES = 9 << 18
 
 def _preset_decode_graph_bytes(config) -> int:
     """GPU bytes a preset counts for the decode graphs of the batch sizes it names (--cuda-graph-bs, which 'multi'
-    fills): the rows of the largest size, k + 1 a request with drafts. Nothing where the sizes are left to the engine."""
+    fills): the rows of the largest size, k + 1 a request with drafts. Nothing where the sizes are left to the engine.
+    A size above the running requests counts as their number: no decode batch is larger."""
     sizes = getattr(config, "cuda_graph_bs", None)
     if not sizes or getattr(config, "preset", None) is None:
         return 0
     rows = 1 + (config.speculative_num_steps if config.speculative_algorithm is not None else 0)
-    return max(sizes) * rows * PRESET_DECODE_GRAPH_ROW_BYTES
+    return min(max(sizes), config.max_running_req) * rows * PRESET_DECODE_GRAPH_ROW_BYTES
 
 
 def _preset_capture_bytes(config) -> int:
