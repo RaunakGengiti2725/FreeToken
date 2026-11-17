@@ -403,6 +403,56 @@ def _preset_takes_fused(config) -> bool:
     return fits
 
 
+# --preset single and single-fast with every expert resident: draft tokens with the store's draft token map. On two cards
+# that held every expert of Qwen3.6-35B-A3B NVFP4, 5 drafts with a 32K map decoded 19% and 5% faster on the math and code
+# prompts than the preset's 3 drafts without a map
+PRESET_MAP_DEPTH = 5
+
+
+def _settle_preset_map_drafts(config, override, windowed_kv: bool) -> None:
+    """--preset single and single-fast where their plan holds every expert resident (_preset_takes_fused): PRESET_MAP_DEPTH
+    MTP draft tokens with the store's draft token map for this checkpoint (moe/calibrate.py), whose sha256 must be the
+    one its manifest records; the preset's own draft tokens without a map elsewhere. Drafts the command line set are
+    served as typed. One log line says which and why."""
+    from freetoken.moe import calibrate
+
+    if config.preset not in ("single", "single-fast") or config.speculative_algorithm is None:
+        return
+    head = f"--preset {config.preset} with every expert resident"
+    typed = [flag for flag, on in (
+        ("--speculative-algorithm", "speculative_algorithm" not in config.preset_fields),
+        ("--speculative-num-steps", "speculative_num_steps" not in config.preset_fields),
+        ("--speculative-token-map", config.speculative_token_map),
+    ) if on]
+    if typed:
+        logger.info_rank0(f"{head}: {config.speculative_num_steps} {config.speculative_algorithm} draft tokens as {', '.join(typed)} set them")
+        return
+    path, sha, recorded = calibrate.store_token_map(config.model_path)
+    without = f"{head}: {config.speculative_num_steps} MTP draft tokens without a draft token map"
+    if sha is None:
+        logger.info_rank0(f"{without}: the store holds none for this checkpoint ({path} and its manifest {path}.json)")
+        return
+    if recorded != sha:
+        logger.info_rank0(f"{without}: the store's map {path} has sha256 {sha[:12]}, its manifest records {str(recorded)[:12]}")
+        return
+    kept = {name: getattr(config, name) for name in ("speculative_num_steps", "speculative_token_map", "spec_slot_states", "attention_backend")}
+    override("speculative_num_steps", PRESET_MAP_DEPTH)
+    override("speculative_token_map", path)
+    try:
+        # the checks of a typed --speculative-token-map: a map the draft head cannot keep fails here, not after the load
+        _adjust_spec_config(config, override, windowed_kv)
+    except (ValueError, KeyError, OSError) as exc:
+        for name, value in kept.items():
+            override(name, value)
+        logger.info_rank0(f"{without}: the store's map {path} is refused ({exc})")
+        return
+    logger.info_rank0(f"{head}: {PRESET_MAP_DEPTH} MTP draft tokens with the store's draft token map {path} (sha256 {sha[:12]}, as its manifest records)")
+    if getattr(config, "moe_decode_key", None) is not None:
+        # the key was made with the preset's drafts: `ft bench decode` reads the last one a server logs
+        override("moe_decode_key", _decode_decision_key(config))
+        logger.info_rank0(f"MoE decode setup: {config.moe_decode_key}")
+
+
 def _adjust_preset_spec_config(config, override, windowed_kv: bool) -> None:
     """Speculative decoding a preset turned on: kept where an explicit start's checks pass and the draft's source is
     on disk to be checked, dropped with one log line elsewhere."""
@@ -3169,6 +3219,7 @@ def _adjust_config(config: EngineConfig):
         if default_backend == "offload" and _preset_takes_fused(config):
             # the one case where it is known that the experts fit: no slot cache, and a prefill reads them in place
             default_backend = "fused"
+            _settle_preset_map_drafts(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
         if default_backend == "offload" and getattr(config, "moe_decode_key", None) is not None:
             # hybrid only on a decode row measured for this setup, on this machine and release; offload without one
             default_backend, row = _measured_decode_strategy(config)

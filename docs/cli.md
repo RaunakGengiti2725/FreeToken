@@ -190,7 +190,16 @@ plan line says which. Both give the same output as the expert cache does.
 
 `--preset single` measures nothing: it serves with `fused` where every expert fits as described
 above, else with `offload` (or what `--moe-strategy auto` takes from an
-[`ft bench decode`](#ft-bench-decode) row), and 3 draft tokens. `--preset single-measured`
+[`ft bench decode`](#ft-bench-decode) row), and 3 draft tokens. Where it serves `fused` (the
+first way above) and the store below holds a draft token map for the checkpoint whose sha256 is
+the one its manifest records, it serves 5 MTP draft tokens with that map instead; on two cards
+that held every expert of Qwen3.6-35B-A3B NVFP4, 5 drafts with a 32K map decoded 19% and 5%
+faster than 3 drafts without one on a math and a coding prompt. With no such map, or a map the
+checks of a typed `--speculative-token-map` refuse, it serves 3 draft tokens without one. An
+expert cache, `--speculative-algorithm`, `--speculative-num-steps` or `--speculative-token-map`
+on the command line, and a typed `--moe-strategy fused`, leave the drafts as they are. One log line
+says which and why. `--preset single-fast` does the same; `--preset single-measured` does not, it
+times the map instead (below). `--preset single-measured`
 is the same preset, and on its first start for a checkpoint, set of flags and machine it times the
 candidates the preset cannot choose between: `offload` and `hybrid`, each with 3, 4 and 5 MTP draft
 tokens and with none. Each candidate is one server start that decodes two built-in prompts (a math
@@ -207,6 +216,9 @@ A draft token map is one more candidate where the calibration's store holds one 
 5 draft tokens with the map, per strategy. The store is the directory of the decode profile, and
 `python scripts/make_token_map.py MODEL --store ...` writes the map there under the checkpoint's
 fingerprint with its manifest; a file whose manifest is missing or names another sha256 is not timed.
+`python scripts/make_token_map.py MODEL --install MAP` copies a map built before and its `MAP.json`
+there, if the sha256 the manifest records (as `map_sha256` or `sha256`) is the file's, and prints
+where it went.
 A `--speculative-token-map` on the command line is not a candidate: every server then has that map.
 No map is shipped: one has to be built for the checkpoint, from text that no benchmark uses.
 

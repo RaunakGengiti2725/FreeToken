@@ -101,18 +101,28 @@ def token_map_path(model_path: str) -> str:
     return os.path.join(store, "token_maps", decode_profile.model_fingerprint(model_path) + ".bin")
 
 
-def stored_token_map(args) -> tuple[str, str] | None:
-    """(path, sha256) of the draft token map to time as a candidate, or None: the command line names a map itself, the
-    store holds none for this checkpoint, or the file is not the one its manifest (<path>.json) describes."""
-    if args.speculative_token_map:
-        return None
-    path = token_map_path(args.model_path)
+def store_token_map(model_path: str) -> tuple[str, str | None, str | None]:
+    """(path, sha256 of the file, sha256 its manifest <path>.json records) of the store's draft token map for this
+    checkpoint; both sha256 are None where the map or its manifest cannot be read. --preset single serves the map
+    where the two are equal, as this calibration times it."""
+    path = token_map_path(model_path)
     try:
         with open(path, "rb") as f:
             sha = hashlib.sha256(f.read()).hexdigest()
         with open(path + ".json") as f:
             recorded = json.load(f).get("map_sha256")
     except (OSError, ValueError, AttributeError):
+        return path, None, None
+    return path, sha, recorded
+
+
+def stored_token_map(args) -> tuple[str, str] | None:
+    """(path, sha256) of the draft token map to time as a candidate, or None: the command line names a map itself, the
+    store holds none for this checkpoint, or the file is not the one its manifest (<path>.json) describes."""
+    if args.speculative_token_map:
+        return None
+    path, sha, recorded = store_token_map(args.model_path)
+    if sha is None:
         return None
     if recorded != sha:
         logger.warning(f"--preset {PRESET}: {path} is not the map its manifest describes (sha256 {sha[:12]}, recorded {str(recorded)[:12]}): not timed")

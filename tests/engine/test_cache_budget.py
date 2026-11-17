@@ -1130,6 +1130,88 @@ def test_preset_single_fast_serves_as_single_where_its_captures_do_not_fit(decod
     assert typed.prefill_graph_chunks == "1-64,128-384:64" and typed.prefill_graph_tokens == 448
 
 
+def test_preset_serves_the_stores_draft_token_map_only_where_every_expert_is_resident(decode_rows, monkeypatch):
+    import hashlib
+
+    from freetoken.moe import calibrate
+
+    engine = decode_rows.engine
+    monkeypatch.setattr(engine, "resolve_pool_class", lambda model: SimpleNamespace(kv_cost=lambda config: (16_000, 500, 16, 0)))
+    monkeypatch.setattr(engine, "state_pool_bytes", lambda config: 300)
+    monkeypatch.setattr(engine, "_prefill_working_bytes", lambda config: (8192, 7000))
+    monkeypatch.setattr(engine, "_spec_runner", lambda: SimpleNamespace(budget=lambda config: (0, 0)))
+    checked = []
+
+    def adjust_spec(config, override, windowed_kv):
+        checked.append((config.speculative_num_steps, config.speculative_token_map))
+        if config.speculative_token_map and "refused" in config.speculative_token_map:
+            raise ValueError("--speculative-token-map needs an LM head with its own weights")
+        override("spec_slot_states", ("draft state", config.speculative_num_steps))
+
+    monkeypatch.setattr(engine, "_adjust_spec_config", adjust_spec)
+    lines = []
+    monkeypatch.setattr(engine.logger, "info_rank0", lines.append)
+    drafts = ("speculative_algorithm", "speculative_num_steps")
+    partial = 100 + 8192 * 1000 + 500 + 300 + 7000 - 1  # one byte short of every expert resident
+    last = [None]
+
+    def resolved(free=1 << 40, preset="single", fields=("moe_strategy", *drafts), **flags):
+        lines.clear()
+        monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: free)
+        flags = {"speculative_algorithm": "mtp", "speculative_num_steps": 3, "memory_ratio": 1.0, **flags}
+        last[0] = config = _resolved(decode_rows, preset=preset, preset_fields=fields, max_seq_len_override=40960, **flags)
+        said = [line for line in lines if line.startswith(f"--preset {preset} with every expert resident")]
+        assert len(said) <= 1
+        return (config.moe_strategy, config.speculative_num_steps, config.speculative_token_map), (said or [""])[0]
+
+    # no map in the store: the preset's 3 drafts, without one
+    served, said = resolved()
+    assert served == ("fused", 3, None) and "3 MTP draft tokens without a draft token map: the store holds none" in said
+    path = calibrate.token_map_path(str(decode_rows.model))
+    os.makedirs(os.path.dirname(path))
+    with open(path, "wb") as f:
+        f.write(b"\x00\x00\x00\x00\x01\x00\x00\x00")
+    sha = hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+    def manifest(**fields):
+        with open(path + ".json", "w") as f:
+            json.dump(fields, f)
+
+    manifest(map_sha256=sha)
+    served, said = resolved()
+    assert served == ("fused", 5, path) and said == f"--preset single with every expert resident: 5 MTP draft tokens with the store's draft token map {path} (sha256 {sha[:12]}, as its manifest records)"
+    # checked as a typed map is, and the setup's key is the one that runs
+    assert checked[-1] == (5, path) and "|spec=mtp:5|" in last[0].moe_decode_key and last[0].spec_slot_states == ("draft state", 5)
+    # single-fast follows; single-measured is its own calibration's (moe/calibrate.py)
+    assert resolved(preset="single-fast")[0] == ("fused", 5, path)
+    assert resolved(preset="single-measured") == (("fused", 3, None), "")
+    # a file that is not the one its manifest describes, a manifest that records none, a map the checks refuse
+    manifest(map_sha256="0" * 64)
+    served, said = resolved()
+    assert served == ("fused", 3, None) and f"has sha256 {sha[:12]}, its manifest records 000000000000" in said
+    manifest(sha256=sha)  # the store reads "map_sha256" only (scripts/make_token_map.py --install writes it)
+    assert resolved()[0] == ("fused", 3, None)
+    manifest(map_sha256=sha)
+    monkeypatch.setattr(calibrate, "token_map_path", lambda model_path: path + ".refused")
+    with open(path + ".refused", "wb") as f:
+        f.write(open(path, "rb").read())
+    with open(path + ".refused.json", "w") as f:
+        json.dump({"map_sha256": sha}, f)
+    served, said = resolved()
+    assert served == ("fused", 3, None) and "is refused (--speculative-token-map needs an LM head" in said
+    assert last[0].spec_slot_states == ("draft state", 3) and "|spec=mtp:3|" in last[0].moe_decode_key
+    monkeypatch.setattr(calibrate, "token_map_path", lambda model_path: path)
+    # drafts from the command line are served as typed
+    served, said = resolved(fields=("moe_strategy", "speculative_algorithm"), speculative_num_steps=4)
+    assert served == ("fused", 4, None) and said.endswith("4 mtp draft tokens as --speculative-num-steps set them")
+    assert resolved(fields=("moe_strategy",))[0] == ("fused", 3, None)
+    assert resolved(speculative_token_map="/maps/typed.bin")[0] == ("fused", 3, "/maps/typed.bin")
+    assert resolved(fields=("moe_strategy",), speculative_algorithm=None, speculative_num_steps=0) == (("fused", 0, None), "")
+    # a partial expert cache changes nothing, and neither does a typed fused: a calibration candidate's server has one
+    assert resolved(free=partial) == (("offload", 3, None), "")
+    assert resolved(fields=drafts, moe_strategy="fused") == (("fused", 3, None), "")
+
+
 def test_preset_keeps_its_drafts_only_where_the_offload_cache_holds_a_fifth_of_the_experts(monkeypatch):
     from freetoken.engine import engine as eng
     from freetoken.engine.engine import PRESET_DRAFT_SHARE, PRESET_NO_DRAFTS, Engine
@@ -1679,6 +1761,22 @@ def test_token_map_builder_refuses_benchmark_text_and_records_what_it_counted(tm
     stored = calibrate.token_map_path(str(model))
     assert calibrate.stored_token_map(args) == (stored, hashlib.sha256(Path(stored).read_bytes()).hexdigest())
     assert Path(stored).parent == tmp_path / "store" / "token_maps"
+    # --install copies a map built elsewhere, whose manifest may record its sha256 as "sha256", and writes the key the store reads
+    built = tmp_path / "built.bin"
+    built.write_bytes(np.arange(5, dtype="<i4").tobytes())
+    sha = hashlib.sha256(built.read_bytes()).hexdigest()
+    for fields in ({"map": "built.bin", "sha256": sha, "size": 5}, {"map": "built.bin", "map_sha256": sha}):
+        Path(str(built) + ".json").write_text(json.dumps(fields))
+        assert tool.main([str(model), "--install", str(built)]) == 0
+        assert Path(stored).read_bytes() == built.read_bytes() and calibrate.stored_token_map(args) == (stored, sha)
+        assert json.loads(Path(stored + ".json").read_text())["map_sha256"] == sha
+    # a file that is not the one its manifest records, or a manifest that records none, is not installed
+    for ids, fields in ((6, {"sha256": sha}), (5, {"map_sha256": sha, "sha256": "0" * 64}), (5, {"size": 5})):
+        built.write_bytes(np.arange(ids, dtype="<i4").tobytes())
+        Path(str(built) + ".json").write_text(json.dumps(fields))
+        with pytest.raises(SystemExit):
+            tool.main([str(model), "--install", str(built)])
+        assert calibrate.stored_token_map(args) == (stored, sha)
 
 
 def test_a_request_and_a_server_end_at_their_deadline_whatever_the_server_does():

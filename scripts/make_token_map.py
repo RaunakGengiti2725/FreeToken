@@ -2,6 +2,7 @@
 
     python scripts/make_token_map.py MODEL [--strategy low-id|topk] [--text FILE ...] [--answers FILE.jsonl ...]
         [--corpus DIR ...] [--size 106496] [-o token_map.bin | --store]
+    python scripts/make_token_map.py MODEL --install MAP
 
 MODEL is the target checkpoint, an HF directory or a GGUF file. Only its tokenizer is read, so every model that shares the tokenizer can use the same file.
 The file holds all special tokens plus the strategy's first ids, --size ids in all, as little-endian int32.
@@ -22,7 +23,7 @@ No benchmark's text may shape the map: a map built from a test set's own tokens 
 - content: it names a test set (BENCHMARK_TEXT: GSM8K, AIME, MMLU, Hendrycks, competition_math, MATH-500, HumanEval, MBPP, SWE-bench, GPQA, HellaSwag, TruthfulQA), or has a line that is GSM8K's answer mark ("#### 42").
 A --text or --answers file that is refused ends the run with an error. Under --corpus a refused file is left out and listed. The check reads names and text only: it cannot tell a copy of a test set that carries no such mark.
 
-<out>.json is written beside the map: its sha256, size and strategy, every file that was counted (path, role, bytes, sha256, tokens), one sha256 over those, the files refused and why, and the checks above. --store writes the map where `ft serve --preset single-measured` looks for this checkpoint's map and times it as a candidate.
+<out>.json is written beside the map: its sha256, size and strategy, every file that was counted (path, role, bytes, sha256, tokens), one sha256 over those, the files refused and why, and the checks above. --store writes the map where `ft serve --preset single-measured` looks for this checkpoint's map and times it as a candidate, and where `--preset single` and `single-fast` serve it when every expert is resident. --install MAP copies a map built before and its MAP.json there, if the sha256 its manifest records is the file's, and prints where it went.
 """
 
 from __future__ import annotations
@@ -95,6 +96,35 @@ def answers_text(raw: str, path: str) -> str:
     return "\n".join(out)
 
 
+def install(p: argparse.ArgumentParser, model: str, src: str) -> int:
+    """Copy the map ``src`` and its manifest into the store for ``model``, where the sha256 the manifest records
+    ("map_sha256", or "sha256" in manifests written by other tools) is the file's. The manifest is written with
+    "map_sha256", the key the store is read by."""
+    from freetoken.moe.calibrate import token_map_path
+
+    try:
+        with open(src, "rb") as f:
+            data = f.read()
+        with open(src + ".json") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError) as exc:
+        p.error(f"--install {src}: {exc}")
+    if not isinstance(manifest, dict):
+        p.error(f"--install {src}: {src}.json is not a JSON object")
+    sha = hashlib.sha256(data).hexdigest()
+    recorded = {manifest[k] for k in ("map_sha256", "sha256") if k in manifest}
+    if recorded != {sha}:
+        p.error(f"--install {src}: the file's sha256 is {sha}, its manifest records {', '.join(map(str, sorted(recorded, key=str))) or 'none'}; nothing installed")
+    out = token_map_path(model)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "wb") as f:
+        f.write(data)
+    with open(out + ".json", "w") as f:
+        json.dump({**manifest, "map_sha256": sha, "installed_from": os.path.abspath(src)}, f, indent=1)
+    print(out)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("model", help="target checkpoint: an HF directory or a GGUF file")
@@ -105,7 +135,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--size", type=int, default=106496, help="ids in the file, special tokens included (default: 106496, a multiple of 128 so the draft head needs no padding rows)")
     p.add_argument("-o", "--out", default="token_map.bin", help="output file (default: token_map.bin)")
     p.add_argument("--store", action="store_true", help="write the map where `ft serve --preset single-measured` looks for this checkpoint's map, instead of --out")
+    p.add_argument("--install", metavar="MAP", help="copy a map built before, and its MAP.json manifest, where --store writes them; nothing is counted")
     args = p.parse_args(argv)
+    if args.install:
+        if args.text or args.answers or args.corpus:
+            p.error("--install copies a map built before: --text, --answers and --corpus count nothing there")
+        return install(p, args.model, args.install)
     if args.strategy == "topk" and not (args.text or args.answers or args.corpus):
         p.error("--strategy topk needs --text, --answers or --corpus")
 
