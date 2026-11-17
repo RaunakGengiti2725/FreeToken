@@ -525,9 +525,12 @@ class Scheduler(SchedulerIOMixin):
                 # the first tokens go out before the draft's prompt pass; its pages are still the request's own
                 self._stamp_usage(reply)
                 self.send_result(reply)
-                draft_prefill()
-                for action in held:
-                    action()
+                try:
+                    draft_prefill()
+                finally:
+                    # the frees and inserts run even when the pass raises
+                    for action in held:
+                        action()
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
