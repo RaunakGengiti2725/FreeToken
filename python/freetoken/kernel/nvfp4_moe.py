@@ -51,10 +51,32 @@ _DECODE_MARLIN_DEEPK_UNROLL = 2
 _DECODE_MARLIN_DEEPK_THRESHOLD = 2048
 
 # Rows of a batched decode step often route to the same expert. The grouped kernel reads such an expert's weights once
-# for up to _DECODE_GROUP_ROWS of its routes; FREETOKEN_NVFP4_DECODE_GROUPED=0 keeps one read per route, to A/B.
+# for up to _DECODE_GROUP_ROWS of its routes. Its program is the heavier one, so it runs only from a row count on:
+# FREETOKEN_NVFP4_DECODE_GROUPED is that count, 0 for never and 1 for every step of more than one row.
 DECODE_GROUPED_ENV = "FREETOKEN_NVFP4_DECODE_GROUPED"
-_DECODE_GROUPED = os.environ.get(DECODE_GROUPED_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
+# measured on one RTX 5090 with 4 rows a request: ahead at 32 rows, behind at 4 to 16; not measured between
+_DECODE_GROUPED_DEFAULT_ROWS = 24
 _DECODE_GROUP_ROWS = 4
+
+
+def decode_grouped_rows(value: str | None) -> int:
+    """The rows of a decode step from which it takes the grouped kernel, as FREETOKEN_NVFP4_DECODE_GROUPED gives them; 0 = never."""
+    text = (value or "").strip().lower()
+    if not text:
+        return _DECODE_GROUPED_DEFAULT_ROWS
+    if text in ("false", "no", "off", "true", "yes", "on"):
+        return int(text in ("true", "yes", "on"))
+    if not text.isdigit():
+        raise ValueError(f"{DECODE_GROUPED_ENV}={value!r} is not a row count (0 = never, 1 = every step of more than one row)")
+    return int(text)
+
+
+_DECODE_GROUPED_ROWS = decode_grouped_rows(os.environ.get(DECODE_GROUPED_ENV))
+
+
+def decode_takes_grouped(rows: int) -> bool:
+    """Whether a decode step of ``rows`` rows runs the grouped kernel. One row's routes are its top-k, with nothing to share."""
+    return rows > 1 and 0 < _DECODE_GROUPED_ROWS <= rows
 
 # FREETOKEN_NVFP4_DECODE_DISTINCT=1 counts the distinct experts of every decode layer call per row count, on the device
 # so that graph replays count too, and logs the means at exit. Debug only: it adds launches to each layer.
@@ -154,8 +176,8 @@ def decode_gemm_marlin(
     (:func:`_decode_nvfp4_marlin_kernel`). ``packed`` is the uint8 ``[S, N, K//2]`` bank;
     it is reinterpreted as int32 ``[S, N, K//8]`` (contiguous, K%8==0 for NVFP4).
 
-    ``grouped`` picks :func:`_decode_nvfp4_marlin_grouped_kernel`, which gives the same bits; unset, it follows
-    FREETOKEN_NVFP4_DECODE_GROUPED for more than one row. One row's routes are its top-k, with nothing to share."""
+    ``grouped`` picks :func:`_decode_nvfp4_marlin_grouped_kernel`, which gives the same bits; unset, the row count
+    decides (:func:`decode_takes_grouped`)."""
     M, top_k = topk_ids.shape
     N = packed.shape[1]
     K = packed.shape[2] * 2
@@ -172,7 +194,7 @@ def decode_gemm_marlin(
         and a.stride(1) == 1 and a.stride(0) % 8 == 0 and a.data_ptr() % 16 == 0
     )
     if grouped is None:
-        grouped = _DECODE_GROUPED and M > 1
+        grouped = decode_takes_grouped(M)
     kernel, group = _decode_nvfp4_marlin_kernel, {}
     if grouped:
         kernel = _decode_nvfp4_marlin_grouped_kernel

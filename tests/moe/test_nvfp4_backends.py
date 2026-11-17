@@ -911,10 +911,27 @@ def test_triton_decode_grouped_kernel_gives_the_per_route_bits(monkeypatch, rows
     if dtype != torch.bfloat16:
         return
     layer = []
-    for grouped in (False, True):
-        monkeypatch.setattr(nvfp4_moe, "_DECODE_GROUPED", grouped)
+    for from_rows in (0, 1):
+        monkeypatch.setattr(nvfp4_moe, "_DECODE_GROUPED_ROWS", from_rows)
         layer.append(fused_nvfp4.fused_experts_decode_nvfp4_marlin(x, *gate_up, *down, weights, ids, "silu", False))
     assert torch.equal(bits(layer[0]), bits(layer[1]))
+
+
+def test_decode_grouped_kernel_runs_from_a_row_count_on(monkeypatch):
+    """The grouped kernel is the slower one for the 4 to 6 rows of one request with drafts: by default a step takes it
+    from 24 rows, and FREETOKEN_NVFP4_DECODE_GROUPED names another count, 0 for never, 1 for every step that can share."""
+    from freetoken.kernel import nvfp4_moe
+
+    takes = nvfp4_moe.decode_takes_grouped
+    assert nvfp4_moe.decode_grouped_rows(None) == nvfp4_moe.decode_grouped_rows(" ") == 24
+    monkeypatch.setattr(nvfp4_moe, "_DECODE_GROUPED_ROWS", 24)
+    assert [rows for rows in (1, 4, 6, 16, 23, 24, 32, 64) if takes(rows)] == [24, 32, 64]
+    for value, rows, grouped in (("0", 0, []), ("off", 0, []), ("1", 1, [2, 4]), ("on", 1, [2, 4]), ("3", 3, [4])):
+        assert nvfp4_moe.decode_grouped_rows(value) == rows
+        monkeypatch.setattr(nvfp4_moe, "_DECODE_GROUPED_ROWS", nvfp4_moe.decode_grouped_rows(value))
+        assert [n for n in (1, 2, 4) if takes(n)] == grouped
+    with pytest.raises(ValueError, match="FREETOKEN_NVFP4_DECODE_GROUPED"):
+        nvfp4_moe.decode_grouped_rows("many")
 
 
 @cuda
