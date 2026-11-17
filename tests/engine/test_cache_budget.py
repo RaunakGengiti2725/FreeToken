@@ -1318,6 +1318,43 @@ def test_preset_keeps_its_drafts_only_where_the_offload_cache_holds_a_fifth_of_t
     assert not served(free=at_share - 1) and served(slots=512)
 
 
+@pytest.mark.parametrize("level, free_gib", [("full card", 32), ("12 GiB", 12), ("8 GiB", 8)])
+def test_preset_kv_reserve_goes_to_its_floor_where_the_plan_holds_under_a_fifth_of_the_experts(monkeypatch, level, free_gib):
+    from freetoken.engine import engine as eng
+    from freetoken.engine.cache_budget import resolve_moe_cache_auto
+    from freetoken.engine.engine import PRESET_SMALL_PLAN_SHARE, Engine
+
+    assert PRESET_SMALL_PLAN_SHARE == 0.20
+    monkeypatch.setattr(eng, "_prefill_working_bytes", lambda config: (8192, 1 << 20))
+    lines = []
+    monkeypatch.setattr(eng.logger, "info_rank0", lines.append)
+    # Qwen3.6-35B-A3B's sizes: 10240 experts of 1.78 MB, 20 KB of KV a token
+    slot, weights, page = 1_780_000, int(4.44 * 2**30), 16 * 20_000
+
+    def settled(free, running=1, ratio=0.95, fields=("kv_reserve_tokens",)):
+        config = SimpleNamespace(max_running_req=running, kv_reserve_tokens=36864, max_seq_len=262144, preset="single", preset_fields=fields)
+        engine = Engine.__new__(Engine)
+        engine._auto_cache_terms = lambda config, banks, method=None, max_slots=None: dict(
+            baseline_free=free, weights_bytes=weights, memory_ratio=ratio, cache_per_page=page, fixed_cache_size=0, per_expert_bytes=slot,
+            num_experts=256, total_experts=10240, prefill_overlap=True, kv_reserve_tokens=config.kv_reserve_tokens, page_size=16,
+        )
+        before = resolve_moe_cache_auto(**engine._auto_cache_terms(config, None))[0]
+        engine._settle_preset_small_plan_reserve(config, None, None, None)
+        return config.kv_reserve_tokens, resolve_moe_cache_auto(**engine._auto_cache_terms(config, None))[0] - before, config.preset_fields
+
+    reserve, gained, fields = settled(free_gib << 30)
+    if level == "8 GiB":
+        # a chunk of 8192 tokens and 1024 of answer; about 310 slots more
+        assert reserve == 9216 and 300 < gained < 320 and fields == ("kv_reserve_tokens",)
+        assert any("the KV reserve is 9216 tokens, not 36864" in line and "under 20%" in line for line in lines)
+    else:
+        assert (reserve, gained) == (36864, 0) and not lines
+    # several running requests keep theirs; at a fifth of the experts exactly the reserve stays, one slot less and it goes
+    assert settled(free_gib << 30, running=2)[0] == 36864
+    at_share = weights + 2048 * slot + (36864 // 16) * page
+    assert settled(at_share, ratio=1.0)[0] == 36864 and settled(at_share - 1, ratio=1.0)[0] == 9216
+
+
 def test_preset_plan_takes_the_staging_slots_only_where_every_expert_and_the_kv_reserve_still_fit():
     from freetoken.engine.cache_budget import plan_resident_staging
 

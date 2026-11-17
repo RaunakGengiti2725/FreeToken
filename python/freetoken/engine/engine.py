@@ -275,6 +275,9 @@ PRESET_CHUNK_ANSWER_TOKENS = 1024
 PRESET_DRAFT_SHARE = 0.20
 # the log line of a start that drops them; moe/calibrate.py reads it from the server of its static candidate
 PRESET_NO_DRAFTS = "serving without the preset's draft tokens"
+# a one-request preset's KV reserve is at its floor where the plan holds under this share of the experts. At 8 GiB free
+# the preset held 701 of 10240 slots, and a server without it about twice that; the share is the drafts' own
+PRESET_SMALL_PLAN_SHARE = PRESET_DRAFT_SHARE
 
 
 def _drop_preset_demand(config, reason: str) -> None:
@@ -1299,6 +1302,36 @@ class Engine:
             f"where a longer prompt and answer end with finish_reason length. {more}"
         )
 
+    def _settle_preset_small_plan_reserve(self, config: EngineConfig, banks, method, max_slots) -> None:
+        """A one-request preset's KV reserve goes down to its floor, a prefill chunk and PRESET_CHUNK_ANSWER_TOKENS of
+        answer (never under the default), where the plan at the reserve settled so far holds under
+        PRESET_SMALL_PLAN_SHARE of all experts: there every slot the reserve's pages take is a miss more on each decode
+        step. One log line says so; a longer prompt and answer then end with finish_reason length."""
+        from freetoken.engine.cache_budget import _plan_or_short
+
+        if config.max_running_req != 1:
+            return
+        terms = self._auto_cache_terms(config, banks, method, max_slots)
+        plan, _ = _plan_or_short(terms)
+        total = terms["total_experts"]
+        if plan is None or plan[0] >= PRESET_SMALL_PLAN_SHARE * total:
+            return
+        page, default = terms["page_size"], EngineConfig.kv_reserve_tokens
+        chunk = _prefill_working_bytes(config)[0]
+        floor = max(default, min(_preset_kv_target(config), align_ceil(chunk + PRESET_CHUNK_ANSWER_TOKENS, page)))
+        if floor >= config.kv_reserve_tokens:
+            return
+        asked = config.kv_reserve_tokens
+        object.__setattr__(config, "kv_reserve_tokens", floor)
+        if floor <= default:
+            _drop_preset_fields(config, "kv_reserve_tokens")
+        after, _ = _plan_or_short(self._auto_cache_terms(config, banks, method, max_slots))
+        logger.info_rank0(
+            f"--preset {config.preset}: the KV reserve is {floor} tokens, not {asked}: at {asked} the plan holds {plan[0]} of "
+            f"{total} experts, under {PRESET_SMALL_PLAN_SHARE:.0%}" + (f", and at {floor} {after[0]}" if after is not None else "")
+            + ". A longer prompt and answer end with finish_reason length"
+        )
+
     def _prefill_tokens_within(self, config: EngineConfig, room: int) -> int:
         """The longest prefill chunk whose working memory (_prefill_working_bytes) is at most ``room`` bytes."""
         probe = copy.copy(config)
@@ -1544,6 +1577,8 @@ class Engine:
             self._settle_preset_captures(config, banks, method, size_cap, spare)
             if "kv_reserve_tokens" in config.preset_fields:
                 self._settle_preset_kv_reserve(config, banks, method, size_cap)
+            if "kv_reserve_tokens" in config.preset_fields:
+                self._settle_preset_small_plan_reserve(config, banks, method, size_cap)
             self._settle_preset_chunk_reserve(config, banks, method, size_cap)
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
             if spare:
