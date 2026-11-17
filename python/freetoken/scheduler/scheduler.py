@@ -61,10 +61,13 @@ _WARM_TEXT = "The quick brown fox jumps over the lazy dog, and then it runs back
 
 
 def warm_lengths(points: Iterable[int], limit: int) -> List[int]:
-    """Prompt lengths of the first-request warmup: one past each token count ``points`` where a prefill kernel takes
-    another compiled variant, at most ``limit``. Each is odd: Triton compiles an integer argument that is a multiple
-    of 16 apart from one that is not, and most prompts are not."""
-    return sorted({p + 1 if p % 2 == 0 else p for p in points if 2 <= p + 1 <= limit})
+    """Prompt lengths of the first-request warmup, at most ``limit``: past each token count ``points`` where a prefill
+    kernel takes another compiled variant, the next odd count and the next multiple of 16. Triton compiles an integer
+    argument that is a multiple of 16 apart from one that is not, and prompts come as both."""
+    lengths = set()
+    for p in points:
+        lengths |= {p + 1 if p % 2 == 0 else p + 2, (p // 16 + 1) * 16}
+    return sorted(n for n in lengths if 2 <= n <= limit)
 
 
 def _warm_points(model_config, device: torch.device) -> List[int]:
