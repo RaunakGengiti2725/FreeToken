@@ -372,6 +372,10 @@ class OffloadMoeCache:
         # of buffer b's layer that wait_prefill_layer copies once their routes are known.
         self._prefill_routed_copy = False
         self._prefill_miss_pending: list = [None, None]
+        # The experts the first layer of the chunk routes to (choose_prefill_path; 0 = not counted) and, per layer, how
+        # many experts it routed to against the first layer in the last chunk that counted them on the host
+        self._prefill_first_routed = 0
+        self._prefill_breadth = [1.0] * self.num_layers
         # Empty slots outside the staging buffers at the chunk's start, per pool (pool-local), and per buffer
         # the absent experts its layer streams: wait_prefill_layer keeps those in the empty slots.
         self._prefill_id_snapshot: torch.Tensor | None = None
@@ -953,6 +957,7 @@ class OffloadMoeCache:
     def begin_prefill(self, num_routes: int | None = None, num_tokens: int | None = None) -> None:
         """Start a prefill chunk of ``num_tokens`` tokens; ``num_routes`` is its tokens times the routes of each."""
         self._prefill_routed_copy = False
+        self._prefill_first_routed = 0
         if not self.prefill_overlap or self.all_resident:
             return
         self._prefill_buffer_layer = [None, None]
@@ -1011,30 +1016,43 @@ class OffloadMoeCache:
         # a stream into a pool with empty slots also fills them (_keep_streamed_experts), which later chunks read
         if any(free.size for free in self._prefill_free_slots):
             return
-        if self._prefill_routed_copy:
-            # the stream copies only the routed misses, at the copy engines' rate, and keeps the residency as it was
-            return
-        self.prefill_chunk_demand = self._demand_copies_less(layer_id, routed_ids.reshape(-1).unique().cpu().numpy())
+        routed = routed_ids.reshape(-1).unique().cpu().numpy()
+        self._prefill_first_routed = routed.size
+        self.prefill_chunk_demand = self._demand_copies_less(layer_id, routed)
 
     def _demand_copies_less(self, layer_id: int, routed) -> bool:
         """Whether loading a chunk on demand is estimated to copy fewer bytes than streaming it, from begin_prefill's
-        snapshot. The stream copies every expert outside the hit slots. On demand a layer copies the experts it routes
-        to that have no slot: counted for ``layer_id``, whose routes ``routed`` are known, and taken for every other
-        layer as the same share of its absent experts, at most as many experts as this layer routes to. An expert
-        admitted beyond a pool's empty slots evicts one, counted as one more copy: a later layer of the chunk or the
-        next decode step loads it again."""
-        absent = self._prefill_snapshot_np < 0
+        snapshot. The stream copies every expert outside the hit slots, or under the routed copy those of them the
+        layer routes to. On demand a layer copies the experts it routes to that have no slot. Both are counted for
+        ``layer_id``, whose routes ``routed`` are known, and taken for every other layer as the same share of its
+        absent (or not hit) experts times the layer's breadth: how many experts it routes to against ``layer_id``, as
+        the last chunk that brought every layer's routes to the host measured it (1 until then). An expert admitted
+        beyond a pool's empty slots evicts one, counted as one more copy: a later layer of the chunk or the next decode
+        step loads it again."""
+        snap = self._prefill_snapshot_np
+        absent = snap < 0
         ids = self._prefill_id_snapshot.numpy()
-        # one more routed than counted, so that a layer with few absent experts does not promise none elsewhere
-        share = (int(absent[layer_id][routed].sum()) + 1) / (int(absent[layer_id].sum()) + 1)
+
+        def share(of) -> float:
+            # one more routed than counted, so that a layer with few such experts does not promise none elsewhere
+            return (int(of[layer_id][routed].sum()) + 1) / (int(of[layer_id].sum()) + 1)
+
         demand = stream = 0.0
         for p, (base, size, stable) in enumerate(zip(self.pool_bases, self.pool_sizes, self._pool_stable_from)):
             layers = [l for l in range(self.num_layers) if self.pool_of_layer[l] == p]
             per_expert = sum(self._row_bytes[self._pool_layout(p)])
-            copies = sum(min(float(routed.size), share * int(absent[l].sum())) for l in layers)
+            missed = snap < stable
+            share_absent, share_missed = share(absent), share(missed)
+            copies = streamed = 0.0
+            for l in layers:
+                breadth = self._prefill_breadth[l]
+                reach = min(float(self.num_experts), routed.size * breadth)
+                copies += min(reach, min(1.0, share_absent * breadth) * int(absent[l].sum()))
+                missed_l = int(missed[l].sum())
+                streamed += min(reach, min(1.0, share_missed * breadth) * missed_l) if self._prefill_routed_copy else missed_l
             empty = int((ids[base : base + size] < 0).sum())
             demand += (copies + max(copies - empty, 0.0)) * per_expert
-            stream += int((self._prefill_snapshot_np[layers] < stable).sum()) * per_expert
+            stream += streamed * per_expert
         return demand < stream
 
     def _snapshot_all_resident(self, ids) -> bool:
@@ -1253,7 +1271,10 @@ class OffloadMoeCache:
         if misses is not None:
             if routed is not None:
                 # one host sync a layer: the batch memcpy takes host pointers
-                misses = routed_misses(misses, routed.cpu().numpy())
+                mask = routed.cpu().numpy()
+                misses = routed_misses(misses, mask)
+                if self._prefill_first_routed:
+                    self._prefill_breadth[layer_id] = int(mask.sum()) / self._prefill_first_routed
             with torch.cuda.stream(self.prefill_copy_stream):
                 self._stage_copy(layer_id, buffer_id, misses, small=False, large=True)
                 self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)

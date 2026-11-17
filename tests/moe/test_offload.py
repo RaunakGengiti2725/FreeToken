@@ -269,6 +269,7 @@ def test_offload_moe_cache_loads_a_longer_chunk_on_demand_where_that_copies_less
         cache._prefill_snapshot_np, cache._prefill_id_snapshot = slots.numpy(), ids
         cache._prefill_free_slots = [np.nonzero(ids.numpy()[16:] < 0)[0] + 16]
         cache._prefill_hit_d2d_active, cache.all_resident, cache.prefill_demand_by_misses = True, False, True
+        cache._prefill_routed_copy, cache._prefill_breadth = False, [1.0] * L
         for name, value in state.items():
             setattr(cache, name, value)
         cache.choose_prefill_path(0, torch.tensor([routes], dtype=torch.int32))
@@ -287,6 +288,12 @@ def test_offload_moe_cache_loads_a_longer_chunk_on_demand_where_that_copies_less
     staged = full.clone()
     staged[2], staged[3] = torch.arange(0, 8, dtype=torch.int32), torch.arange(8, 16, dtype=torch.int32)
     assert chosen(list(range(E)), staged)
+    # a layer that routes to half as many experts as the first copies half as many on demand: 4 + 4 + 3.5 + 3.5
+    assert chosen([1, 2, 3, 4, 5, 6, 7], _prefill_breadth=[1.0, 1.0, 0.5, 0.5])
+    # under the routed copy the stream copies the routed experts outside the hit slots, as many as demand copies
+    # here, and wins the tie; with experts in staging slots it copies those too: 4 + 4 + 8 + 8 against 4 + 4 and 8 evictions
+    assert not chosen([0, 1, 4, 4], _prefill_routed_copy=True)
+    assert chosen(list(range(E)), staged, _prefill_routed_copy=True)
     # an empty hit slot: the stream fills it for the chunks that follow
     holed = full.clone()
     holed[1, 3] = -1
