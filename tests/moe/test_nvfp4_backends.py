@@ -984,3 +984,69 @@ def test_b12x_pack_keeps_per_layer_banks_and_flat_alphas():
     assert len(cache.bank_sources["gate_up"]) == L
     assert sum(t.shape[0] for t in cache.bank_sources["gate_up"]) == total
     assert cache.gate_up_alpha.shape == (total,)
+
+
+@cuda
+@pytest.mark.parametrize("fmt", ["bf16", "nvfp4"])
+def test_prefill_routed_copy_gemm_reads_no_unrouted_staging_row(monkeypatch, fmt):
+    """Under the routed copy a staging buffer's unrouted rows keep whatever they held, here NaN in every byte (0xFF:
+    NaN in bf16, e4m3 and fp32). The prefill GEMM over the routed copy's buffer must equal, bit for bit, the GEMM
+    over the stream's, which writes every row: no route reads an unrouted row, with or without weight. The hit
+    slots hold two routed and two unrouted experts of each layer; the packed banks count as big, the scales small."""
+    from freetoken.moe import offload_cache
+    from freetoken.moe.fused import fused_experts_impl
+    from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setattr(offload_cache, "_SMALL_BANK_FEAT_BYTES", 8192)
+    device = torch.device("cuda")
+    if fmt == "nvfp4":
+        sources, kwargs = _make_native_sources(device, seed=11), {"quant_format": "nvfp4"}
+    else:
+        g = torch.Generator().manual_seed(11)
+        sources = {
+            "gate_up": [(torch.randn(E, 2 * I, H, generator=g) / 8).to(torch.bfloat16).pin_memory() for _ in range(L)],
+            "down": [(torch.randn(E, H, I, generator=g) / 8).to(torch.bfloat16).pin_memory() for _ in range(L)],
+        }
+        kwargs = {}
+    torch.manual_seed(12)
+    M = 6
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    topk_ids = _skewed_routes(M, device=device)  # never 1, 3 or 4
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+
+    def run(routed_copy_tokens):
+        cache = OffloadMoeCache(
+            num_layers=L, num_experts=E, cache_size=2 * E + 4 * L, device=device, prefill_overlap=True, prefill_hit_d2d=True, **kwargs
+        )
+        cache.set_bank_sources({name: sources[name] for name in cache.bank_schema})
+        cache.prefill_routed_copy_tokens = routed_copy_tokens
+        # every hit slot full: experts 0 and 6 (routed), 1 and 3 (not) of each layer
+        for layer in range(L):
+            for k, e in enumerate((0, 6, 1, 3)):
+                slot = 2 * E + 4 * layer + k
+                cache.slot_for_id[layer, e] = slot
+                cache.id_of_slot[slot] = layer * E + e
+                for name, per_layer in sources.items():
+                    cache.bank_caches[name][slot].copy_(per_layer[layer][e])
+        for (_, bank), stage in zip(cache.banks, cache._stage_bytes):
+            bank.view(-1).view(torch.uint8)[: 2 * stage].fill_(0xFF)
+        cache.begin_prefill(num_routes=topk_ids.numel(), num_tokens=M)
+        assert cache._prefill_routed_copy == bool(routed_copy_tokens)
+        outs = []
+        for layer in range(L):
+            cache.prefetch_prefill_layer(layer)
+            cache.prefetch_prefill_layer(layer + 1)
+            views = cache.wait_prefill_layer(layer, topk_ids)
+            if fmt == "nvfp4":
+                out = fused_experts_nvfp4(hidden.clone(), *views, topk_weights, topk_ids.clone(), E, "silu", False)
+            else:
+                out = fused_experts_impl(hidden.clone(), *views, topk_weights, topk_ids.clone(), "silu", False)
+            outs.append(out.clone())
+            cache.release_prefill_layer(layer)
+        torch.cuda.synchronize()
+        return outs
+
+    for layer, (by_stream, by_routes) in enumerate(zip(run(0), run(64))):
+        assert torch.isfinite(by_stream).all(), layer
+        assert torch.equal(by_routes, by_stream), layer
