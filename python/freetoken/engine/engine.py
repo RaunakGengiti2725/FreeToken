@@ -2891,10 +2891,11 @@ def _cpu_pool_threads(config) -> int:
 def _preset_without_row(config, reason: str) -> tuple[str, None] | None:
     """('hybrid', None) for a one-request preset that left the strategy to it, where no decode row answers for this
     setup (``reason``) and the CPU MoE pool has PRESET_HYBRID_THREADS threads or more; None elsewhere. A row that was
-    measured still decides, and a typed --moe-strategy, --moe-cpu-layers or running-request count is left alone. So are
+    measured still decides, and a typed --moe-strategy, --moe-cpu-layers or running-request count (1 included) is left alone. So are
     the typed flags hybrid cannot serve: --reproducible-seeds (every expert on the GPU) and --moe-prefill-demand-tokens
     (a GPU-decoded cache)."""
-    if "moe_strategy" not in getattr(config, "preset_fields", ()) or config.max_running_req != 1 or config.moe_cpu_layers:
+    fields = getattr(config, "preset_fields", ())
+    if "moe_strategy" not in fields or "max_running_req" not in fields or config.max_running_req != 1 or config.moe_cpu_layers:
         return None
     if getattr(config, "reproducible_seeds", False):
         return None

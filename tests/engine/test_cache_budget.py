@@ -1307,6 +1307,7 @@ def test_preset_serves_hybrid_on_a_partial_cache_without_a_decode_row_where_the_
     assert served(threads=PRESET_HYBRID_THREADS - 1) == ("fused" if resident else "offload")
     assert served(fields=("max_running_req",), moe_strategy="offload") == "offload"
     assert served(fields=("moe_strategy",), max_running_req=2) == ("fused" if resident else "offload")
+    assert served(fields=("moe_strategy",), max_running_req=1) == ("fused" if resident else "offload")  # typed, as the preset's
     assert resident or served(moe_cpu_layers="2") == "offload"  # CPU layers are never resident (_preset_resident_need)
     # typed flags hybrid cannot serve: seeded text that must not follow the cache, and a typed demand length (GPU decode)
     assert served(reproducible_seeds=True) == ("fused" if resident else "offload")
