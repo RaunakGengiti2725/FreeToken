@@ -1448,11 +1448,10 @@ class Engine:
         """A one-request preset's KV reserve goes down to its floor, a prefill chunk and PRESET_CHUNK_ANSWER_TOKENS of
         answer (never under the default), where the plan at the reserve settled so far holds under
         PRESET_SMALL_PLAN_SHARE of all experts: there every slot the reserve's pages take is a miss more on each decode
-        step. One warning says so: a longer prompt is then refused (context_length_exceeded) and a longer answer is cut
-        (finish_reason length). A typed --max-output-tokens, which the reserve was sized for, keeps it."""
+        step. One log line says so; a longer prompt and answer then end with finish_reason length."""
         from freetoken.engine.cache_budget import _plan_or_short
 
-        if config.max_running_req != 1 or getattr(config, "max_output_tokens", None) is not None:
+        if config.max_running_req != 1:
             return
         terms = self._auto_cache_terms(config, banks, method, max_slots)
         plan, _ = _plan_or_short(terms)
@@ -1469,10 +1468,10 @@ class Engine:
         if floor <= default:
             _drop_preset_fields(config, "kv_reserve_tokens")
         after, _ = _plan_or_short(self._auto_cache_terms(config, banks, method, max_slots))
-        logger.warning_rank0(
+        logger.info_rank0(
             f"--preset {config.preset}: the KV reserve is {floor} tokens, not {asked}: at {asked} the plan holds {plan[0]} of "
             f"{total} experts, under {PRESET_SMALL_PLAN_SHARE:.0%}" + (f", and at {floor} {after[0]}" if after is not None else "")
-            + ". A longer prompt and answer end with finish_reason length; --kv-reserve-tokens or --max-output-tokens keeps a larger one"
+            + ". A longer prompt and answer end with finish_reason length"
         )
 
     def _prefill_tokens_within(self, config: EngineConfig, room: int) -> int:
