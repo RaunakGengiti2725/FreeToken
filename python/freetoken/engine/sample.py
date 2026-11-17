@@ -154,8 +154,11 @@ def keyed_draw(probs: torch.Tensor, uniforms: torch.Tensor) -> torch.Tensor:
     return torch.minimum(tokens, last)
 
 
-# A/B switch: FREETOKEN_SEEDED_DRAW=per-row draws each seeded row in a call of its own, as before the batched keyed draw
-_SEEDED_DRAW_PER_ROW = os.getenv("FREETOKEN_SEEDED_DRAW", "batched") == "per-row"
+# A/B switch: FREETOKEN_SEEDED_DRAW=batched draws every seeded row of a step in one pass (keyed_probs, keyed_draw), for
+# its speed. It is not batch-independent on CUDA: a row's top-k / top-p probabilities in a batch of keyed rows are not
+# the bits it gets alone, so a seeded request's text can follow the requests beside it. The default draws each seeded
+# row in a call of its own, which is.
+_SEEDED_DRAW_PER_ROW = os.getenv("FREETOKEN_SEEDED_DRAW", "per-row") != "batched"
 
 
 def sample_impl(
@@ -199,8 +202,9 @@ def sample_rows(
     min_p: torch.Tensor | None,
     keys: list[int | None] | None,
 ) -> torch.Tensor:
-    """sample_impl over the batch; the rows with a key are then drawn again from their keys, all in one pass
-    (keyed_draw), each from the uniform its own key gives."""
+    """sample_impl over the batch; a row with a key is then drawn again from that key, in a call of its own. Under
+    FREETOKEN_SEEDED_DRAW=batched the keyed rows are drawn in one pass instead (keyed_draw), each from the uniform its
+    own key gives; not batch-independent on CUDA (_SEEDED_DRAW_PER_ROW)."""
     tokens = sample_impl(logits, temperatures, top_k, top_p, min_p)
     if not keys:
         return tokens
@@ -208,7 +212,8 @@ def sample_rows(
         for row, key in enumerate(keys):
             if key is None:
                 continue
-            # one row per call: a batched call takes one seed, and flashinfer mixes the row index into it
+            # One row per call: a batched call takes one seed, and flashinfer mixes the row index into it. Alone, a row's
+            # softmax and draw also run the same arithmetic whatever else the step holds.
             one = slice(row, row + 1)
             tokens[one] = sample_impl(
                 logits[one], temperatures[one], None if top_k is None else top_k[one], None if top_p is None else top_p[one],
