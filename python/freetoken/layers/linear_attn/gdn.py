@@ -168,7 +168,8 @@ class GatedDeltaNet(BaseOP):
 
     def _rule_inputs(self, mixed: torch.Tensor, start: int, end: int, dtype: torch.dtype):
         """The chunk rule's q, k and values for rows [start, end) of the conv output ``mixed`` [total, conv_dim]: the
-        values as ``v``, or in the conv's own layout as ``value_rows`` (then ``v`` is None)."""
+        values as ``v``, or in the conv's own layout as ``value_rows`` (then ``v`` is None), all of its columns: the
+        rule reads columns [start, end) of it in place."""
         n = end - start
         # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
         qf, kf, vf = torch.split(mixed[start:end], [self.key_dim, self.key_dim, self.value_dim], dim=-1)
@@ -178,8 +179,6 @@ class GatedDeltaNet(BaseOP):
         value_rows = mixed.transpose(0, 1)[2 * self.key_dim:] if _VALUES_IN_PLACE else None
         if value_rows is not None and (value_rows.dtype != dtype or not value_rows.is_contiguous()):
             value_rows = None
-        if value_rows is not None and n != mixed.shape[0]:
-            value_rows = value_rows[:, start:end].contiguous()
         v = vf.reshape(1, n, self.num_v_heads, self.head_v_dim).to(dtype) if value_rows is None else None
         return q, k, v, value_rows
 
@@ -278,10 +277,11 @@ class GatedDeltaNet(BaseOP):
                 and not torch.cuda.is_current_stream_capturing()
             )
             spans = _rule_spans(total, rule, CHUNK_SIZE) if sliced else [(0, total)]
-            core_out = None
+            whole = len(spans) == 1
+            # each call writes its rows of the output in place
+            core_out = None if whole else torch.empty((total, self.num_v_heads, self.head_v_dim), dtype=dtype, device=mixed.device)
             for start, end in spans:
                 q, k, v, value_rows = self._rule_inputs(mixed, start, end, dtype)
-                whole = len(spans) == 1
                 o, _, _ = chunk_gated_delta_rule(
                     q=q, k=k, v=v, g=g if whole else g[:, start:end], beta=beta if whole else beta[:, start:end],
                     scale=self.head_k_dim ** -0.5,
@@ -289,14 +289,12 @@ class GatedDeltaNet(BaseOP):
                     cu_seqlens=fla.cu_seqlens.to(torch.int64) if whole else _span_cu(end - start, mixed.device),
                     head_first=False, use_qk_l2norm_in_kernel=True,
                     # every call writes the state entering its last kernel chunk: the last call's is the request's
-                    track_state=track_state, value_rows=value_rows,
+                    track_state=track_state, value_rows=value_rows, value_start=start,
+                    output=None if whole else core_out[start:end].unsqueeze(0),
                 )
                 if whole:
                     core_out = o[0]  # [total, num_v_heads, head_v_dim]
                 else:
-                    if core_out is None:
-                        core_out = torch.empty((total, *o.shape[2:]), dtype=o.dtype, device=o.device)
-                    core_out[start:end] = o[0]
                     # freed before the next call makes its own
                     del q, k, v, value_rows, o
             if fla.track_dst is not None:
