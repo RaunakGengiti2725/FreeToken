@@ -1362,7 +1362,20 @@ def test_preset_keeps_offload_where_an_expert_cache_would_hold_every_expert(deco
     # a cache the command line sized: by its slots against the 80 experts
     assert strategy(enough - 64, moe_cache_size=80) == "offload" and strategy(1 << 40, moe_cache_size=79) == "hybrid"
     assert strategy(1 << 40, moe_cache_rate=1.0) == "offload" and strategy(1 << 40, moe_cache_rate=0.2) == "hybrid"
-    assert strategy(enough - 64, moe_cache_mem=100) == "offload" and strategy(1 << 40, moe_cache_mem=99) == "hybrid"
+    # a typed --moe-cache-mem against the routed experts' bytes (the safetensors headers), not the whole checkpoint's
+    assert strategy(1 << 40, moe_cache_mem=1 << 40) == "offload"  # the stand-in shard has no header to count them by
+    import safetensors.torch
+
+    shard = decode_rows.model / "model-00001.safetensors"
+    safetensors.torch.save_file({
+        "model.embed_tokens.weight": torch.zeros(1024, dtype=torch.uint8),
+        "model.layers.0.mlp.experts.0.down_proj.weight": torch.zeros(96, dtype=torch.uint8),
+        "model.layers.0.mlp.experts.1.down_proj.weight": torch.zeros(32, dtype=torch.uint8),
+        "mtp.layers.0.mlp.experts.0.down_proj.weight": torch.zeros(512, dtype=torch.uint8),
+    }, str(shard))
+    assert engine._checkpoint_expert_bytes(str(decode_rows.model)) == 128
+    assert strategy(1 << 40, moe_cache_mem=128) == "offload" and strategy(1 << 40, moe_cache_mem=127) == "hybrid"
+    shard.write_bytes(b"x" * 100)
     monkeypatch.setattr(engine, "_checkpoint_bytes", lambda path: None)
     assert strategy(enough - 64) == "offload"
 

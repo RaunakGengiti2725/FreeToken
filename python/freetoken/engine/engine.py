@@ -382,6 +382,32 @@ def _prefill_working_bytes(config) -> tuple[int, int]:
     )
 
 
+def _checkpoint_expert_bytes(path: str) -> int | None:
+    """Bytes of the target's routed experts in a folder of safetensors files, from the files' headers (the tensors
+    named ``.experts.``, not the MTP draft's); None where there is no such folder or the headers cannot be read."""
+    import json
+    import struct
+
+    path = os.path.realpath(os.path.expanduser(path))
+    try:
+        files = sorted(n for n in os.listdir(path) if n.endswith(".safetensors")) if os.path.isdir(path) else []
+        total = 0
+        for name in files:
+            full = os.path.join(path, name)
+            with open(full, "rb") as f:
+                (size,) = struct.unpack("<Q", f.read(8))
+                if size > os.path.getsize(full) - 8:
+                    return None  # not a safetensors header
+                header = json.loads(f.read(size))
+            for tensor, info in header.items():
+                if ".experts." in tensor and not tensor.startswith("mtp.") and isinstance(info, dict):
+                    begin, end = info["data_offsets"]
+                    total += end - begin
+        return total or None
+    except (OSError, ValueError, KeyError, TypeError, struct.error):
+        return None
+
+
 def _checkpoint_bytes(path: str) -> int | None:
     """Bytes of a checkpoint's weight files on disk; None where ``path`` is neither a weight file nor a folder that holds some."""
     from freetoken.moe.decode_profile import _WEIGHT_FILES
@@ -423,8 +449,9 @@ def _preset_every_expert_fits(config) -> bool | None:
     if need is None:
         return None
     if config.moe_cache_mem is not None:
-        # the cache's own budget against the checkpoint's bytes: an upper bound of the experts' bytes
-        return config.moe_cache_mem >= _checkpoint_bytes(config.model_path)
+        # the cache's own budget against the target's routed experts as stored: without them, it cannot be told
+        experts = _checkpoint_expert_bytes(config.model_path)
+        return None if experts is None else config.moe_cache_mem >= experts
     free = _gpu_free_bytes()
     return None if free is None else need <= int(config.memory_ratio * free)
 
