@@ -1307,6 +1307,11 @@ class OffloadMoeCache:
             for p, (size, stable) in enumerate(zip(self.pool_sizes, self._pool_stable_from))
         )
 
+    def copies_routed_misses(self, num_tokens: int) -> bool:
+        """Whether a streamed chunk of ``num_tokens`` tokens can copy only its routed misses: within
+        ``prefill_routed_copy_tokens``, with a usable hit-d2d split. Asked at startup, where a fallback is logged."""
+        return 0 < num_tokens <= self.prefill_routed_copy_tokens and self.prefill_overlap and self.prefill_hit_d2d and self._hit_d2d_usable()
+
     def warm_prefill_keeps(self) -> bool:
         """Whether a warmup prefill would leave experts resident: the cache keeps what a prefill streams and the hit-d2d split is usable. Asked once at startup, where a fallback is logged."""
         return self.keeps_streamed_experts and self._hit_d2d_usable()

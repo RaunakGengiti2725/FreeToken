@@ -1316,8 +1316,10 @@ def test_preset_loads_short_prefill_chunks_on_demand_only_into_a_gpu_decoded_cac
     engine = decode_rows.engine
     monkeypatch.setattr(OffloadMoeCache, "keeps_streamed_experts", property(lambda self: self.prefill_hit_d2d))
 
-    def settled(extra, decode_target="gpu", pool_sizes=None, fields=("moe_prefill_demand_tokens",), tokens=512, by_misses=True, routed=0, cpu_layers=frozenset()):
+    def settled(extra, decode_target="gpu", pool_sizes=None, fields=("moe_prefill_demand_tokens",), tokens=512, by_misses=True, routed=0, cpu_layers=frozenset(), usable=True):
         monkeypatch.setattr(engine, "_PREFILL_DEMAND_BY_MISSES", by_misses)
+        # a CPU cache has no copy stream for the hit-d2d split
+        monkeypatch.setattr(OffloadMoeCache, "_hit_d2d_usable", lambda self: usable)
         config = SimpleNamespace(
             preset="single", preset_fields=fields, moe_prefill_demand_tokens=tokens, model_config=SimpleNamespace(num_experts=4),
         )
@@ -1343,6 +1345,7 @@ def test_preset_loads_short_prefill_chunks_on_demand_only_into_a_gpu_decoded_cac
     # where a streamed chunk copies only its routed misses up to the preset's length or past it, the preset loads on
     # demand only chunks of up to 32 tokens; typed tokens stay as typed
     assert settled(7, routed=2048) == 32 and settled(7, routed=512) == 32 and settled(7, routed=256) == 512
+    assert settled(7, routed=2048, usable=False) == 512  # no batch memcpy or no hit region: no routed copy either
     assert settled(8, routed=2048) == 0 and settled(8, fields=(), routed=2048) == 512
     # typed tokens are the command line's: kept on any cache, and refused by it as without the preset
     assert settled(8, fields=()) == 512 and settled(8, fields=(), tokens=32) == 32

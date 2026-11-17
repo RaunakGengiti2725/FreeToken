@@ -315,7 +315,7 @@ def _settle_preset_demand(config, decode_target: str, pool_sizes: list[int], cac
         # a prefill reads the slots once they are filled, and until then it fills them by streaming
         _drop_preset_demand(config, "the expert cache has a slot for every expert")
     if cache is not None and "moe_prefill_demand_tokens" in getattr(config, "preset_fields", ()):
-        if cache.prefill_overlap and cache.prefill_hit_d2d and cache.prefill_routed_copy_tokens >= config.moe_prefill_demand_tokens:
+        if config.moe_prefill_demand_tokens and cache.copies_routed_misses(config.moe_prefill_demand_tokens):
             object.__setattr__(config, "moe_prefill_demand_tokens", min(config.moe_prefill_demand_tokens, PRESET_ROUTED_DEMAND_TOKENS))
     if cache is not None:
         cache.prefill_demand_tokens = config.moe_prefill_demand_tokens
@@ -1435,7 +1435,8 @@ class Engine:
                 parts.append("a prefill streams the experts that are not resident (--moe-prefill-hit-d2d)")
             if demand := self.moe_offload_cache.prefill_demand_tokens:
                 parts.append(f"a prefill chunk of at most {demand} tokens loads only the experts it routes to")
-            if config.moe_prefill_hit_d2d and (routed := self.moe_offload_cache.prefill_routed_copy_tokens) > demand:
+            routed = self.moe_offload_cache.prefill_routed_copy_tokens
+            if routed > demand and self.moe_offload_cache.copies_routed_misses(routed):
                 parts.append(f"a streamed chunk of at most {routed} tokens copies only the absent experts it routes to")
         elif getattr(config.model_config, "is_moe", False):
             parts.append(f"every expert resident ({config.moe_strategy})")
