@@ -290,8 +290,10 @@ def _drop_preset_demand(config, reason: str) -> None:
 _PREFILL_DEMAND_BY_MISSES = os.getenv("FREETOKEN_PREFILL_DEMAND_BY_MISSES", "1") != "0"
 # A streamed hit-d2d chunk of at most this many tokens copies only the absent experts it routes to (the cache's
 # prefill_routed_copy_tokens); FREETOKEN_PREFILL_ROUTED_COPY_TOKENS=0 copies every absent expert, for an A/B.
-# Past 2048 tokens at 8 routes a token a chunk reaches nearly every expert of a 256-expert layer.
-_PREFILL_ROUTED_COPY_TOKENS = int(os.getenv("FREETOKEN_PREFILL_ROUTED_COPY_TOKENS", "2048"))
+# unmeasured: where it stops paying. Each layer's copy waits for that layer's routes, so it no longer runs under the
+# layer before; near 2048 tokens at 8 routes a token a chunk reaches nearly every expert of a 256-expert layer and
+# copies about what the stream does, without the overlap. 512 until the 1024 and 2048 arms are read.
+_PREFILL_ROUTED_COPY_TOKENS = int(os.getenv("FREETOKEN_PREFILL_ROUTED_COPY_TOKENS", "512"))
 # where the routed copy serves the chunks above it, a preset loads on demand only chunks this short: their routes
 # reach fewer experts than a layer has, and the demand path needs no host sync a layer
 PRESET_ROUTED_DEMAND_TOKENS = 32
