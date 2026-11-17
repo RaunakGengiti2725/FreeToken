@@ -410,13 +410,14 @@ PRESET_MAP_DEPTH = 5
 
 
 def _settle_preset_map_drafts(config, override, windowed_kv: bool) -> None:
-    """--preset single and single-fast where their plan holds every expert resident (_preset_takes_fused): PRESET_MAP_DEPTH
-    MTP draft tokens with the store's draft token map for this checkpoint (moe/calibrate.py), whose sha256 must be the
-    one its manifest records; the preset's own draft tokens without a map elsewhere. Drafts the command line set are
-    served as typed. One log line says which and why."""
+    """--preset single, single-measured and single-fast where their plan holds every expert resident (_preset_takes_fused):
+    PRESET_MAP_DEPTH MTP draft tokens with the store's draft token map for this checkpoint (moe/calibrate.py), whose sha256
+    must be the one its manifest records; the preset's own draft tokens without a map elsewhere. Drafts the command line
+    set are served as typed. One log line says which and why. For single-measured this is its static choice, which its
+    calibration times first."""
     from freetoken.moe import calibrate
 
-    if config.preset not in ("single", "single-fast") or config.speculative_algorithm is None:
+    if config.preset not in ("single", "single-measured", "single-fast") or config.speculative_algorithm is None:
         return
     head = f"--preset {config.preset} with every expert resident"
     typed = [flag for flag, on in (

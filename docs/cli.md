@@ -200,8 +200,8 @@ faster than 3 drafts without one on a math and a coding prompt. With no such map
 checks of a typed `--speculative-token-map` refuse, it serves 3 draft tokens without one. An
 expert cache, `--speculative-algorithm`, `--speculative-num-steps` or `--speculative-token-map`
 on the command line, and a typed `--moe-strategy fused`, leave the drafts as they are. One log line
-says which and why. `--preset single-fast` does the same; `--preset single-measured` does not, it
-times the map instead (below). `--preset single-measured`
+says which and why. `--preset single-fast` and `--preset single-measured` do the same: for
+`single-measured` that is its static choice, the first candidate it times (below). `--preset single-measured`
 is the same preset, and on its first start for a checkpoint, set of flags and machine it times the
 candidates the preset cannot choose between: `offload` and `hybrid`, each with 3, 4 and 5 MTP draft
 tokens and with none. Each candidate is one server start that decodes two built-in prompts (a math

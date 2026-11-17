@@ -1176,7 +1176,7 @@ def parse_args(
             "that a prefill streams nothing; a typed --moe-strategy is kept. Resident, it drafts 5 tokens with the draft "
             "token map scripts/make_token_map.py --store or --install put in the store for the checkpoint, if there is one. "
             "The log says what it set. "
-            "'single-measured' is 'single', but times the map instead of serving it: on its first start for a checkpoint, flags and machine it also times "
+            "'single-measured' is 'single', and on its first start for a checkpoint, flags and machine it also times "
             "offload against hybrid and 0, 3, 4 and 5 draft tokens (one server start each, as many as fit in 300 s), "
             "keeps the choice next to the `ft bench decode` rows and logs how long that took; later starts read the "
             "choice, and --calibrate-again times again. "

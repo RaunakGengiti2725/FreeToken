@@ -1183,9 +1183,9 @@ def test_preset_serves_the_stores_draft_token_map_only_where_every_expert_is_res
     assert served == ("fused", 5, path) and said == f"--preset single with every expert resident: 5 MTP draft tokens with the store's draft token map {path} (sha256 {sha[:12]}, as its manifest records)"
     # checked as a typed map is, and the setup's key is the one that runs
     assert checked[-1] == (5, path) and "|spec=mtp:5|" in last[0].moe_decode_key and last[0].spec_slot_states == ("draft state", 5)
-    # single-fast follows; single-measured is its own calibration's (moe/calibrate.py)
+    # single-fast follows, and so does single-measured: this is its static choice, which its calibration times first
     assert resolved(preset="single-fast")[0] == ("fused", 5, path)
-    assert resolved(preset="single-measured") == (("fused", 3, None), "")
+    assert resolved(preset="single-measured")[0] == ("fused", 5, path)
     # a file that is not the one its manifest describes, a manifest that records none, a map the checks refuse
     manifest(map_sha256="0" * 64)
     served, said = resolved()
@@ -1440,7 +1440,7 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
 
     static_strategy = ["offload"]
     monkeypatch.setattr(calibrate, "_time_candidate", time_candidate)
-    monkeypatch.setattr(calibrate, "_static_strategy", lambda args, argv: static_strategy[0])
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: (static_strategy[0], 3, None))
     monkeypatch.setattr(calibrate, "_sleep", lambda seconds: None)
     free_now(_ROW_FREE)
     args, argv = parsed()
@@ -1547,6 +1547,16 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     assert starts(mapped, mapped_argv) == (with_map, 0)
     flags = calibrate.child_flags(mapped_argv, 5, map_path)
     assert flags[-6:] == ["--preset", "single", "--speculative-num-steps", "5", "--speculative-token-map", map_path]
+    # where the static preset serves the map itself (as --preset single does), 5 drafts with it are the static choice:
+    # timed first, and served by the engine's own rule, depth and map together; 3 drafts without it come next
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: ("fused", 5, map_path))
+    own_map, own_map_argv = parsed("--memory-ratio", "0.761")
+    assert starts(own_map, own_map_argv) == ({}, 5)
+    assert started[-5:] == [("fused", "5map"), ("fused", 3), ("fused", 4), ("fused", 5), ("fused", 0)]
+    speeds["fused", 3] = [160.0, 270.0]  # 3 drafts lead the map by more than the margin on both prompts
+    assert starts(*parsed("--memory-ratio", "0.762")) == ({"moe_strategy": "fused", "speculative_num_steps": 3}, 5)
+    speeds["fused", 3] = [100.0, 200.0]
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: (static_strategy[0], 3, None))
     # another map is another candidate, timed again; a file that is not the one its manifest describes is not timed,
     # and a map on the command line is every server's, not a candidate
     store_map(b"\x01\x00\x00\x00\x03\x00\x00\x00")

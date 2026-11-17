@@ -16,6 +16,8 @@ over a hybrid that led by 25% to 36% in three passes and 9.7% in one.)
 A draft token map is one more candidate where a file for this checkpoint is in the store (token_map_path, written
 by scripts/make_token_map.py --store with a manifest that names its corpus): MAP_DEPTH draft tokens with the map,
 per strategy. A --speculative-token-map on the command line is not a candidate: every server then has that map.
+Where the static preset serves the map itself (every expert resident, engine._settle_preset_map_drafts), that
+candidate is the static choice, as --preset single serves it.
 
 The candidates are timed in a fixed order, inside BUDGET_S seconds, the static choice first. Where it serves every
 expert from the GPU (fused, or a cache with a slot for each): 5 drafts with the map (5 without, where there is no
@@ -130,10 +132,11 @@ def stored_token_map(args) -> tuple[str, str] | None:
     return path, sha
 
 
-def candidates(args, fused: bool = False, token_map: str | None = None) -> list[tuple[str, str, int | None, str | None]]:
+def candidates(args, fused: bool = False, token_map: str | None = None, static_map: bool = False) -> list[tuple[str, str, int | None, str | None]]:
     """(name, strategy, depth, token map) of every candidate, the static preset's choice first. A depth of None leaves
-    speculative decoding as the command line set it. ``fused``: the static preset takes fused (_static_strategy).
-    ``token_map``: the store's map for this checkpoint (stored_token_map), timed at MAP_DEPTH draft tokens."""
+    speculative decoding as the command line set it. ``fused``: the static preset takes fused (_static_choice).
+    ``token_map``: the store's map for this checkpoint (stored_token_map), timed at MAP_DEPTH draft tokens.
+    ``static_map``: the static preset serves that map itself, so its candidate is the static choice."""
     left = args.preset_fields
     if "moe_strategy" not in left:
         strategies = [args.moe_strategy]
@@ -147,6 +150,8 @@ def candidates(args, fused: bool = False, token_map: str | None = None) -> list[
         if token_map and len(depths) > 1:
             out.append((f"{s}@{MAP_DEPTH}map", s, MAP_DEPTH, token_map))
         out += [(f"{s}@{d}", s, d, None) for d in depths[1:]]
+    if static_map and token_map and len(depths) > 1:
+        out.insert(0, out.pop(next(i for i, c in enumerate(out) if c[3])))
     return out
 
 
@@ -206,9 +211,10 @@ def _probe_gpu(args) -> tuple[str | None, str | None, int | None]:
     return name, uuid, free
 
 
-def _static_strategy(args, argv: list[str]) -> str | None:
-    """The strategy the static preset resolves to for this command line on the GPU the server will bind, from the
-    engine's own _adjust_config in a process of its own (see _probe_gpu); None where that cannot be run."""
+def _static_choice(args, argv: list[str]) -> tuple[str, int, str | None] | None:
+    """(strategy, draft tokens, draft token map) the static preset resolves to for this command line on the GPU the
+    server will bind, from the engine's own _adjust_config in a process of its own (see _probe_gpu); None where that
+    cannot be run. The map is None where the command line names one: every candidate's server then has it."""
     target = (args.gpu_assigned or args.gpu or ("0",))[0]
     code = (
         "import json, sys\n"
@@ -221,13 +227,18 @@ def _static_strategy(args, argv: list[str]) -> str | None:
         "engine.set_quant_backend(engine._adjust_ftw_quant_backend(args.model_path, engine.QuantBackend.parse(args.quant_backend)))\n"
         "set_assigned_gpu(sys.argv[1])\n"
         "bind_assigned_gpu()\n"
+        "typed = args.speculative_token_map\n"
         "engine._adjust_config(args)\n"
-        "print(json.dumps(args.moe_strategy))\n"
+        "depth = args.speculative_num_steps if args.speculative_algorithm is not None else 0\n"
+        "print(json.dumps([args.moe_strategy, depth, None if typed else args.speculative_token_map]))\n"
     )
     try:
         done = subprocess.run([sys.executable, "-c", code, target, *argv], capture_output=True, text=True, timeout=300)
-        return json.loads(done.stdout.strip().splitlines()[-1]) if done.returncode == 0 else None
-    except (subprocess.SubprocessError, ValueError, IndexError):
+        if done.returncode != 0:
+            return None
+        strategy, depth, token_map = json.loads(done.stdout.strip().splitlines()[-1])
+        return str(strategy), int(depth), token_map
+    except (subprocess.SubprocessError, ValueError, IndexError, TypeError):
         return None
 
 
@@ -418,6 +429,9 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
                 # cards), then 4 drafts, then the other strategy and what is left
                 own = [c for c in rest if c[1] == static[1]]
                 deep = next((c for c in own if c[3]), None) or next((c for c in own if c[2] == MAP_DEPTH), None)
+                if static[3]:
+                    # the static choice is the map: the preset's depth without it comes next
+                    deep = next((c for c in own if c[2] == DEPTHS[0] and c[3] is None), None)
                 near = next((c for c in own if c[2] == DEPTHS[1] and c[3] is None), None)
                 lead_in = [c for c in (deep, near) if c is not None]
                 queue, stage = lead_in + heads + [c for c in rest if c not in lead_in], 2
@@ -530,6 +544,9 @@ def _overrides(args, strategy: str, depth: int | None, static: bool = False, tok
     from freetoken.moe import is_offload_moe_strategy
 
     out: dict = {}
+    if static and token_map:
+        # the static preset's own map: the engine serves both the depth and the map, or neither where it refuses the map
+        return out
     if "moe_strategy" in args.preset_fields and not static:
         out["moe_strategy"] = strategy
         sized = args.moe_cache_size or args.moe_cache_auto or args.moe_cache_mem is not None or args.moe_cache_rate
@@ -569,8 +586,10 @@ def measured_choice(args, argv: list[str]) -> dict:
         return static("calibrations are kept on Linux only: this machine's memory cannot be read from /proc")
     try:
         gpu_name, gpu_uuid, free = _probe_gpu(args)
-        if "moe_strategy" in args.preset_fields and _static_strategy(args, argv) == "fused":
-            todo = candidates(args, fused=True, token_map=token_map)
+        resolved = _static_choice(args, argv)
+        if "moe_strategy" in args.preset_fields and resolved is not None and resolved[0] == "fused":
+            # where the static preset serves the store's map, that is the static choice (engine._settle_preset_map_drafts)
+            todo = candidates(args, fused=True, token_map=token_map, static_map=bool(token_map) and resolved[2] == token_map)
             names = [c[0] for c in todo]
             if len(todo) == 1:
                 return static("every expert fits on the GPU and the command line sets the speculative decoding: nothing to measure")
