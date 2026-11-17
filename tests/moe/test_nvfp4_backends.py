@@ -866,17 +866,19 @@ def test_triton_decode_marlin_unsummed_routes_are_what_its_sum_kernel_reads():
 @pytest.mark.parametrize("rows,routes,dtype", [
     *((rows, routes, torch.bfloat16) for rows in range(1, 9) for routes in ("shared", "distinct")),
     (5, "shared", torch.float32),  # activations the kernel loads one value at a time
+    # the row counts the kernel runs at by default (from 24): 8 and 16 requests with 3 or 5 drafts
+    *((rows, routes, torch.bfloat16) for rows in (24, 32, 48, 64, 96) for routes in ("shared", "spread")),
 ])
 def test_triton_decode_grouped_kernel_gives_the_per_route_bits(monkeypatch, rows, routes, dtype):
     """The grouped decode GEMV reads an expert once for the rows that share it and must give every route the bits of
     the per-route kernel: both GEMMs at the 35B-A3B shapes (deep-K and short-K tiles), with and without the routed
     weight, rows on shared experts (more routes of an expert than one program takes, and a repeat inside a row) and
-    rows on distinct experts."""
+    rows on distinct experts, and rows spread over a layer's 256 experts as a batch of requests routes them."""
     import freetoken.moe.fused_nvfp4 as fused_nvfp4
     from freetoken.kernel import nvfp4_moe
 
     device = torch.device("cuda")
-    slots, top_k, hidden_size, inter = 72, 8, 2048, 512
+    slots, top_k, hidden_size, inter = (256 if routes == "spread" else 72), 8, 2048, 512
     g = torch.Generator().manual_seed(100 * rows + len(routes))
 
     def bank(n, k):
@@ -887,6 +889,8 @@ def test_triton_decode_grouped_kernel_gives_the_per_route_bits(monkeypatch, rows
     gate_up, down = bank(2 * inter, hidden_size), bank(hidden_size, inter)
     if routes == "distinct":
         ids = torch.randperm(slots, generator=g)[: rows * top_k].view(rows, top_k)
+    elif routes == "spread":
+        ids = torch.stack([torch.randperm(slots, generator=g)[:top_k] for _ in range(rows)])
     else:
         ids = torch.stack([torch.randperm(12, generator=g)[:top_k] for _ in range(rows)])
         ids[0, 1] = ids[0, 0]
