@@ -169,6 +169,14 @@ def test_preset_kv_reserve_follows_the_output_limit_and_leaves_a_sized_kv_pool_a
     assert sized.kv_reserve_tokens == ServerArgs.kv_reserve_tokens and "kv_reserve_tokens" not in sized.preset_fields
 
 
+def test_cuda_graph_bs_is_the_sorted_sizes_within_the_running_requests():
+    assert _parse().cuda_graph_bs is None  # the engine's own rule: 1, 2, 4 and the multiples of 8
+    assert _parse("--max-running-requests", "16", "--cuda-graph-bs", "16", "3", "12", "3").cuda_graph_bs == [3, 12, 16]
+    for refused in (("--cuda-graph-bs", "8"), ("--cuda-graph-bs", "0", "2"), ("--cuda-graph-bs", "2", "--cuda-graph-max-bs", "4")):
+        with pytest.raises(SystemExit):
+            _parse(*refused)  # above the default 4 running requests; not a batch size; two rules for one list
+
+
 @pytest.mark.parametrize("agent", sorted(launch.PREPARERS))
 def test_dry_run_prints_a_placeholder_instead_of_the_key(agent, monkeypatch, capsys):
     key = 'p"w\\d\xe9'

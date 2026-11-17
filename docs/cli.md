@@ -51,6 +51,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens; with offloaded experts see [performance/prefill.md](performance/prefill.md) |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
+| `--cuda-graph-bs` | 1, 2, 4 and the multiples of 8 up to `--cuda-graph-max-bs` | The batch sizes captured as CUDA graphs, e.g. `1 2 3 4 5 6 7 8 12 16`. A decode batch replays the graph of the next size up with its other rows padded, so a size of its own saves the padded rows; a batch above the largest size runs without a graph. Each size takes GPU memory and startup time. Not with `--cuda-graph-max-bs` |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 
 ### Choosing a GPU

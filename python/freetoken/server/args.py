@@ -501,6 +501,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--cuda-graph-bs",
+        type=int,
+        nargs="+",
+        default=ServerArgs.cuda_graph_bs,
+        help=(
+            "The batch sizes captured as CUDA graphs, e.g. 1 2 3 4 5 6 7 8 12 16. A decode batch replays the graph of "
+            "the next size up, its other rows padded, and one above the largest size runs without a graph. Default: 1, 2, "
+            "4 and the multiples of 8 up to --cuda-graph-max-bs. Not with --cuda-graph-max-bs."
+        ),
+    )
+
+    parser.add_argument(
         "--num-tokenizer",
         "--tokenizer-count",
         type=int,
@@ -1247,8 +1259,20 @@ def parse_args(
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 
+    if run_shell:
+        kwargs["cuda_graph_bs"] = None
+    if kwargs["cuda_graph_bs"] is not None and kwargs["cuda_graph_max_bs"] is not None:
+        parser.error("--cuda-graph-bs lists the captured batch sizes itself; give it without --cuda-graph-max-bs")
+
     if kwargs["preset"] is not None:
         kwargs["preset_fields"] = _apply_preset(kwargs, left_alone)
+    if kwargs["cuda_graph_bs"] is not None:
+        sizes, most = sorted(set(kwargs["cuda_graph_bs"])), kwargs["max_running_req"]
+        if sizes[0] < 1 or sizes[-1] > most:
+            parser.error(f"--cuda-graph-bs takes batch sizes from 1 to --max-running-requests ({most}), got {sizes}")
+        if sizes[-1] < most:
+            logger.warning(f"--cuda-graph-bs stops at {sizes[-1]}: a decode batch of {sizes[-1] + 1} to {most} requests runs without a graph")
+        kwargs["cuda_graph_bs"] = sizes
     if (kwargs["speculative_algorithm"] or "").lower() == "off":
         kwargs["speculative_algorithm"] = None
 
