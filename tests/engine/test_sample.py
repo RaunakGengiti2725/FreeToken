@@ -368,3 +368,21 @@ def test_speculative_decoding_commits_the_distribution_plain_decode_samples(devi
         assert (counts / n - exact).abs().max() < 5 * (0.25 / n) ** 0.5, name
     for position in range(steps):
         assert _homogeneity_p_value(off[position], on[position]) > 1e-6, f"position {position}"
+
+
+def test_the_unseeded_streams_are_put_back_as_they_were(monkeypatch):
+    """sampling_streams / restore_sampling_streams (the first-request warmup's guard): the draws after a restore are
+    the draws after the save, for torch's generators and the Triton kernels' own unseeded one, and a Triton generator
+    made in between is dropped."""
+    triton_sampling = pytest.importorskip("freetoken.kernel.triton.sampling")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    cpu = torch.device("cpu")
+    triton_sampling._gen_u(4, cpu, None, None)
+    saved = S.sampling_streams()
+    want = (torch.rand(3), triton_sampling._gen_u(4, cpu, None, None))
+    # a generator first made after the save, as for another device
+    triton_sampling._UGEN[("other", False)] = torch.Generator()
+    S.restore_sampling_streams(saved)
+    got = (torch.rand(3), triton_sampling._gen_u(4, cpu, None, None))
+    assert all(torch.equal(a, b) for a, b in zip(want, got))
+    assert ("other", False) not in triton_sampling._UGEN

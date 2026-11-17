@@ -224,7 +224,7 @@ class Scheduler(SchedulerIOMixin):
         variants of its prompt length loaded: the prefill forward, the sampler, the draft's prompt pass and a verify step.
 
         They carry a seed and run under reproducible seeds, so they match nothing in the prefix cache and leave nothing
-        in it; the sampling stream is put back after them, so an unseeded request draws what it drew without them.
+        in it; the sampling streams are put back after them, so an unseeded request draws what it drew without them.
         With an expert cache they do not run: they would change which experts the first real request finds resident.
         """
         if not ENV.WARM_FIRST_REQUEST or self.device.type != "cuda" or self.engine.moe_offload_cache is not None:
@@ -242,8 +242,10 @@ class Scheduler(SchedulerIOMixin):
             keep = {key: sampled[key] for key in ("temperature", "top_k", "top_p") if key in sampled}
             runs.append((lengths[min(1, len(lengths) - 1)], SamplingParams(**keep, max_tokens=2, ignore_eos=True, seed=0)))
 
+        from freetoken.engine.sample import restore_sampling_streams, sampling_streams
+
         send, seeds = self.send_result, self.cache_manager.reproducible_seeds
-        cuda_rng, cpu_rng = torch.cuda.get_rng_state(self.device), torch.get_rng_state()
+        streams = sampling_streams()
         self.send_result = lambda reply: None
         self.cache_manager.reproducible_seeds = True
         started = time.perf_counter()
@@ -263,8 +265,7 @@ class Scheduler(SchedulerIOMixin):
         finally:
             self.send_result = send
             self.cache_manager.reproducible_seeds = seeds
-        torch.cuda.set_rng_state(cuda_rng, self.device)
-        torch.set_rng_state(cpu_rng)
+        restore_sampling_streams(streams)
         self.engine.sampler._sent = None
         self.finished_reqs = set()
         self.cache_manager.check_integrity()
