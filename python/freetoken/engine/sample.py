@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, NamedTuple
 
@@ -83,6 +84,55 @@ def draw_key(seed: int, position: int) -> int:
     return (seed * 0x9E3779B97F4A7C15 + position) & 0x7FFFFFFFFFFFFFFF
 
 
+def key_uniform(key: int) -> float:
+    """The uniform in [0, 1) a draw_key gives: splitmix64's finalizer of the key, its top 24 bits, which a float32 holds exactly."""
+    z = (key + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    return ((z ^ (z >> 31)) >> 40) * 2.0**-24
+
+
+def keyed_probs(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    min_p: torch.Tensor | None,
+) -> torch.Tensor:
+    """[B, V] fp32: softmax(T), then top-k, then top-p, then min-p, as sample_impl applies them, but the min-p cut keeps
+    its tokens' probabilities unscaled: keyed_draw scales by the row's total, and a division by a sum would bring in
+    last bits that depend on how many rows torch's reduction covered."""
+    sampling = sampling_module()
+    probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
+    if top_k is not None:
+        probs = sampling.top_k_renorm_probs(probs, top_k)
+    if top_p is not None:
+        probs = sampling.top_p_renorm_probs(probs, top_p)
+    if min_p is not None:
+        probs = torch.where(probs >= min_p.unsqueeze(1) * probs.amax(dim=1, keepdim=True), probs, 0.0)
+    return probs
+
+
+def keyed_draw(probs: torch.Tensor, uniforms: torch.Tensor) -> torch.Tensor:
+    """One token per row of ``probs`` [n, V], by the inverse CDF at ``uniforms`` [n] in [0, 1) times the row's total:
+    the first token whose running sum passes it, which always has a probability above 0. The sums run over at least
+    two rows, as torch scans a lone row with another kernel than the rows of a matrix."""
+    n = probs.shape[0]
+    if n == 1:
+        probs = probs.expand(2, -1)
+    cdf = probs.cumsum(dim=-1)[:n]
+    target = (uniforms.to(cdf.dtype) * cdf[:, -1]).unsqueeze(1)
+    tokens = torch.searchsorted(cdf, target, right=True).squeeze(1)
+    # a target that rounds up to the total: the last token with a probability above 0
+    positive = probs[:n] > 0
+    last = probs.shape[1] - 1 - positive.flip(1).to(torch.uint8).argmax(dim=1)
+    return torch.minimum(tokens, last)
+
+
+# A/B switch: FREETOKEN_SEEDED_DRAW=per-row draws each seeded row in a call of its own, as before the batched keyed draw
+_SEEDED_DRAW_PER_ROW = os.getenv("FREETOKEN_SEEDED_DRAW", "batched") == "per-row"
+
+
 def sample_impl(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -124,18 +174,33 @@ def sample_rows(
     min_p: torch.Tensor | None,
     keys: list[int | None] | None,
 ) -> torch.Tensor:
-    """sample_impl over the batch; a row with a key is then drawn again from that key."""
+    """sample_impl over the batch; the rows with a key are then drawn again from their keys, all in one pass
+    (keyed_draw), each from the uniform its own key gives."""
     tokens = sample_impl(logits, temperatures, top_k, top_p, min_p)
-    for row, key in enumerate(keys or ()):
-        if key is None:
-            continue
-        # One row per call: a batched call takes one seed, and flashinfer mixes the row index into it. Alone, a row's
-        # softmax and draw also run the same arithmetic whatever else the step holds.
-        one = slice(row, row + 1)
-        tokens[one] = sample_impl(
-            logits[one], temperatures[one], None if top_k is None else top_k[one], None if top_p is None else top_p[one],
-            None if min_p is None else min_p[one], key,
-        )
+    if not keys:
+        return tokens
+    if _SEEDED_DRAW_PER_ROW:
+        for row, key in enumerate(keys):
+            if key is None:
+                continue
+            # one row per call: a batched call takes one seed, and flashinfer mixes the row index into it
+            one = slice(row, row + 1)
+            tokens[one] = sample_impl(
+                logits[one], temperatures[one], None if top_k is None else top_k[one], None if top_p is None else top_p[one],
+                None if min_p is None else min_p[one], key,
+            )
+        return tokens
+    rows = [row for row, key in enumerate(keys) if key is not None]
+    if not rows:
+        return tokens
+    at = make_device_tensor(rows, torch.int64, logits.device)
+    uniforms = make_device_tensor([key_uniform(keys[row]) for row in rows], torch.float32, logits.device)
+
+    def pick(t: torch.Tensor | None) -> torch.Tensor | None:
+        return None if t is None else t.index_select(0, at)
+
+    probs = keyed_probs(logits.index_select(0, at), pick(temperatures), pick(top_k), pick(top_p), pick(min_p))
+    tokens[at] = keyed_draw(probs, uniforms).to(tokens.dtype)
     return tokens
 
 

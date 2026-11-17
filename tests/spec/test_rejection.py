@@ -281,13 +281,18 @@ def test_a_seeded_request_draws_the_same_token_at_a_position_in_any_step(params)
         return Req(input_ids=torch.zeros(device_len, dtype=torch.int32), table_idx=0, cached_len=device_len - 1, output_len=64,
                    uid=0, sampling_params=SamplingParams(temperature=1.0, seed=seed, **params), cache_handle=None)
 
-    def verify(start, width, seed=7, neighbor=False):
-        """The seeded request's ``width`` rows from one verify step at ``start``, after an unseeded request's rows when ``neighbor``."""
+    def verify(start, width, seed=7, neighbor=False, batch=1, at=0):
+        """The seeded request's ``width`` rows from one verify step at ``start``, after an unseeded request's rows when
+        ``neighbor``; or as request ``at`` of ``batch`` requests, the others seeded and unseeded in turn."""
         reqs = [req(3), req(start, seed)] if neighbor else [req(start, seed)]
+        if batch > 1:
+            others = [req(3 + i % 4, None if i % 2 else 100 + i) for i in range(batch - 1)]
+            reqs = others[:at] + [req(start, seed)] + others[at:]
         args = sampler.prepare(Batch(reqs=reqs, phase="verify", rows_per_req=width))
         logits = torch.cat([table[r.device_len : r.device_len + width] for r in reqs])
         drafts = torch.zeros(len(reqs), width - 1, dtype=torch.int64, device=device)
-        return sampler.sample_verify(logits, args, drafts)[-width:].tolist()
+        mine = at if batch > 1 else len(reqs) - 1
+        return sampler.sample_verify(logits, args, drafts)[mine * width : (mine + 1) * width].tolist()
 
     decode = []
     for n in range(5, 11):
@@ -297,3 +302,113 @@ def test_a_seeded_request_draws_the_same_token_at_a_position_in_any_step(params)
     assert verify(5, 6) == decode
     assert verify(5, 6, neighbor=True) == decode
     assert verify(5, 6, seed=8) != decode
+    for batch in (2, 8, 16):
+        for at in sorted({0, batch // 2, batch - 1}):
+            assert verify(5, 6, batch=batch, at=at) == decode, (batch, at)
+
+
+def test_the_keyed_draw_samples_the_rows_distribution_and_never_a_token_it_cut():
+    """keyed_draw's inverse CDF: over many uniforms each row's tokens come up as often as its probabilities say, a
+    token at probability 0 (the tail top-k and top-p cut) never does, and the ends of [0, 1) land on tokens it keeps."""
+    from freetoken.engine.sample import key_uniform, keyed_draw
+
+    g = torch.Generator().manual_seed(5)
+    probs = torch.rand(3, 32, generator=g)
+    probs[0, 20:] = 0.0  # a cut tail
+    probs[1, :5] = 0.0
+    probs[2, ::2] = 0.0
+    probs /= probs.sum(dim=1, keepdim=True)
+    n = 200_000
+    uniforms = torch.tensor([key_uniform(key) for key in range(3 * n)], dtype=torch.float32).view(n, 3)
+    tokens = torch.stack([keyed_draw(probs, u) for u in uniforms[:2000]])
+    tokens = torch.cat([tokens, keyed_draw(probs.repeat(n - 2000, 1), uniforms[2000:].reshape(-1)).view(-1, 3)])
+    for row in range(3):
+        seen = torch.bincount(tokens[:, row], minlength=32).float() / n
+        assert (seen - probs[row]).abs().max() < 4e-3
+        assert not seen[probs[row] == 0].any()
+    # the uniforms' ends; a total that is not 1 (min-p keeps its tokens unscaled) is scaled into
+    ends = torch.tensor([0.0, 1.0 - 2.0**-24, 1.0 - 2.0**-24])
+    assert keyed_draw(probs, ends).tolist() == [0, 31, 31] and keyed_draw(probs * 0.3, ends).tolist() == [0, 31, 31]
+    assert keyed_draw(probs[:1], torch.tensor([1.0 - 2.0**-24])).tolist() == [19]
+    assert keyed_draw(probs[1:2], torch.tensor([0.0])).tolist() == [5]
+
+
+def test_a_seeded_row_draws_alone_what_it_draws_in_a_batch_and_leaves_the_unseeded_rows_alone(monkeypatch):
+    """One seeded row alone and as row 0, a middle row and the last of 2, 8 and 16, beside seeded and unseeded rows:
+    the same token. The unseeded rows draw from the shared stream exactly as in the same step without a seed, and
+    the stream stands where it would. Stand-in kernels as above; the CUDA test checks the arithmetic of the kernels."""
+    from types import SimpleNamespace
+
+    from freetoken.engine import sample
+
+    def sampling_from_probs(probs, seed=None, offset=None):
+        generator = None if seed is None else torch.Generator().manual_seed(seed + offset)
+        uniforms = torch.rand(probs.shape[0], 1, generator=generator)
+        return torch.searchsorted(probs.cumsum(-1), uniforms).squeeze(1).clamp_(max=probs.shape[1] - 1).to(torch.int32)
+
+    kernels = SimpleNamespace(
+        softmax=lambda logits, temperatures, enable_pdl=False: torch.softmax(logits / temperatures.unsqueeze(1), dim=-1),
+        sampling_from_probs=sampling_from_probs,
+    )
+    monkeypatch.setattr(sample, "sampling_module", lambda: kernels)
+    monkeypatch.setattr(sample, "is_sm90_supported", lambda: False)
+    vocab = 512
+    g = torch.Generator().manual_seed(11)
+    mine, others = torch.randn(1, vocab, generator=g), torch.randn(15, vocab, generator=g)
+    key = sample.draw_key(7, 40)
+
+    def step(batch, at, seeded=True):
+        logits = torch.cat([others[:at], mine, others[at : batch - 1]])
+        keys = [None if i % 2 else sample.draw_key(100 + i, 40) for i in range(batch - 1)]
+        keys = keys[:at] + [key] + keys[at:]
+        torch.manual_seed(1)
+        tokens = sample.sample_rows(logits, torch.full((batch,), 0.8), None, None, None, keys if seeded else None)
+        return tokens, torch.rand(1), keys
+
+    alone = int(step(1, 0)[0][0])
+    for batch in (2, 8, 16):
+        for at in sorted({0, batch // 2, batch - 1}):
+            tokens, after, keys = step(batch, at)
+            assert int(tokens[at]) == alone, (batch, at)
+            plain, plain_after, _ = step(batch, at, seeded=False)
+            unseeded = [i for i, k in enumerate(keys) if k is None]
+            assert torch.equal(tokens[unseeded], plain[unseeded]) and torch.equal(after, plain_after)
+    # the A/B switch keeps the per-row draw reachable: the same unseeded rows, its own seeded tokens
+    monkeypatch.setattr(sample, "_SEEDED_DRAW_PER_ROW", True)
+    tokens, after, keys = step(8, 3)
+    plain, plain_after, _ = step(8, 3, seeded=False)
+    unseeded = [i for i, k in enumerate(keys) if k is None]
+    assert torch.equal(tokens[unseeded], plain[unseeded]) and torch.equal(after, plain_after)
+
+
+@cuda
+def test_a_seeded_rows_probabilities_and_token_have_the_same_bits_alone_and_in_a_batch():
+    """At Qwen3.6's vocabulary on the GPU: a seeded row's filtered probabilities, their running sums and its token,
+    alone and as a row of 2, 8 and 16 rows, for each filter keyed_probs applies."""
+    from freetoken.engine.sample import key_uniform, keyed_draw, keyed_probs
+
+    device = torch.device("cuda")
+    vocab = 248320
+    g = torch.Generator(device=device).manual_seed(4)
+    logits = torch.randn(16, vocab, device=device, generator=g) * 4
+    u = torch.tensor([key_uniform(k) for k in range(16)], dtype=torch.float32, device=device)
+    filters = [
+        dict(top_k=None, top_p=None, min_p=None),
+        dict(top_k=torch.full((16,), 20, dtype=torch.int32, device=device), top_p=torch.full((16,), 0.95, device=device), min_p=None),
+        dict(top_k=None, top_p=None, min_p=torch.full((16,), 0.05, device=device)),
+    ]
+    for f in filters:
+        def probs(rows):
+            return keyed_probs(logits[rows], torch.full((len(rows),), 0.7, device=device),
+                               *(None if f[n] is None else f[n][rows] for n in ("top_k", "top_p", "min_p")))
+
+        for row in (0, 7, 15):
+            p1 = probs([row])
+            t1 = keyed_draw(p1, u[row : row + 1])
+            for batch in (2, 8, 16):
+                rows = sorted({row, *range(batch)})[:batch] if row < batch else [*range(batch - 1), row]
+                i = rows.index(row)
+                pb = probs(rows)
+                assert torch.equal(pb[i], p1[0]), (f, row, batch)
+                assert torch.equal(pb.cumsum(-1)[i], p1.expand(2, -1).cumsum(-1)[0]), (f, row, batch)
+                assert torch.equal(keyed_draw(pb, u[rows])[i], t1[0]), (f, row, batch)
