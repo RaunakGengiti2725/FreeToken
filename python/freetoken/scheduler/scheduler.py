@@ -43,6 +43,7 @@ from .io import SchedulerIOMixin
 from .mm import cut_image_spans, plan_mm_batch
 from .full_hit import FullHitEntry, FullHitStore, first_token_key, tree_pages
 from .prefill import ChunkedReq, PrefillManager, _maybe_pinned
+from .utils import PendingReq
 from .reasoning import OPEN_TAIL, ReasoningTracker, ThinkTokens
 from .status import SchedulerStatusReporter
 from .table import TableManager
@@ -507,6 +508,11 @@ class Scheduler(SchedulerIOMixin):
                         hold(functools.partial(self._finish_drained, req))
                         new_finished_reqs.add(req)
                         continue
+                    if full_hit is not None and int(next_tokens_cpu[i]) != full_hit.first_token:
+                        self._undo_full_hit(req, full_hit, int(next_tokens_cpu[i]))
+                        continue
+                    if full_hit is not None:
+                        self._report_prompt_admissions(batch)
                     if req in self.finished_reqs:
                         # Overlap scheduling launched one more decode step for a request that
                         # already terminated (filter_reqs keeps it while output budget remains,
@@ -521,9 +527,6 @@ class Scheduler(SchedulerIOMixin):
                     if msg.finished or req.sampling_params.timings_per_token:
                         msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
                     finished = msg.finished
-                    if full_hit is not None and msg.next_tokens != [full_hit.first_token]:
-                        # its state, draft rows and tree path are those of the first send's token
-                        raise RuntimeError(f"a full hit sampled {msg.next_tokens}, not the stored first token {full_hit.first_token}")
                     if batch.is_prefill and not finished and full_hit is None and prefill_logits is not None:
                         keep.append((req, i, msg.next_tokens[0]))
 
@@ -1209,9 +1212,8 @@ class Scheduler(SchedulerIOMixin):
         if getattr(self, "full_hits", None) is not None and (hit := self._full_hit_batch()) is not None:
             # nothing to compute: the sampling arguments and where the token goes, as _prepare_batch has them
             hit.padded_reqs = hit.reqs
-            forward_input = ForwardInput(hit, self.engine.sampler.prepare(hit), None, _make_write_tuple(hit, self.device))
-            self._report_prompt_admissions(hit)
-            return forward_input
+            # its admission is reported at the drain, once its first token is the stored one
+            return ForwardInput(hit, self.engine.sampler.prepare(hit), None, _make_write_tuple(hit, self.device))
         # TODO: support other policies: e.g. DECODE first
         batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
@@ -1293,6 +1295,29 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool[output_mapping] = next_tokens_gpu
         self.decode_manager.filter_reqs(batch.reqs)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done)
+
+    def _undo_full_hit(self, req: Req, entry: FullHitEntry, token: int) -> None:
+        """A full hit whose first token is not the stored one: its state, draft rows and tree path are the first send's
+        token's. The entry goes, the request gives back what it took and goes back to the head of the queue to prefill."""
+        logger.error(
+            f"full hit for request {req.uid} sampled token {token}, not the stored {entry.first_token}: "
+            "entry dropped, the request prefills"
+        )
+        self.full_hits.drop(entry)
+        self.decode_manager.remove_req(req)
+        if self.spec is not None:
+            self.spec.release(req)
+        cm = self.cache_manager
+        cm.unlock(req.cache_handle)
+        cm.linear_state_pool.free([req.linear_slot_idx, *req.mamba_ping_pong])
+        self.table_manager.free(req.table_idx)
+        req.table_idx = -1
+        stats = req.stats
+        stats.first_chunk_at = stats.first_token_at = stats.last_token_at = None
+        self.prefill_manager.pending_list.insert(
+            0, PendingReq(req.uid, req.input_ids[: req.prompt_len].clone(), req.sampling_params,
+                          turn_anchor_len=req.turn_anchor_len, stats=stats),
+        )
 
     def _keep_full_hit(self, req: Req, logits: torch.Tensor, token: int) -> None:
         """Store what a prompt's final prefill left for an identical resend: on the engine stream, after the draft pass

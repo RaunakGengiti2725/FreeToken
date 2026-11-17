@@ -420,7 +420,7 @@ def _full_hit_setup(monkeypatch):
     )
     for name in ("_stamp_usage", "_finish_drained", "_kv_usage_pages", "_mamba_slot_usage", "_swa_token_usage",
                  "_free_req_resources", "_commit_tokens", "_keep_full_hit", "_full_hit_batch", "_forward_full_hit",
-                 "_restore_linear_states"):
+                 "_restore_linear_states", "_report_prompt_admissions", "_undo_full_hit"):
         setattr(stub, name, getattr(Scheduler, name).__get__(stub))
     monkeypatch.setattr(torch.cuda, "Event", lambda: SimpleNamespace(record=lambda stream: None, synchronize=lambda: None))
     import freetoken.kernel as kernel
@@ -520,7 +520,10 @@ def test_an_identical_resend_takes_the_first_sends_state_logits_and_pages_with_n
     sent = []
     stub.send_result = sent.extend
     Scheduler._process_last_data(stub, (SimpleNamespace(batch=batch), output))
-    assert [(m.uid, m.next_tokens, m.finished) for m in sent] == [(6, [31], False)]
+    # the admission reports the whole prompt cached, ahead of the token
+    assert [(type(m).__name__, m.uid) for m in sent] == [("PromptAdmittedMsg", 6), ("DetokenizeMsg", 6)]
+    assert (sent[0].prompt_tokens, sent[0].cached_tokens) == (PROMPT, PROMPT)
+    assert (sent[1].next_tokens, sent[1].finished) == ([31], False)
     assert len(store) == 1, "a full hit stores nothing again"
 
     # the resend finishes; a third send that ends on its first token still hits, and its timings count nothing computed
@@ -532,7 +535,7 @@ def test_an_identical_resend_takes_the_first_sends_state_logits_and_pages_with_n
     output = stub._forward_full_hit((batch, None, None, (torch.tensor([batch.reqs[0].table_idx]), torch.tensor([PROMPT]))))
     sent.clear()
     Scheduler._process_last_data(stub, (SimpleNamespace(batch=batch), output))
-    (msg,) = sent
+    msg = sent[-1]
     assert (msg.next_tokens, msg.finished, msg.finish_reason) == ([31], True, "length")
     assert (msg.timings["cache_n"], msg.timings["prompt_n"]) == (PROMPT, 0) and batch.reqs[0].table_idx == -1
     # then an eviction drops the entry and gives its state slot back
@@ -553,18 +556,54 @@ def test_the_first_token_key_names_what_decides_a_deterministic_first_token():
     assert greedy != first_token_key(SamplingParams(presence_penalty=1.5))
 
 
-def test_a_full_hit_waits_for_running_requests(monkeypatch):
-    """No full hit while another request decodes: the resend stays queued for the normal prefill."""
+def test_a_full_hit_waits_for_running_requests_and_falls_back_to_a_prefill_on_another_token(monkeypatch):
+    """No full hit beside a decoding request. A full hit whose sampled token is not the stored one drops the entry,
+    sends nothing, gives back its table row, state slots and lock, and goes back to the head of the queue to prefill."""
     from freetoken.message import UserMsg
     from freetoken.scheduler.full_hit import FullHitEntry, first_token_key
 
     pool, cm, tm, dm, pm, store, stub = _full_hit_setup(monkeypatch)
     prompt = torch.arange(1, PROMPT + 1, dtype=torch.int32)
     greedy = SamplingParams(max_tokens=8, ignore_eos=True)
-    store.add(FullHitEntry(prompt.clone(), torch.arange(PROMPT, dtype=torch.int32), pool.alloc(1)[0], torch.zeros(1, 50), None, 31,
-                           first_token_key(greedy)))
+    # the tree holds the prompt and one answer token, as a finished first send leaves it
+    first = Req(input_ids=prompt.clone(), table_idx=tm.allocate(), cached_len=0, output_len=8, uid=1,
+                sampling_params=greedy, cache_handle=cm.match_req(SimpleNamespace(input_ids=prompt, input_len=PROMPT)).cuda_handle)
+    first.linear_slot_idx, first.mamba_ping_pong = pool.alloc(1)[0], tuple(pool.alloc(2))
+    cm.lock(first.cache_handle)
+    cm.allocate_paged([first])
+    first.complete_one()
+    kv = cm.page_table[first.table_idx, :PROMPT].clone()
+    cm.allocate_paged([first])
+    first.append_host(torch.tensor([31], dtype=torch.int32))
+    first.commit_pending(1)
+    first.append_host(torch.tensor([7], dtype=torch.int32))
+    with cm.lazy_free_region():
+        stub._finish_drained(first)
+    logits = torch.zeros(1, 50)
+    logits[0, 9] = 1.0  # its argmax is not the stored first token
+    entry = FullHitEntry(prompt.clone(), kv, pool.alloc(1)[0], logits, None, 31, first_token_key(greedy))
+    store.add(entry)
+
     running = Req(input_ids=torch.arange(60, 70, dtype=torch.int32), table_idx=tm.allocate(), cached_len=9, output_len=4,
                   uid=9, sampling_params=greedy, cache_handle=None)
     dm.filter_reqs([running])
     pm.add_one_req(UserMsg(uid=2, input_ids=prompt.clone(), sampling_params=greedy))
-    assert Scheduler._full_hit_batch(stub) is None and len(pm.pending_list) == 1 and len(store) == 1
+    assert Scheduler._full_hit_batch(stub) is None and len(pm.pending_list) == 1
+    dm.remove_req(running)
+    tm.free(running.table_idx)
+
+    free = (len(cm.free_slots), cm.available_size, len(tm._free_slots), pool.num_free_slots)
+    batch = Scheduler._full_hit_batch(stub)
+    assert batch is not None and not pm.pending_list
+    stub._restore_linear_states(batch)
+    output = stub._forward_full_hit((batch, None, None, (torch.tensor([batch.reqs[0].table_idx]), torch.tensor([PROMPT]))))
+    sent = []
+    stub.send_result = sent.extend
+    Scheduler._process_last_data(stub, (SimpleNamespace(batch=batch), output))
+    assert not [m for m in sent if hasattr(m, "next_tokens") or hasattr(m, "cached_tokens")]
+    assert len(store) == 0 and not dm.running_reqs
+    assert [p.uid for p in pm.pending_list] == [2] and torch.equal(pm.pending_list[0].input_ids, prompt)
+    assert pm.pending_list[0].stats.first_chunk_at is None
+    # everything the hit took is back; the entry's own slot too
+    assert (len(cm.free_slots), cm.available_size, len(tm._free_slots), pool.num_free_slots) == (free[0], free[1], free[2], free[3] + 1)
+    cm.check_integrity()
