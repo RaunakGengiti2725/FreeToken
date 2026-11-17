@@ -269,7 +269,7 @@ def test_offload_moe_cache_loads_a_longer_chunk_on_demand_where_that_copies_less
         cache._prefill_snapshot_np, cache._prefill_id_snapshot = slots.numpy(), ids
         cache._prefill_free_slots = [np.nonzero(ids.numpy()[16:] < 0)[0] + 16]
         cache._prefill_hit_d2d_active, cache.all_resident, cache.prefill_demand_by_misses = True, False, True
-        cache._prefill_routed_copy, cache._prefill_breadth = False, [1.0] * L
+        cache._prefill_routed_copy = False
         for name, value in state.items():
             setattr(cache, name, value)
         cache.choose_prefill_path(0, torch.tensor([routes], dtype=torch.int32))
@@ -288,8 +288,28 @@ def test_offload_moe_cache_loads_a_longer_chunk_on_demand_where_that_copies_less
     staged = full.clone()
     staged[2], staged[3] = torch.arange(0, 8, dtype=torch.int32), torch.arange(8, 16, dtype=torch.int32)
     assert chosen(list(range(E)), staged)
-    # a layer that routes to half as many experts as the first copies half as many on demand: 4 + 4 + 3.5 + 3.5
-    assert chosen([1, 2, 3, 4, 5, 6, 7], _prefill_breadth=[1.0, 1.0, 0.5, 0.5])
+    # past the routed copy the rule is v5's (1ea1fa1), whatever chunks came before: random snapshots, routes and
+    # staging residents decide as its formula does
+    def v5_demand_copies_less(routed, slots):
+        absent, ids = slots.numpy() < 0, cache._prefill_id_snapshot.numpy()
+        share = (int(absent[0][routed].sum()) + 1) / (int(absent[0].sum()) + 1)
+        copies = sum(min(float(routed.size), share * int(absent[l].sum())) for l in range(L))
+        empty = int((ids < 0).sum())
+        return (copies + max(copies - empty, 0.0)) < int((slots.numpy() < 16).sum())
+
+    g = torch.Generator().manual_seed(3)
+    answers = set()
+    for _ in range(300):
+        # every hit slot full (else the stream fills it, as in v5), and a random number of staging-slot residents
+        slots = torch.full((L * E,), -1, dtype=torch.int32)
+        held = torch.randperm(L * E, generator=g)[: 8 + int(torch.randint(0, 17, (1,), generator=g))]
+        slots[held] = torch.cat([torch.arange(16, 24), torch.randperm(16, generator=g)])[: held.numel()].to(torch.int32)
+        slots = slots.view(L, E)
+        routes = torch.randint(0, E, (int(torch.randint(1, 12, (1,), generator=g)),), generator=g).tolist()
+        decided = chosen(routes, slots)
+        assert decided == v5_demand_copies_less(np.unique(np.array(routes)), slots), (routes, slots)
+        answers.add(decided)
+    assert answers == {True, False}
     # under the routed copy the stream copies the routed experts outside the hit slots, as many as demand copies
     # here, and wins the tie; with experts in staging slots it copies those too: 4 + 4 + 8 + 8 against 4 + 4 and 8 evictions
     assert not chosen([0, 1, 4, 4], _prefill_routed_copy=True)
