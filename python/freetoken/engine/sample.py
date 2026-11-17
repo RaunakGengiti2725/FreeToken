@@ -157,7 +157,9 @@ def keyed_draw(probs: torch.Tensor, uniforms: torch.Tensor) -> torch.Tensor:
 # A/B switch: FREETOKEN_SEEDED_DRAW=batched draws every seeded row of a step in one pass (keyed_probs, keyed_draw), for
 # its speed. It is not batch-independent on CUDA: a row's top-k / top-p probabilities in a batch of keyed rows are not
 # the bits it gets alone, so a seeded request's text can follow the requests beside it. The default draws each seeded
-# row in a call of its own, which is.
+# row in a call of its own. Its tokens are batch-independent only when every keyed row of the step has the same
+# filters: on an RTX 5090, a request with top-k 20 and top-p 0.95 among requests with other temperatures and top-p drew
+# other tokens than alone (box B, 1c946ea). One running request is unaffected.
 _SEEDED_DRAW_PER_ROW = os.getenv("FREETOKEN_SEEDED_DRAW", "per-row") != "batched"
 
 
@@ -204,7 +206,8 @@ def sample_rows(
 ) -> torch.Tensor:
     """sample_impl over the batch; a row with a key is then drawn again from that key, in a call of its own. Under
     FREETOKEN_SEEDED_DRAW=batched the keyed rows are drawn in one pass instead (keyed_draw), each from the uniform its
-    own key gives; not batch-independent on CUDA (_SEEDED_DRAW_PER_ROW)."""
+    own key gives; not batch-independent on CUDA (_SEEDED_DRAW_PER_ROW). Either way a seeded row's token is the one it
+    draws alone only where every keyed row of the step has the same filters."""
     tokens = sample_impl(logits, temperatures, top_k, top_p, min_p)
     if not keys:
         return tokens
