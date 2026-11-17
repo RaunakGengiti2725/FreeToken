@@ -6,6 +6,7 @@ The real unbound Scheduler methods run against CPU-built hybrid managers; the en
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import torch
 
@@ -282,3 +283,76 @@ def test_a_step_commits_up_to_its_first_finishing_token():
         assert (msg.finished, msg.finish_reason, msg.matched_stop) == (reason is not None, reason, matched), case
         assert req.input_ids.tolist() == before + committed, case
         assert req.toolcall_anchor_len == anchor_len, case
+
+
+def _prefill_drain(with_draft: bool, max_tokens: int):
+    """Drain the final prefill chunk of two requests (uid 1 finishes on its first token when max_tokens is 1); returns
+    the recorded events and the replies."""
+    pool, cm, tm, dm, stub, events = _setup()
+    reqs = []
+    for uid in (1, 2):
+        prompt = torch.arange(1, PROMPT + 1, dtype=torch.int32) + 100 * uid
+        match = cm.match_req(SimpleNamespace(input_ids=prompt, input_len=PROMPT))
+        req = Req(input_ids=prompt, table_idx=tm.allocate(), cached_len=0, output_len=max_tokens if uid == 1 else 16,
+                  uid=uid, sampling_params=SamplingParams(max_tokens=max_tokens if uid == 1 else 16, ignore_eos=True),
+                  cache_handle=match.cuda_handle)
+        req.linear_slot_idx = pool.alloc(1)[0]
+        req.mamba_ping_pong = tuple(pool.alloc(2))
+        req.mamba_next_track_idx = 1
+        cm.lock(match.cuda_handle)
+        cm.allocate_paged([req])
+        req.complete_one()
+        reqs.append(req)
+    dm.filter_reqs(reqs)
+    batch = Batch(reqs=reqs, phase="prefill")
+    cache_req = cm.cache_req
+
+    def cached(req, finished):
+        events.append(("cache", req.uid))
+        cache_req(req, finished=finished)
+
+    cm.cache_req = cached
+    sent = []
+    stub.send_result = lambda reply: (events.append(("send", [m.uid for m in reply])), sent.extend(reply))
+    stub.finished_reqs = set()
+    stub.status_reporter = SimpleNamespace(report_batch=lambda *a, **k: events.append(("report",)))
+    stub.prefill_manager = SimpleNamespace(pending_list=[])
+    stub.config.page_size = 1
+    for name in ("_stamp_usage", "_finish_drained", "_kv_usage_pages", "_mamba_slot_usage", "_swa_token_usage"):
+        setattr(stub, name, getattr(Scheduler, name).__get__(stub))
+    stub._gpu_mem_bytes = lambda: 0
+    tokens = torch.tensor([31, 32], dtype=torch.int32)
+    draft = (lambda: events.append(("draft",))) if with_draft else None
+    output = engine_output(tokens, draft)
+    Scheduler._process_last_data(stub, (SimpleNamespace(batch=batch), output))
+    return events, [(m.uid, m.next_tokens, m.finished, m.finish_reason) for m in sent]
+
+
+class _Output(NamedTuple):
+    """engine.ForwardOutput's fields, without importing the engine's kernels."""
+
+    next_tokens_gpu: torch.Tensor
+    next_tokens_cpu: torch.Tensor
+    copy_done_event: object
+    draft_prefill: object
+
+
+def engine_output(tokens, draft):
+    return _Output(tokens, tokens, SimpleNamespace(synchronize=lambda: None), draft)
+
+
+def test_a_prefill_drain_sends_the_first_tokens_before_the_draft_pass_and_frees_after_it():
+    """The first sampled tokens leave before the draft's prompt pass, and every free and prefix insert of the batch
+    waits for the pass, which reads and writes the requests' pages through the page table. The replies are those of
+    a drain without a draft pass, whose page operations run in their places as before."""
+    for max_tokens in (1, 16):
+        events, replies = _prefill_drain(True, max_tokens)
+        plain_events, plain_replies = _prefill_drain(False, max_tokens)
+        assert replies == plain_replies == [(1, [31], max_tokens == 1, "length" if max_tokens == 1 else None),
+                                            (2, [32], False, None)]
+        pages = [e for e in events if e[0] in ("free", "cache")]
+        assert events[: 2] == [("send", [1, 2]), ("draft",)] and events[2 : 2 + len(pages)] == pages
+        # a finishing request is freed (its free commits the prefix), the other's prefix is inserted
+        assert pages == ([("free", 1), ("cache", 1)] if max_tokens == 1 else [("cache", 1)]) + [("cache", 2)]
+        # without a draft pass the order is the drain's as before: page operations first, then the report and the send
+        assert plain_events == pages + [("report",), ("send", [1, 2])]

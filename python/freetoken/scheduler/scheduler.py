@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import functools
 import math
 import os
 import time
 from dataclasses import replace
 
-from typing import TYPE_CHECKING, Iterable, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
+from typing import TYPE_CHECKING, Callable, Iterable, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
 from freetoken.core import Batch, Req, SamplingParams
@@ -438,12 +439,17 @@ class Scheduler(SchedulerIOMixin):
 
         batch, output = last_data[0].batch, last_data[1]
         _, next_tokens_cpu, copy_done = output[:3]
+        # a prefill's draft pass: it runs once the sampled tokens are sent, before the pages are freed or cached
+        draft_prefill = getattr(output, "draft_prefill", None)
         copy_done.synchronize()
         # tokens are on the host from here: the per-request timings' token stamps
         now = time.perf_counter()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         generated = None
+        held: List[Callable[[], None]] = []
+        # without a draft pass every page operation runs in its place
+        hold = held.append if draft_prefill is not None else (lambda action: action())
         with self.cache_manager.lazy_free_region():
             if batch.phase == "verify":
                 generated = self._drain_verify(batch, output, reply, new_finished_reqs)
@@ -457,14 +463,13 @@ class Scheduler(SchedulerIOMixin):
                             # Aborted mid-chunked-prefill while this chunk was in flight: the abort
                             # popped the pending continuation (no next chunk launches), and this
                             # drain point frees the chunk's pages/slots exactly once.
-                            self._free_req_resources(req)
+                            hold(functools.partial(self._free_req_resources, req))
                         continue
                     if req.aborted:
                         # Aborted while this final-chunk prefill / decode step was in flight: free
                         # here (the forward is drained) and finish the request. No DetokenizeMsg --
                         # the abort ack flushed after this method stays the uid's terminal reply.
-                        self.decode_manager.remove_req(req)
-                        self._free_req_resources(req)
+                        hold(functools.partial(self._finish_drained, req))
                         new_finished_reqs.add(req)
                         continue
                     if req in self.finished_reqs:
@@ -484,8 +489,7 @@ class Scheduler(SchedulerIOMixin):
 
                     # NOTE: overlap scheduling may make the request freed twice, skip second free
                     if finished and req not in self.finished_reqs:
-                        self.decode_manager.remove_req(req)
-                        self._free_req_resources(req)
+                        hold(functools.partial(self._finish_drained, req))
                         new_finished_reqs.add(req)
                     elif batch.is_prefill and req.table_idx != -1:
                         # for prefill, non-chunk req, cache the prefix.
@@ -496,11 +500,39 @@ class Scheduler(SchedulerIOMixin):
                         # never reach this commit -- but if a future path frees one early, skip
                         # rather than re-read the freed page-table row (and on hybrid, deref the
                         # None'd GDN ping-pong slots).
-                        self.cache_manager.cache_req(req, finished=False)
+                        hold(functools.partial(self.cache_manager.cache_req, req, finished=False))
+            if draft_prefill is not None:
+                # the first tokens go out before the draft's prompt pass; its pages are still the request's own
+                self._stamp_usage(reply)
+                self.send_result(reply)
+                draft_prefill()
+                for action in held:
+                    action()
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
+        used, total, mamba_slots, swa_tokens = self._stamp_usage(reply if draft_prefill is None else [])
+        self.status_reporter.report_batch(
+            batch,
+            running_reqs=len(self.decode_manager.running_reqs),
+            queue_reqs=len(self.prefill_manager.pending_list),
+            kv_used_pages=used,
+            kv_total_pages=total,
+            page_size=self.config.page_size,
+            mamba_slots=mamba_slots,
+            swa_tokens=swa_tokens,
+            generated=generated,
+        )
+        if draft_prefill is None:
+            self.send_result(reply)
+
+    def _finish_drained(self, req: Req) -> None:
+        self.decode_manager.remove_req(req)
+        self._free_req_resources(req)
+
+    def _stamp_usage(self, reply: List[DetokenizeMsg]):
+        """Stamp ``reply`` with the pools' occupancy now; returns (kv used, kv total, mamba slots, swa tokens)."""
         used, total = self._kv_usage_pages()
         mamba_slots = self._mamba_slot_usage()
         swa_tokens = self._swa_token_usage()
@@ -516,18 +548,7 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
-        self.status_reporter.report_batch(
-            batch,
-            running_reqs=len(self.decode_manager.running_reqs),
-            queue_reqs=len(self.prefill_manager.pending_list),
-            kv_used_pages=used,
-            kv_total_pages=total,
-            page_size=self.config.page_size,
-            mamba_slots=mamba_slots,
-            swa_tokens=swa_tokens,
-            generated=generated,
-        )
-        self.send_result(reply)
+        return used, total, mamba_slots, swa_tokens
 
     def _drain_verify(self, batch: Batch, output, reply: List[DetokenizeMsg], new_finished_reqs: Set[Req]) -> int:
         """Commit each request's accepted tokens, return the slots its rejected rows took, then the target state; returns the tokens committed."""
