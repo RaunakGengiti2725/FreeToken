@@ -289,6 +289,8 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
         if _signalled:
             raise  # the launcher's own exit on a signal, not the parser's
         raise RuntimeError(f"the bench refused the command line (exit {exc.code})") from None
+    # a candidate is timed on decode: the first-request warmup would only spend its seconds to ready
+    ns.server_env = {"FREETOKEN_WARM_FIRST_REQUEST": "0"}
     builtin = dict(benchdecode.BUILTIN_PROMPTS)
     sampling, _ = benchdecode.resolve_sampling(ns.model, ns.greedy)
     ns.eos = benchdecode.eos_strings(ns.model)
