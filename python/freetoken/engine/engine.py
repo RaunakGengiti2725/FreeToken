@@ -1417,7 +1417,7 @@ class Engine:
             if reserve < target:
                 logger.warning_rank0(
                     f"{what}: a larger one leaves fewer expert slots than the {plain[0]} a server without the preset plans. "
-                    "A longer prompt and answer end with finish_reason length"
+                    "A longer prompt is refused (context_length_exceeded) and a longer answer is cut (finish_reason length)"
                 )
             elif reserve < asked:
                 logger.info_rank0(f"{what}: the model's context is {config.max_seq_len} tokens")
@@ -1439,15 +1439,15 @@ class Engine:
         logger.warning_rank0(
             f"--preset {config.preset}: a KV reserve of {target} tokens ({_preset_kv_words(config)}) does not fit "
             f"beside the expert cache's minimum; keeping the default plan of {kept[0]} expert slots and {kept[1] * page} KV tokens, "
-            f"where a longer prompt and answer end with finish_reason length. {more}"
+            f"where a longer prompt is refused (context_length_exceeded) and a longer answer is cut (finish_reason length). {more}"
         )
 
     def _settle_preset_small_plan_reserve(self, config: EngineConfig, banks, method, max_slots) -> None:
         """A one-request preset's KV reserve goes down to its floor, a prefill chunk and PRESET_CHUNK_ANSWER_TOKENS of
         answer (never under the default), where the plan at the reserve settled so far holds under
         PRESET_SMALL_PLAN_SHARE of all experts: there every slot the reserve's pages take is a miss more on each decode
-        step. One warning says so; a longer prompt and answer then end with finish_reason length. A typed
-        --max-output-tokens, which the reserve was sized for, keeps it."""
+        step. One warning says so: a longer prompt is then refused (context_length_exceeded) and a longer answer is cut
+        (finish_reason length). A typed --max-output-tokens, which the reserve was sized for, keeps it."""
         from freetoken.engine.cache_budget import _plan_or_short
 
         if config.max_running_req != 1 or getattr(config, "max_output_tokens", None) is not None:
@@ -1617,7 +1617,7 @@ class Engine:
             # only where the expert cache was not sized by --moe-cache-auto, which keeps the reserve
             logger.warning_rank0(
                 f"{line}; fewer KV tokens than {_preset_kv_words(config)} ({_preset_kv_target(config)}): "
-                "a longer prompt and answer end with finish_reason length"
+                "a longer prompt is refused (context_length_exceeded) and a longer answer is cut (finish_reason length)"
             )
         else:
             logger.info_rank0(line)
