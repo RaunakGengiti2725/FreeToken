@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Callable, List, Tuple
 
 import torch
 from freetoken.core import Req
@@ -67,6 +67,8 @@ class CacheManager:
         assert not (radix_lookahead and self.is_swa), "the SWA radix cache keeps token keys"
         self.radix_lookahead = radix_lookahead
         self.reproducible_seeds = reproducible_seeds
+        # called on every eviction that frees tree pages, and where state slots run short; returns whether it gave slots back (full_hit.FullHitStore)
+        self.on_evict: Callable[[], bool] | None = None
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -162,9 +164,14 @@ class CacheManager:
         while self.linear_state_pool.num_free_slots < n:
             er = self.prefix_cache.evict_mamba(n - self.linear_state_pool.num_free_slots)
             if not er.mamba_slots:
+                # the slots kept beside the tree go before an admission fails
+                if self.on_evict is not None and self.on_evict():
+                    continue
                 break
             self.linear_state_pool.free(er.mamba_slots)
             self._free(er.kv_indices)
+            if er.kv_indices.numel():
+                self._evicted()
 
     def snapshot_toolcall_anchor(self, reqs: List[Req]) -> None:
         """Freeze each decoding request's GDN state at its tool-call anchor, into the ping-pong
@@ -648,8 +655,14 @@ class CacheManager:
             er = self.prefix_cache.evict_full(need)
             if er.mamba_slots:
                 self.linear_state_pool.free(er.mamba_slots)
+            if er.kv_indices.numel():
+                self._evicted()
             return er.kv_indices
         return self.prefix_cache.evict(need)
+
+    def _evicted(self) -> None:
+        if self.on_evict is not None:
+            self.on_evict()
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):

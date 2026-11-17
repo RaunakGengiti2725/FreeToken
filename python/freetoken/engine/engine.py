@@ -883,6 +883,8 @@ class ForwardOutput(NamedTuple):
     # a prefill's draft pass, which the drain runs after it sends the sampled tokens and before it frees or caches
     # the batch's pages: the draft reads and writes them through the page table
     draft_prefill: Callable[[], None] | None = None
+    # a prefill's last-row logits, kept where the scheduler stores full hits (scheduler/full_hit.py)
+    prefill_logits: torch.Tensor | None = None
 
 
 class Engine:
@@ -2528,7 +2530,9 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         draft = functools.partial(self.spec.on_prefill, batch, next_tokens_gpu) if spec_prefill else None
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, draft)
+        # a copy: a replayed graph's output buffer is written again by the next step
+        kept = batch_logits.clone() if batch.is_prefill and getattr(self, "keep_prefill_logits", False) else None
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, draft, kept)
 
     @torch.inference_mode()
     def _warmup_prefill(self, autotune: bool = True, keeps: bool = False) -> None:

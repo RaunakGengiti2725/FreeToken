@@ -80,6 +80,8 @@ class EnvClassSingleton:
     GDN_RULE_TOKENS = EnvInt(2048)
     # Serve a few internal requests before the readiness ack so that the first real one finds its kernels loaded.
     WARM_FIRST_REQUEST = EnvBool(True)
+    # An identical resend samples the first send's stored logits and state without a forward (scheduler/full_hit.py).
+    FULL_HIT = EnvBool(False)
 
     def __new__(cls):
         # single instance
