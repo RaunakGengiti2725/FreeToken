@@ -202,7 +202,9 @@ has 8 threads or more (`--moe-cpu-threads`, or one a physical core within the CP
 `offload` otherwise: on one box's 12 GiB, 8 GiB, 20% and 5% cells, `offload` there was 31% to 51%
 under the fastest typed flags, and `--preset single-measured`, which took `hybrid` with 3 draft
 tokens, within 1% to 19%. A typed `--moe-strategy`,
-`--max-running-requests` or `--moe-cpu-layers` keeps what it set. Under `hybrid` a prefill chunk
+`--max-running-requests` or `--moe-cpu-layers` keeps what it set, and a typed `--reproducible-seeds`
+or `--moe-prefill-demand-tokens`, which `hybrid` cannot serve, keeps `offload`; `--preset
+single-measured` then times no `hybrid` candidate either. Under `hybrid` a prefill chunk
 does not load its experts on demand (above), and hybrid's text can differ from offload's where two
 tokens are nearly tied (below). Where it serves `fused` (the
 first way above) and the store below holds a draft token map for the checkpoint whose sha256 is

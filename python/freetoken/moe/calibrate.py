@@ -181,13 +181,16 @@ def candidates(args, static: tuple[str, int, str | None], token_map: str | None 
         elif depth is not None and token_map and "moe_strategy" not in left:
             out.append(cand("fused", MAP_DEPTH, token_map))
         return out
-    others = [] if "moe_strategy" not in left else [s for s in ("hybrid", "offload") if s != strategy]
+    # hybrid refuses --reproducible-seeds and a typed --moe-prefill-demand-tokens: its server would not start
+    typed_demand = getattr(args, "moe_prefill_demand_tokens", 0) and "moe_prefill_demand_tokens" not in left
+    hybrid_ok = not (getattr(args, "reproducible_seeds", False) or typed_demand)
+    others = [] if "moe_strategy" not in left else [s for s in ("hybrid", "offload") if s != strategy and (s != "hybrid" or hybrid_ok)]
     if depth is None or depth == 0:
         return out + [cand(s, depth) for s in others]
     if strategy == "hybrid":
         out.append(cand("hybrid", 0))
     out += [cand(s, depth) for s in others]
-    if strategy != "hybrid" and others:
+    if strategy != "hybrid" and "hybrid" in others:
         out.append(cand("hybrid", 0))
     if "offload" in (strategy, *others):
         out.append(cand("offload", 0))
