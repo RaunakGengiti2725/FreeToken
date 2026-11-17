@@ -191,8 +191,15 @@ plan line says which. Both give the same output as the expert cache does.
   choice to the token count alone.
 
 `--preset single` measures nothing: it serves with `fused` where every expert fits as described
-above, else with `offload` (or what `--moe-strategy auto` takes from an
-[`ft bench decode`](#ft-bench-decode) row), and 3 draft tokens. Where it serves `fused` (the
+above, else with what `--moe-strategy auto` takes from an [`ft bench decode`](#ft-bench-decode)
+row, and 3 draft tokens. Where no row answers for the setup it serves `hybrid` if the CPU MoE pool
+has 8 threads or more (`--moe-cpu-threads`, or one a physical core within the CPU quota), and
+`offload` otherwise: on one box's 12 GiB, 8 GiB, 20% and 5% cells, `offload` there was 31% to 51%
+under the fastest typed flags, and `--preset single-measured`, which took `hybrid` with 3 draft
+tokens, within 1% to 19%. A typed `--moe-strategy`,
+`--max-running-requests` or `--moe-cpu-layers` keeps what it set. Under `hybrid` a prefill chunk
+does not load its experts on demand (above), and hybrid's text can differ from offload's where two
+tokens are nearly tied (below). Where it serves `fused` (the
 first way above) and the store below holds a draft token map for the checkpoint whose sha256 is
 the one its manifest records, it serves 5 MTP draft tokens with that map instead; on two cards
 that held every expert of Qwen3.6-35B-A3B NVFP4, 5 drafts with a 32K map decoded 19% and 5%
@@ -560,7 +567,7 @@ profile from a build whose rows held one number per column is not read, and the 
 `--preset single-measured` keeps its own timings in the same file, under its own key: `auto`
 does not read them, and the preset does not read the rows of this command.
 
-Without such a row `auto` stays on `offload`. Rows are Linux only: the machine is read from `/proc`
+Without such a row `auto` stays on `offload` (`--preset single` may take `hybrid` there, see [Presets](#presets)). Rows are Linux only: the machine is read from `/proc`
 and `/sys`, and where that cannot be done no row is filed and `auto` stays on `offload`.
 Tensor-parallel servers are never picked from rows.
 Hybrid computes some experts on the CPU, so where two tokens are nearly tied its output can differ

@@ -2736,7 +2736,7 @@ def _gpu_free_bytes() -> int | None:
 
 
 def _measured_decode_strategy(config: EngineConfig) -> tuple[str, dict | None]:
-    """``(strategy, row)`` for --moe-strategy auto on a model that would take offload: hybrid only on a decode row measured for this setup, on this machine and release (moe/decode_profile.py); offload otherwise, as before."""
+    """``(strategy, row)`` for --moe-strategy auto on a model that would take offload: hybrid on a decode row measured for this setup, on this machine and release (moe/decode_profile.py); where no row answers, what a one-request preset takes there (_preset_without_row); offload otherwise, as before."""
     from freetoken.moe import decode_profile
 
     def offload(reason: str) -> tuple[str, None]:
@@ -2757,7 +2757,7 @@ def _measured_decode_strategy(config: EngineConfig) -> tuple[str, dict | None]:
         # a hand-edited row below the cache's floor would cap the cache under it and fail the start
         row, reason = None, f"the decode row's hybrid cache is below this model's floor of {floor} slots"
     if row is None:
-        return offload(reason)
+        return _preset_without_row(config, reason) or offload(reason)
     # the rounding mode this server will run (moe/offload_kernels.py reads the same variable)
     round_mode = (os.getenv("FREETOKEN_HYBRID_FETCH_ROUND") or "min-wait").strip().lower()
     verdict = decode_profile.verdict_for(row, round_mode)
@@ -2768,9 +2768,38 @@ def _measured_decode_strategy(config: EngineConfig) -> tuple[str, dict | None]:
         return "offload", None
     if _moe_cache_is_auto(config):
         if objection := decode_profile.auto_size_objection(row, _gpu_free_bytes(), config.memory_ratio):
-            return offload(objection)
+            return _preset_without_row(config, objection) or offload(objection)
     logger.info_rank0(f"--moe-strategy auto: {decode_profile.explain(row, verdict)}")
     return "hybrid", row
+
+
+# --preset single on an expert cache that holds part of the experts, where no decode row answers: hybrid with a CPU MoE
+# pool of this many threads or more. On one box's 12 GiB, 8 GiB, 20% and 5% cells --preset single stayed on offload and
+# was 31% to 51% under the best typed flags, and single-measured's hybrid with 3 drafts 1% to 19%; the count is unmeasured
+PRESET_HYBRID_THREADS = 8
+
+
+def _cpu_pool_threads(config) -> int:
+    """Threads of the CPU MoE pool this server would start (moe/cpu_executor.py), counted without its log lines."""
+    from freetoken.moe.cpu_executor import pool_threads
+
+    return pool_threads(config.moe_cpu_threads)
+
+
+def _preset_without_row(config, reason: str) -> tuple[str, None] | None:
+    """('hybrid', None) for a one-request preset that left the strategy to it, where no decode row answers for this
+    setup (``reason``) and the CPU MoE pool has PRESET_HYBRID_THREADS threads or more; None elsewhere. A row that was
+    measured still decides, and a typed --moe-strategy, --moe-cpu-layers or running-request count is left alone."""
+    if "moe_strategy" not in getattr(config, "preset_fields", ()) or config.max_running_req != 1 or config.moe_cpu_layers:
+        return None
+    threads = _cpu_pool_threads(config)
+    if threads < PRESET_HYBRID_THREADS:
+        return None
+    logger.info_rank0(
+        f"--preset {config.preset}: hybrid ({reason}; the CPU MoE pool has {threads} threads, {PRESET_HYBRID_THREADS} or "
+        "more); `ft bench decode` measures it against offload, and --moe-strategy offload keeps offload"
+    )
+    return "hybrid", None
 
 
 # expert activations the CPU MoE executor supports (csrc ActKind)

@@ -199,6 +199,15 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     spreading first across physical cores, then across the remaining logical CPUs
     (so distinct hardware threads are used before any core is doubled up).
     """
+    return _pool_cpus(requested, log=True)
+
+
+def pool_threads(requested: int) -> int:
+    """The worker pool's thread count resolve_threads_and_affinity gives for ``requested``, without its log lines."""
+    return _pool_cpus(requested, log=False)[0]
+
+
+def _pool_cpus(requested: int, log: bool) -> tuple[int, list[int]]:
     reps = physical_core_cpus()
     if requested and requested > 0:
         n = int(requested)
@@ -217,20 +226,22 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     quota = cgroup_cpu_quota()
     fit = len(reps) if quota is None else max(1, int(quota) - _QUOTA_SPARE)
     if fit < len(reps):
-        logger.info_rank0(
-            f"CPU MoE pool: {fit} of {len(reps)} physical cores, to fit the cgroup CPU quota of "
-            f"{quota:.2f} CPUs (--moe-cpu-threads sets the count)"
-        )
+        if log:
+            logger.info_rank0(
+                f"CPU MoE pool: {fit} of {len(reps)} physical cores, to fit the cgroup CPU quota of "
+                f"{quota:.2f} CPUs (--moe-cpu-threads sets the count)"
+            )
         reps = reps[:fit]
     # Where every allowed CPU is its own core (a VM, a container pinned without SMT siblings), one thread per core
     # leaves none of the two free CPUs _spin_wait_ok asks for, and the pool parks between tasks.
     allowed = _allowed_cpus()
     if _SPIN_WAIT and allowed is not None and len(reps) >= _SPIN_MIN_CORES and allowed - len(reps) < _SPIN_SPARE:
         room = allowed - _SPIN_SPARE
-        logger.info_rank0(
-            f"CPU MoE pool: {room} of {len(reps)} physical cores, to leave {_SPIN_SPARE} of the {allowed} allowed CPUs "
-            "free so the pool can spin (--moe-cpu-threads sets the count)"
-        )
+        if log:
+            logger.info_rank0(
+                f"CPU MoE pool: {room} of {len(reps)} physical cores, to leave {_SPIN_SPARE} of the {allowed} allowed CPUs "
+                "free so the pool can spin (--moe-cpu-threads sets the count)"
+            )
         reps = reps[:room]
     return len(reps), list(reps)
 

@@ -798,6 +798,8 @@ def decode_rows(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "_cpu_moe_executor_viable", lambda model_config: True)
     monkeypatch.setattr(engine, "_profile_gpu", lambda index=None: _ROW_GPU)
     monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: _ROW_FREE)
+    # a CPU MoE pool under PRESET_HYBRID_THREADS, whatever this machine has: a preset's cache stays on offload without a row
+    monkeypatch.setattr(engine, "_cpu_pool_threads", lambda config: 4)
     monkeypatch.setattr("freetoken.version.__version__", "9.9.9+gabc")
     proc = {"/proc/meminfo": "65536000 kB", "/proc/cpuinfo": "Fake CPU", "/sys/fs/cgroup/cpu.max": "max 100000"}
     monkeypatch.setattr(decode_profile, "_first_line", lambda path, prefix="": proc.get(path))
@@ -1211,6 +1213,46 @@ def test_preset_serves_the_stores_draft_token_map_only_where_every_expert_is_res
     # a partial expert cache changes nothing, and neither does a typed fused: a calibration candidate's server has one
     assert resolved(free=partial) == (("offload", 3, None), "")
     assert resolved(fields=drafts, moe_strategy="fused") == (("fused", 3, None), "")
+
+
+@pytest.mark.parametrize(
+    "level, resident, flags",
+    [("full card", True, {}), ("12 GiB", False, {}), ("8 GiB", False, {}), ("20%", False, {"moe_cache_rate": 0.2}), ("5%", False, {"moe_cache_rate": 0.05})],
+)
+def test_preset_serves_hybrid_on_a_partial_cache_without_a_decode_row_where_the_cpu_pool_has_8_threads(decode_rows, monkeypatch, level, resident, flags):
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.engine import PRESET_HYBRID_THREADS
+
+    engine = decode_rows.engine
+    assert PRESET_HYBRID_THREADS == 8
+    monkeypatch.setattr(engine, "_preset_takes_fused", lambda config: resident)  # the full card's rule has a test of its own
+    lines = []
+    monkeypatch.setattr(engine.logger, "info_rank0", lines.append)
+
+    def served(threads=8, fields=("moe_strategy", "max_running_req"), **more):
+        monkeypatch.setattr(engine, "_cpu_pool_threads", lambda config: threads)
+        config = _resolved(decode_rows, preset="single", preset_fields=fields, **{"max_running_req": 1, **flags, **more})
+        return config.moe_strategy
+
+    partial = "fused" if resident else "hybrid"
+    assert served() == partial and served(threads=16) == partial
+    if not resident:
+        assert any(line.startswith("--preset single: hybrid (") and "the CPU MoE pool has 8 threads" in line for line in lines)
+    # a smaller pool, or a strategy, a request count or CPU layers from the command line: offload as before
+    assert served(threads=PRESET_HYBRID_THREADS - 1) == ("fused" if resident else "offload")
+    assert served(fields=("max_running_req",), moe_strategy="offload") == "offload"
+    assert served(fields=("moe_strategy",), max_running_req=2) == ("fused" if resident else "offload")
+    assert resident or served(moe_cpu_layers="2") == "offload"  # CPU layers are never resident (_preset_resident_need)
+    # nor where hybrid cannot run, and a decode row measured for the setup decides before the rule: offload where it says so
+    with monkeypatch.context() as m:
+        m.setattr(engine, "_cpu_moe_executor_viable", lambda model_config: False)
+        assert served() == ("fused" if resident else "offload")
+    assert served(tp_info=DistributedInfo(rank=0, size=2)) == ("fused" if resident else "offload")
+    if not resident:
+        _file_row(decode_rows, _HYBRID_SLOWER, max_running_req=1, **flags)
+        assert served() == "offload"
+        _file_row(decode_rows, _HYBRID_FASTER, max_running_req=1, **flags)
+        assert served() == "hybrid" and _resolved(decode_rows, preset="single", preset_fields=("moe_strategy",), max_running_req=1, **flags).moe_decode_row is not None
 
 
 def test_preset_keeps_its_drafts_only_where_the_offload_cache_holds_a_fifth_of_the_experts(monkeypatch):
