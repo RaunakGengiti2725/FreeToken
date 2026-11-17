@@ -2997,10 +2997,13 @@ def _preset_without_row(config, reason: str) -> tuple[str, None] | None:
         why = "every expert fits on the GPU" if fits else "whether every expert fits on the GPU cannot be counted before the load"
         logger.info_rank0(f"--preset {config.preset}: offload, not hybrid ({why})")
         return None
-    # under a fifth, as for the preset's drafts (PRESET_DRAFT_SHARE): with 8 GiB free on an RTX 5090, hybrid on a cache of
-    # 1609 of 10240 experts ran out of memory in long prefills where offload with the same cache answered to 32K tokens
-    share = _preset_expert_share(config)
-    if share is None or share < PRESET_DRAFT_SHARE:
+    # an automatic plan under a fifth, as for the preset's drafts (PRESET_DRAFT_SHARE): with 8 GiB free on an RTX 5090,
+    # hybrid on a planned cache of 1609 of 10240 experts ran out of memory in long prefills where offload with the same
+    # cache answered to 32K tokens. A cache the command line sized leaves the rest of the card free: hybrid at any share
+    # (5% caches: 1.6 and 14 times offload's decode on two boxes, no failures)
+    sized = config.moe_cache_size > 0 or config.moe_cache_rate or config.moe_cache_mem is not None
+    share = None if sized else _preset_expert_share(config)
+    if not sized and (share is None or share < PRESET_DRAFT_SHARE):
         held = "cannot be counted before the load" if share is None else f"is about {share:.0%}, under {PRESET_DRAFT_SHARE:.0%}"
         logger.info_rank0(f"--preset {config.preset}: offload, not hybrid (the share of the experts the expert cache holds {held})")
         return None

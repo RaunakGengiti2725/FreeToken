@@ -1292,10 +1292,10 @@ def test_preset_serves_the_stores_draft_token_map_only_where_every_expert_is_res
 
 
 def test_preset_takes_hybrid_only_where_the_expert_cache_holds_a_fifth_of_the_experts(decode_rows, monkeypatch):
-    """4a's line: hybrid where the expert cache holds 20% of the experts or more, offload under it (box B's 8 GiB plan,
-    1609 of 10240, ran out of memory under hybrid where offload answered). A typed size or rate is the share; an
-    automatic cache's share is counted before the load from the experts' bytes, what the server needs beside them, the
-    staging buffers and the free memory; where it cannot be counted, offload."""
+    """4a's line for an automatic cache: hybrid where the plan holds 20% of the experts or more, offload under it (box
+    B's 8 GiB plan, 1609 of 10240, ran out of memory under hybrid where offload answered). The share is counted before
+    the load from the experts' bytes, what the server needs beside them, the staging buffers and the free memory; where
+    it cannot be counted, offload. A cache the command line sized (size, rate or memory) takes hybrid at any share."""
     engine = decode_rows.engine
     monkeypatch.setattr(engine, "_preset_takes_fused", lambda config: False)
     monkeypatch.setattr(engine, "_preset_every_expert_fits", lambda config: False)
@@ -1305,11 +1305,9 @@ def test_preset_takes_hybrid_only_where_the_expert_cache_holds_a_fifth_of_the_ex
         return _resolved(decode_rows, preset="single", preset_fields=("moe_strategy", "max_running_req"), max_running_req=1,
                          memory_ratio=0.95, **flags).moe_strategy
 
-    # the fixture's 80 experts: 16 slots is a fifth
-    assert strategy(moe_cache_size=16) == "hybrid" and strategy(moe_cache_size=15) == "offload"
-    # a rate is rounded up to slots: 0.19 of 80 is 16
-    assert strategy(moe_cache_rate=0.2) == "hybrid" and strategy(moe_cache_rate=0.18) == "offload"
-    assert strategy(moe_cache_rate=1609 / 10240) == "offload"
+    # a typed cache, at any share of the fixture's 80 experts
+    assert strategy(moe_cache_size=16) == strategy(moe_cache_size=4) == "hybrid"
+    assert strategy(moe_cache_rate=0.2) == strategy(moe_cache_rate=0.05) == strategy(moe_cache_rate=1609 / 10240) == "hybrid"
     # automatic: 1000 bytes of experts, 1000 more the server needs, staging of two of ten layers' experts (200 bytes):
     # 0.95 x free - 1200 must reach 200
     monkeypatch.setattr(engine, "_checkpoint_expert_bytes", lambda path: 1000)
@@ -1317,15 +1315,18 @@ def test_preset_takes_hybrid_only_where_the_expert_cache_holds_a_fifth_of_the_ex
     for free, want in ((1474, "hybrid"), (1473, "offload"), (1 << 20, "hybrid")):
         monkeypatch.setattr(engine, "_gpu_free_bytes", lambda free=free: free)
         assert strategy() == want, free
-    assert strategy(moe_cache_mem=200) == "hybrid" and strategy(moe_cache_mem=199) == "offload"
+    monkeypatch.setattr(engine, "_gpu_free_bytes", lambda free=1473: free)
+    assert strategy(moe_cache_mem=200) == strategy(moe_cache_mem=50) == "hybrid"
     monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: None)
-    assert strategy() == "offload"
+    assert strategy() == "offload" and strategy(moe_cache_mem=50) == "hybrid"
     monkeypatch.setattr(engine, "_checkpoint_expert_bytes", lambda path: None)
-    assert strategy(moe_cache_mem=1 << 30) == "offload"
+    assert strategy() == "offload"
 
 
-# the share of the experts each level's expert cache holds (box B's 8 GiB plan: 1609 of 10240)
+# the share of the experts each level's expert cache holds (box B's 8 GiB plan: 1609 of 10240); the line applies to the
+# automatic plans only, and the typed rates (20%, 5%) take hybrid at any share
 _LEVEL_SHARE = {"full card": 1.0, "12 GiB": 0.39, "8 GiB": 1609 / 10240, "20%": 0.2, "5%": 0.05}
+_LEVEL_TYPED = {"20%", "5%"}
 
 
 @pytest.mark.parametrize(
@@ -1349,8 +1350,8 @@ def test_preset_serves_hybrid_on_a_partial_cache_without_a_decode_row_where_the_
         config = _resolved(decode_rows, preset="single", preset_fields=fields, **{"max_running_req": 1, **flags, **more})
         return config.moe_strategy
 
-    # hybrid only where the cache holds a fifth of the experts or more: 12 GiB and 20%, not 8 GiB or 5%
-    partial = "fused" if resident else ("hybrid" if _LEVEL_SHARE[level] >= 0.2 else "offload")
+    # hybrid where the automatic plan holds a fifth of the experts or more (12 GiB, not 8 GiB) and on any typed cache
+    partial = "fused" if resident else ("hybrid" if level in _LEVEL_TYPED or _LEVEL_SHARE[level] >= 0.2 else "offload")
     assert served() == partial and served(threads=16) == partial
     if partial == "hybrid":
         assert any(line.startswith("--preset single: hybrid (") and "the CPU MoE pool has 8 threads" in line for line in lines)
@@ -1430,7 +1431,7 @@ def test_preset_keeps_offload_where_an_expert_cache_would_hold_every_expert(deco
         ("12 GiB", False, {}, ("hybrid", 3, None), ("offload", 3, None), ["hybrid@3", "hybrid@0", "offload@3", "offload@0"]),
         ("8 GiB", False, {}, ("offload", 3, None), ("offload", 3, None), ["offload@3", "hybrid@3", "hybrid@0", "offload@0"]),
         ("20%", False, {"moe_cache_rate": 0.2}, ("hybrid", 3, None), ("offload", 3, None), ["hybrid@3", "hybrid@0", "offload@3", "offload@0"]),
-        ("5%", False, {"moe_cache_rate": 0.05}, ("offload", 3, None), ("offload", 3, None), ["offload@3", "hybrid@3", "hybrid@0", "offload@0"]),
+        ("5%", False, {"moe_cache_rate": 0.05}, ("hybrid", 3, None), ("offload", 3, None), ["hybrid@3", "hybrid@0", "offload@3", "offload@0"]),
     ],
 )
 def test_what_single_serves_and_single_measured_times_at_each_memory_level(decode_rows, monkeypatch, level, resident, flags, served8, served4, candidates8):
