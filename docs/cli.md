@@ -141,12 +141,7 @@ or a slot in the expert cache), the cache decodes on the CPU or `hybrid`, or one
 smaller than a layer's experts, and the KV reserve where the expert cache's minimum does not fit beside it (the
 warning names the largest `--kv-reserve-tokens` that does). The KV reserve is never more than the
 model's context, and it is lowered, to the default at the least, where it would leave fewer expert
-slots than a server without the preset plans. Where the automatic plan at that reserve still holds
-under 20% of all experts, with one running request, the reserve goes down to a prompt as long as a
-prefill chunk and 1024 tokens of answer (never under the default): there each slot its pages take is
-one miss more on every decode step (about 310 slots of Qwen3.6-35B-A3B NVFP4 with 8 GiB free). A
-longer prompt and answer then end with finish_reason length, and the log says so. A typed
-`--kv-reserve-tokens`, `--moe-cache-rate` or `--moe-cache-size` is left as it is. The preset's memory ratio comes with the working memory
+slots than a server without the preset plans. The preset's memory ratio comes with the working memory
 of one prefill chunk of `--max-prefill-length` tokens left free on top of its headroom (0.65 GiB for
 8192 tokens on Qwen3.6-35B-A3B, counted from the GatedDeltaNet layer's tensor shapes; the layer runs
 its chunk rule over one request in calls of 2048 tokens, `FREETOKEN_GDN_RULE_TOKENS`, with the output
