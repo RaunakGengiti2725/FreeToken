@@ -79,7 +79,7 @@ class TokenizeManager:
         results: List[UserMsg] = []
         # TODO: batch tokenization
         for msg in msgs:
-            prompt = self.render_prompt(msg)
+            prompt = self.render_prompt(msg) if msg.prompt is None else msg.prompt
             # A jinja chat template owns every special token (HF's apply_chat_template
             # tokenizes with add_special_tokens=False for the same reason): tokenizers
             # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --

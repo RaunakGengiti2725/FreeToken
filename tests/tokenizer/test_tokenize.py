@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -951,3 +952,75 @@ def test_warm_leaves_no_prompt_in_the_prefix_cache_and_no_decode_state():
     detokenizer = DetokenizeManager(tokenizer)
     assert detokenizer.warm(ids[-32:].tolist()) == tokenizer.decode(ids[-32:].tolist())
     assert detokenizer.decode_map == {}
+
+
+_TOOLS = [{"type": "function", "function": {"name": "get_weather", "description": "Weather of a city",
+                                            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+_RENDER_CASES = {
+    "plain": dict(messages=[{"role": "user", "content": "hello there"}]),
+    "developer and tools": dict(messages=[{"role": "developer", "content": "Be terse."},
+                                          {"role": "user", "content": "Weather in Paris?"}], tools=_TOOLS),
+    "tool call turns": dict(messages=[
+        {"role": "system", "content": "You help."}, {"role": "user", "content": "Weather in Paris?"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {
+            "name": "get_weather", "arguments": {"city": "Paris"}}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "sunny"}, {"role": "user", "content": "Thanks, and Rome?"},
+    ], tools=_TOOLS),
+    "thinking off and an effort": dict(messages=[{"role": "user", "content": "2+2?"}],
+                                       kwargs={"enable_thinking": False, "reasoning_effort": "max"}),
+    "inline system, auto": dict(messages=[{"role": "system", "content": "stable"}, {"role": "user", "content": "q"},
+                                          {"role": "assistant", "content": "a"}, {"role": "system", "content": "late"},
+                                          {"role": "user", "content": "q2"}], policy="auto"),
+    "inline system, fold": dict(messages=[{"role": "system", "content": "stable"}, {"role": "user", "content": "q"},
+                                          {"role": "system", "content": "late"}], policy="fold"),
+}
+
+
+def _bos_tokenizer():
+    tokenizer = _hub_tokenizer("BAAI/bge-small-en-v1.5")
+    tokenizer.chat_template = (
+        "{{ cls_token }}{% for m in messages %}<{{ m['role'] }}> {{ m['content'] }} {% endfor %}"
+        "{% if add_generation_prompt %}<assistant>{% endif %}"
+    )
+    return tokenizer
+
+
+@pytest.mark.parametrize("case", sorted(_RENDER_CASES))
+@pytest.mark.parametrize("repo", ["Qwen/Qwen3-0.6B", "Qwen/Qwen2.5-0.5B-Instruct", "nvidia/Qwen3.6-35B-A3B-NVFP4", "bos"])
+def test_a_prerendered_prompt_encodes_to_the_ids_the_worker_renders(repo, case):
+    """The frontend's stream prerender hands its prompt to the worker, which then encodes it without rendering:
+    the ids equal those of a worker that renders the messages itself (a templated prompt keeps add_special_tokens off
+    and the prefix cache, so a template's own bos is not doubled)."""
+    import asyncio
+
+    from freetoken.server.generation import GenSpec, prerender_error, submit_generation
+
+    if repo == "bos":
+        if case != "plain":
+            pytest.skip("the bos template renders plain turns only")
+        frontend, worker = TokenizeManager(_bos_tokenizer()), TokenizeManager(_bos_tokenizer())
+    else:
+        frontend, worker = TokenizeManager(_hub_tokenizer(repo)), TokenizeManager(_hub_tokenizer(repo))
+    spec_args = _RENDER_CASES[case]
+    spec = GenSpec(messages=deepcopy(spec_args["messages"]), sampling_params=SamplingParams(),
+                   chat_template_kwargs=dict(spec_args.get("kwargs", {})), template_tools=spec_args.get("tools"),
+                   inline_system_policy=spec_args.get("policy"))
+    sent = []
+
+    async def send_one(msg):
+        sent.append(msg)
+
+    state = SimpleNamespace(frontend_tokenizer=lambda: frontend, config=SimpleNamespace(reasoning_budget=None),
+                            new_user=lambda: 7, send_one=send_one)
+
+    async def run():
+        assert await prerender_error(spec, state) is None
+        await submit_generation(spec, state)
+
+    asyncio.run(run())
+    (msg,) = sent
+    assert msg.prompt is not None
+    rendered = worker.tokenize([msg])[0].input_ids
+    msg.prompt = None
+    assert torch.equal(rendered, worker.tokenize([msg])[0].input_ids)
+    assert torch.equal(rendered, TokenizeManager(worker.tokenizer).tokenize([msg])[0].input_ids)

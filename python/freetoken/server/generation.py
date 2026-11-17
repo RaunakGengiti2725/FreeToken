@@ -226,6 +226,8 @@ class GenSpec:
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
     inline_system_policy: str | None = None
+    # the prompt prerender_error rendered from these fields, so the worker does not render it again
+    rendered_prompt: str | None = None
 
     @property
     def parse_tools(self) -> bool:
@@ -415,6 +417,8 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             tools=spec.template_tools,
             images=images,
             inline_system_policy=spec.inline_system_policy,
+            # with images the prerender saw their references and the worker gets their bytes: it renders again
+            prompt=spec.rendered_prompt if not refs else None,
         )
     )
     return uid
@@ -465,8 +469,9 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
     """Render ``spec``'s prompt frontend-side, returning the failure a streaming
     adapter should surface as an HTTP 400 *before* committing an SSE stream —
     once headers go out, a template rejection can only ride in-stream, where
-    some agents show nothing but "empty response". Render only; the worker
-    still renders and encodes authoritatively. Best-effort: a state without a
+    some agents show nothing but "empty response". The rendered prompt is kept
+    on ``spec``, and submit_generation hands it to the worker, which then only
+    encodes it. Best-effort: a state without a
     frontend tokenizer, or one that fails to *initialize*, skips validation
     rather than blocking the generation path.
     """
@@ -486,7 +491,7 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
     except Exception:  # noqa: BLE001 -- server fault, not this request's problem
         return None
     try:
-        await asyncio.to_thread(manager.render_prompt, msg)
+        spec.rendered_prompt = await asyncio.to_thread(manager.render_prompt, msg)
     except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
         return GenerationError(f"could not encode request: {exc}")
     return None
