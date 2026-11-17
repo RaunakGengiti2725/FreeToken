@@ -4,11 +4,12 @@ import collections
 import contextlib
 import copy
 import errno
+import functools
 import gc
 import math
 import os
 from datetime import timedelta
-from typing import Any, Dict, Iterable, NamedTuple, Tuple
+from typing import Any, Callable, Dict, Iterable, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
@@ -852,6 +853,9 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # a prefill's draft pass, which the drain runs after it sends the sampled tokens and before it frees or caches
+    # the batch's pages: the draft reads and writes them through the page table
+    draft_prefill: Callable[[], None] | None = None
 
 
 class Engine:
@@ -2532,10 +2536,8 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        if spec_prefill:
-            # after the D2H is queued: the drain waits for the copy only, while the draft's work overlaps it
-            self.spec.on_prefill(batch, next_tokens_gpu)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        draft = functools.partial(self.spec.on_prefill, batch, next_tokens_gpu) if spec_prefill else None
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, draft)
 
     @torch.inference_mode()
     def _warmup_prefill(self, autotune: bool = True, keeps: bool = False) -> None:

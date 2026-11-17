@@ -131,14 +131,15 @@ def recompute_w_u_fwd(
     chunk_indices: torch.LongTensor | None = None,
     value_rows: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``value_rows`` [H * V, B * T] contiguous, when given, holds the values a row a value dim (the layout the
-    GDN conv writes) and is read in place of ``v``: the tiles and every operation on them are those of ``v``."""
+    """``value_rows`` [H * V, B * T] with unit stride along tokens, when given, holds the values a row a value dim (the
+    layout the GDN conv writes, or a column slice of it) and is read in place of ``v``: the tiles and every operation
+    on them are those of ``v``."""
     B, T, Hg, K = k.shape
     if value_rows is None:
         H, V = v.shape[-2:]
         u = torch.empty_like(v)
     else:
-        assert v is None and value_rows.is_contiguous() and value_rows.shape[1] == B * T
+        assert v is None and value_rows.stride(1) == 1 and value_rows.shape[1] == B * T
         H = beta.shape[-1]
         V = value_rows.shape[0] // H
         u = value_rows.new_empty(B, T, H, V)

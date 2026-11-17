@@ -326,6 +326,7 @@ def serve_cmd(ns: argparse.Namespace, extra: list[str], arm: str, rate: float | 
     env.pop("FREETOKEN_HYBRID_FETCH_ROUND", None)
     if ":" in arm:
         env["FREETOKEN_HYBRID_FETCH_ROUND"] = arm.split(":", 1)[1].split("#")[0]
+    env.update(getattr(ns, "server_env", None) or {})
     return cmd + extra, env
 
 

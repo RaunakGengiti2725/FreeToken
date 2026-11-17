@@ -1650,7 +1650,7 @@ def test_calibration_takes_the_largest_worst_lead_above_the_margin_and_times_two
 
     def run_arm(ns, extra, arm, rate, single, together, sampling, floors=None, passes=None, warm_after=None, deadline=None, grace=30.0):
         seen.update(passes=ns.seeds, warm=ns.warm, decode=ns.decode, warm_after=warm_after, timeout=ns.server_timeout, extra=extra,
-                    prompts=[name for name, _ in single], together=together)
+                    prompts=[name for name, _ in single], together=together, env=benchdecode.serve_cmd(ns, extra, arm, rate, 1)[1])
         cols = [{"tok_s": (a + b) / 2, "seeds": [{"tok_s": a}, {"tok_s": b}], "draft_n": 4, "early": a, "gave_up": False} for a, b in ((90.0, 110.0), (180.0, 220.0))]
         return {"tok_s": [c["tok_s"] for c in cols], "results": cols, "cache_slots": 40, "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": None, "ready_s": 1.0}
 
@@ -1671,6 +1671,8 @@ def test_calibration_takes_the_largest_worst_lead_above_the_margin_and_times_two
     assert seen["warm_after"] == calibrate.WARM_AGAIN < calibrate.WARM and seen["timeout"] == 123
     assert seen["extra"] == ["--memory-ratio", "0.8", "--preset", "single"]
     assert seen["prompts"] == list(calibrate.PROMPTS) and not seen["together"]
+    # the candidate's server skips the first-request warmup: its seconds to ready are the calibration's
+    assert seen["env"]["FREETOKEN_WARM_FIRST_REQUEST"] == "0"
 
 
 def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_preset(decode_rows, monkeypatch):

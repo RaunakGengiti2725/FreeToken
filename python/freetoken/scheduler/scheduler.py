@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import functools
+import math
 import os
 import time
+from dataclasses import replace
 
-from typing import TYPE_CHECKING, Iterable, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
+from typing import TYPE_CHECKING, Callable, Iterable, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
-from freetoken.core import Batch, Req
+from freetoken.core import Batch, Req, SamplingParams
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.message import (
@@ -26,6 +29,7 @@ from freetoken.message import (
 from freetoken.utils import (
     init_logger,
     load_eos_token_ids,
+    load_generation_sampling,
     load_tokenizer,
     load_toolcall_anchor_id,
     load_turn_anchor_tails,
@@ -50,6 +54,41 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
+
+
+# The prompt text of the first-request warmup, repeated to each length: plain words, no special or image tokens.
+_WARM_TEXT = "The quick brown fox jumps over the lazy dog, and then it runs back across the field to the river. "
+
+
+def warm_lengths(points: Iterable[int], limit: int) -> List[int]:
+    """Prompt lengths of the first-request warmup, at most ``limit``: past each token count ``points`` where a prefill
+    kernel takes another compiled variant, the next odd count and the next multiple of 16. Triton compiles an integer
+    argument that is a multiple of 16 apart from one that is not, and prompts come as both."""
+    lengths = set()
+    for p in points:
+        lengths |= {p + 1 if p % 2 == 0 else p + 2, (p // 16 + 1) * 16}
+    return sorted(n for n in lengths if 2 <= n <= limit)
+
+
+def _warm_points(model_config, device: torch.device) -> List[int]:
+    """Token counts of one prefill chunk where the code picks another kernel variant (see warm_lengths)."""
+    from freetoken.kvcache.linear_state_pool import gdn_rule_tokens
+
+    # 2: the shortest prompt; 16, 32, 64: the GDN output kernel's BT and the small-M dense GEMM tiles (chunk_o.py,
+    # nvfp4_linear.py), and the FP8 BLOCK_M (fp8_pertensor_linear.py); 1024: the norm and shared-gate warps
+    # (norm.py, moe_shared_gate.py); 4096: the activation tile (activation.py)
+    points = [2, 16, 32, 64, 1024, 4096]
+    rule = gdn_rule_tokens()
+    if rule:
+        # past it the GDN rule runs in more than one call
+        points.append(rule)
+    if getattr(model_config, "expert_quant", "none") == "nvfp4" and getattr(model_config, "num_experts_per_tok", 0):
+        from freetoken.kernel.nvfp4_moe import _prefill_block_m_steps
+
+        # where the routed GEMM's BLOCK_SIZE_M grows: tokens per expert are M * top_k / experts
+        per_token = model_config.num_experts_per_tok / model_config.num_experts
+        points += [math.ceil(step / per_token) for step in _prefill_block_m_steps(device.index) if math.isfinite(step)]
+    return points
 
 
 def _gib(n_bytes: int) -> str:
@@ -178,6 +217,78 @@ class Scheduler(SchedulerIOMixin):
         # on the engine stream, so the read and the zeroing fall between decode replays
         with torch.cuda.stream(self.engine.stream):
             return self.engine.moe_offload_cache.decode_stats_line()
+
+    @torch.inference_mode()
+    def warm_first_request(self) -> None:
+        """Serve a few requests nobody sent, before the readiness ack, so that the first real request finds the kernel
+        variants of its prompt length loaded: the prefill forward, the sampler, the draft's prompt pass and a verify step.
+
+        They carry a seed and run under reproducible seeds, so they match nothing in the prefix cache and leave nothing
+        in it; the sampling streams are put back after them, so an unseeded request draws what it drew without them.
+        With an expert cache they do not run: they would change which experts the first real request finds resident.
+        """
+        if not ENV.WARM_FIRST_REQUEST or self.device.type != "cuda" or self.engine.moe_offload_cache is not None:
+            return
+        limit = min(self.prefill_budget, self.engine.max_seq_len - self.config.decode_rows_per_req - 2)
+        ids = self.tokenizer.encode(_WARM_TEXT, add_special_tokens=False)
+        lengths = warm_lengths(_warm_points(self.config.model_config, self.device), limit)
+        if not ids or not lengths:
+            return
+        greedy = SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True, seed=0)
+        sampled = load_generation_sampling(self.config.model_path) if getattr(self.config, "sampling_defaults", None) == "model" else {}
+        runs = [(length, greedy) for length in lengths]
+        if sampled.get("temperature", 0.0) > 0.0:
+            # the sampled request's kernels too, at the default sampling of a request that names none
+            keep = {key: sampled[key] for key in ("temperature", "top_k", "top_p") if key in sampled}
+            runs.append((lengths[min(1, len(lengths) - 1)], SamplingParams(**keep, max_tokens=2, ignore_eos=True, seed=0)))
+
+        from freetoken.engine.sample import restore_sampling_streams, sampling_streams
+
+        send, seeds = self.send_result, self.cache_manager.reproducible_seeds
+        streams = sampling_streams()
+        self.send_result = lambda reply: None
+        self.cache_manager.reproducible_seeds = True
+        started = time.perf_counter()
+        try:
+            with self.engine_stream_ctx:
+                self.engine.stream.wait_stream(self.stream)
+                for uid, (length, params) in enumerate(runs, start=1):
+                    prompt = torch.tensor((ids * (length // len(ids) + 1))[:length], dtype=torch.int32)
+                    self._process_one_msg(UserMsg(uid=-uid, input_ids=prompt, sampling_params=replace(params)))
+                    while self.prefill_manager.runnable or self.decode_manager.runnable:
+                        forward_input = self._schedule_next_batch()
+                        if forward_input is None:
+                            break
+                        self._restore_linear_states(forward_input.batch)
+                        self._process_last_data((forward_input, self._forward(forward_input)))
+                    if self._drop_unserved_warm(-uid):
+                        # the pools cannot seat it now; a longer one fits no better
+                        logger.warning_rank0(f"First-request warmup stopped: a {length}-token prompt could not be served")
+                        runs = runs[: uid - 1]
+                        break
+                assert not (self.prefill_manager.runnable or self.decode_manager.runnable), "a warm request is left"
+                torch.cuda.synchronize(self.device)
+        finally:
+            self.send_result = send
+            self.cache_manager.reproducible_seeds = seeds
+        restore_sampling_streams(streams)
+        self.engine.sampler._sent = None
+        self.finished_reqs = set()
+        self.cache_manager.check_integrity()
+        logger.info_rank0(
+            f"First-request warmup served prompts of {[length for length, _ in runs]} tokens "
+            f"in {time.perf_counter() - started:.3f} s"
+        )
+
+    def _drop_unserved_warm(self, uid: int) -> bool:
+        """Take warm request ``uid`` out of the queue or the running set and free what it holds; True if it was there.
+        A warm request left queued would stand at the head of the queue for good, and answer to a negative uid."""
+        queued = any(req.uid == uid for req in self.prefill_manager.pending_list)
+        running = self.decode_manager.abort_req(uid)
+        chunked = self.prefill_manager.abort_req(uid) if queued else None
+        for req in {r for r in (running, chunked) if r is not None}:
+            self._free_req_resources(req)
+        return queued or running is not None
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
@@ -348,12 +459,17 @@ class Scheduler(SchedulerIOMixin):
 
         batch, output = last_data[0].batch, last_data[1]
         _, next_tokens_cpu, copy_done = output[:3]
+        # a prefill's draft pass: it runs once the sampled tokens are sent, before the pages are freed or cached
+        draft_prefill = getattr(output, "draft_prefill", None)
         copy_done.synchronize()
         # tokens are on the host from here: the per-request timings' token stamps
         now = time.perf_counter()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         generated = None
+        held: List[Callable[[], None]] = []
+        # without a draft pass every page operation runs in its place
+        hold = held.append if draft_prefill is not None else (lambda action: action())
         with self.cache_manager.lazy_free_region():
             if batch.phase == "verify":
                 generated = self._drain_verify(batch, output, reply, new_finished_reqs)
@@ -367,14 +483,13 @@ class Scheduler(SchedulerIOMixin):
                             # Aborted mid-chunked-prefill while this chunk was in flight: the abort
                             # popped the pending continuation (no next chunk launches), and this
                             # drain point frees the chunk's pages/slots exactly once.
-                            self._free_req_resources(req)
+                            hold(functools.partial(self._free_req_resources, req))
                         continue
                     if req.aborted:
                         # Aborted while this final-chunk prefill / decode step was in flight: free
                         # here (the forward is drained) and finish the request. No DetokenizeMsg --
                         # the abort ack flushed after this method stays the uid's terminal reply.
-                        self.decode_manager.remove_req(req)
-                        self._free_req_resources(req)
+                        hold(functools.partial(self._finish_drained, req))
                         new_finished_reqs.add(req)
                         continue
                     if req in self.finished_reqs:
@@ -394,8 +509,7 @@ class Scheduler(SchedulerIOMixin):
 
                     # NOTE: overlap scheduling may make the request freed twice, skip second free
                     if finished and req not in self.finished_reqs:
-                        self.decode_manager.remove_req(req)
-                        self._free_req_resources(req)
+                        hold(functools.partial(self._finish_drained, req))
                         new_finished_reqs.add(req)
                     elif batch.is_prefill and req.table_idx != -1:
                         # for prefill, non-chunk req, cache the prefix.
@@ -406,11 +520,42 @@ class Scheduler(SchedulerIOMixin):
                         # never reach this commit -- but if a future path frees one early, skip
                         # rather than re-read the freed page-table row (and on hybrid, deref the
                         # None'd GDN ping-pong slots).
-                        self.cache_manager.cache_req(req, finished=False)
+                        hold(functools.partial(self.cache_manager.cache_req, req, finished=False))
+            if draft_prefill is not None:
+                # the first tokens go out before the draft's prompt pass; its pages are still the request's own
+                self._stamp_usage(reply)
+                self.send_result(reply)
+                try:
+                    draft_prefill()
+                finally:
+                    # the frees and inserts run even when the pass raises
+                    for action in held:
+                        action()
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
+        used, total, mamba_slots, swa_tokens = self._stamp_usage(reply if draft_prefill is None else [])
+        self.status_reporter.report_batch(
+            batch,
+            running_reqs=len(self.decode_manager.running_reqs),
+            queue_reqs=len(self.prefill_manager.pending_list),
+            kv_used_pages=used,
+            kv_total_pages=total,
+            page_size=self.config.page_size,
+            mamba_slots=mamba_slots,
+            swa_tokens=swa_tokens,
+            generated=generated,
+        )
+        if draft_prefill is None:
+            self.send_result(reply)
+
+    def _finish_drained(self, req: Req) -> None:
+        self.decode_manager.remove_req(req)
+        self._free_req_resources(req)
+
+    def _stamp_usage(self, reply: List[DetokenizeMsg]):
+        """Stamp ``reply`` with the pools' occupancy now; returns (kv used, kv total, mamba slots, swa tokens)."""
         used, total = self._kv_usage_pages()
         mamba_slots = self._mamba_slot_usage()
         swa_tokens = self._swa_token_usage()
@@ -426,18 +571,7 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
-        self.status_reporter.report_batch(
-            batch,
-            running_reqs=len(self.decode_manager.running_reqs),
-            queue_reqs=len(self.prefill_manager.pending_list),
-            kv_used_pages=used,
-            kv_total_pages=total,
-            page_size=self.config.page_size,
-            mamba_slots=mamba_slots,
-            swa_tokens=swa_tokens,
-            generated=generated,
-        )
-        self.send_result(reply)
+        return used, total, mamba_slots, swa_tokens
 
     def _drain_verify(self, batch: Batch, output, reply: List[DetokenizeMsg], new_finished_reqs: Set[Req]) -> int:
         """Commit each request's accepted tokens, return the slots its rejected rows took, then the target state; returns the tokens committed."""

@@ -81,6 +81,8 @@ class TokenizeMsg(BaseTokenizerMsg):
     tools: List[Dict[str, Any]] | None = None
     images: List[bytes] | None = None
     inline_system_policy: str | None = None
+    # the chat prompt the frontend already rendered from ``text``, which the worker then encodes as is
+    prompt: str | None = None
 
 
 @dataclass

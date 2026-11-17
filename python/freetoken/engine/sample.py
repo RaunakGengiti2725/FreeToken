@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, NamedTuple
 
@@ -62,6 +63,30 @@ def sampling_module():
     else:
         import freetoken.kernel.triton.sampling as sampling
     return sampling
+
+
+def sampling_streams() -> tuple:
+    """The state of every stream an unseeded draw reads: torch's CUDA and CPU generators and, once the Triton sampling
+    kernels are loaded, their own unseeded generators."""
+    triton_sampling = sys.modules.get("freetoken.kernel.triton.sampling")
+    cuda = [torch.cuda.get_rng_state(i) for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else []
+    kernels = {} if triton_sampling is None else {slot: g.get_state() for slot, g in triton_sampling._UGEN.items()}
+    return cuda, torch.get_rng_state(), kernels
+
+
+def restore_sampling_streams(saved: tuple) -> None:
+    """Put back what sampling_streams read; a Triton generator made since then is dropped, so it starts afresh."""
+    cuda, cpu, kernels = saved
+    for index, state in enumerate(cuda):
+        torch.cuda.set_rng_state(state, index)
+    torch.set_rng_state(cpu)
+    triton_sampling = sys.modules.get("freetoken.kernel.triton.sampling")
+    if triton_sampling is not None:
+        for slot in list(triton_sampling._UGEN):
+            if slot in kernels:
+                triton_sampling._UGEN[slot].set_state(kernels[slot])
+            else:
+                del triton_sampling._UGEN[slot]
 
 
 def min_p_renorm_probs(probs: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
