@@ -390,9 +390,14 @@ class OffloadMoELayer(MoELayer):
         demand = demand or cache.prefill_chunk_demand
         if cache.all_resident or demand:
             slot_of = None
-            if not cache.all_resident:
+            by_expert = _PREFILL_EXPERT_ALIGN and self.quant_method.kernel.groups_prefill_by_expert
+            if not cache.all_resident and by_expert:
+                # the admission gave each routed expert a slot: the grid spans the layer's experts, not the pool's slots
+                cache.admit_prefill_experts(self.layer_id, topk_ids)
+                routes, slot_of = topk_ids, cache.slot_for_id[self.layer_id]
+            elif not cache.all_resident:
                 routes = cache.load_prefill_experts(self.layer_id, topk_ids)
-            elif _PREFILL_EXPERT_ALIGN and self.quant_method.kernel.groups_prefill_by_expert:
+            elif by_expert:
                 # a GEMM grid sized for a padded block per slot of the pool is mostly empty programs: the kernel groups
                 # the expert ids and looks up one slot per block
                 routes, slot_of = topk_ids, cache.resident_slot_of(self.layer_id)

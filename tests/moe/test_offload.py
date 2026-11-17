@@ -195,13 +195,26 @@ def test_offload_moe_layer_short_prefill_loads_its_experts_through_the_slot_cach
     assert events == [("materialized", 0), ("copied",)]
 
 
+@pytest.mark.parametrize("resident", [True, False])
 @pytest.mark.parametrize(("kernel_groups", "switch"), [(True, True), (False, True), (True, False)])
-def test_offload_moe_layer_resident_prefill_leaves_the_slot_lookup_to_a_kernel_that_groups_by_expert(monkeypatch, kernel_groups, switch):
-    """Once every expert is resident, a kernel that groups a prefill's routes by expert gets the expert ids and the
-    layer's live row of the slot table; any other kernel, or the switch off, gets the routes as slots."""
-    layer, cache = _make_layer_and_cache(num_experts=4, cache_size=12)
-    cache.all_resident = True
-    cache.slot_for_id[0] = torch.tensor([9, 4, 11, 6], dtype=torch.int32)
+def test_offload_moe_layer_resident_prefill_leaves_the_slot_lookup_to_a_kernel_that_groups_by_expert(monkeypatch, kernel_groups, switch, resident):
+    """Once every expert is resident, or once a demand chunk's admission gave its routed experts slots, a kernel that
+    groups a prefill's routes by expert gets the expert ids and the layer's live row of the slot table; any other
+    kernel, or the switch off, gets the routes as slots. A demand chunk's row names no slot for an unrouted expert."""
+    layer, cache = _make_layer_and_cache(num_experts=5, cache_size=12)
+    slots = torch.tensor([9, 4, 11, 6, -1], dtype=torch.int32)
+    admitted = []
+    if resident:
+        cache.all_resident = True
+        cache.slot_for_id[0] = slots
+    else:
+        cache.prefill_demand_tokens = 3
+
+        def admit(layer_id, topk_ids):
+            admitted.append(topk_ids.clone())
+            cache.slot_for_id[layer_id] = slots
+
+        monkeypatch.setattr(cache, "admit_prefill_experts", admit)
     routes = torch.tensor([[2, 1], [0, 2], [3, 2]], dtype=torch.int32)
     calls = {}
     monkeypatch.setattr("freetoken.layers.moe._PREFILL_EXPERT_ALIGN", switch)
@@ -211,10 +224,11 @@ def test_offload_moe_layer_resident_prefill_leaves_the_slot_lookup_to_a_kernel_t
     layer._prefill_routed(torch.randn(3, 8), torch.rand(3, 2), routes.clone())
 
     routed = calls["view"].routed
-    assert calls["view"].n == cache.cache_size and routed.count == 4
+    assert calls["view"].n == cache.cache_size and routed.count == 5
+    assert resident or [ids.tolist() for ids in admitted] == [routes.tolist()]
     if kernel_groups and switch:
         assert torch.equal(calls["ids"], routes)
-        assert routed.slot_of.data_ptr() == cache.slot_for_id.data_ptr() and routed.slot_of.tolist() == [9, 4, 11, 6]
+        assert routed.slot_of.data_ptr() == cache.slot_for_id.data_ptr() and routed.slot_of.tolist() == slots.tolist()
     else:
         assert calls["ids"].tolist() == [[11, 4], [9, 11], [6, 11]]
         assert routed.slot_of is None

@@ -1314,8 +1314,13 @@ class OffloadMoeCache:
         return 0 < num_tokens <= self.prefill_demand_tokens
 
     def load_prefill_experts(self, layer_id: int, topk_ids: torch.Tensor) -> torch.Tensor:
-        """Make a demand prefill chunk's routed experts resident, copying in the missing ones,
-        and return ``topk_ids`` as slot ids. The chunk's distinct experts go to the slot cache
+        """:meth:`admit_prefill_experts`, then ``topk_ids`` as slot ids."""
+        self.admit_prefill_experts(layer_id, topk_ids)
+        return self.slot_for_id[layer_id][topk_ids.long()]
+
+    def admit_prefill_experts(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+        """Make a demand prefill chunk's routed experts resident, copying in the missing ones;
+        ``topk_ids`` is left as it is. The chunk's distinct experts go to the slot cache
         ``ENSURE_QUERY_WIDTH`` at a time, each query's misses copied before the next query
         evicts: LRU evicts an earlier query's slots last while the chunk's distinct experts fit the
         layer's pool, which one admission of the whole chunk needs as well. The admissions stay out
@@ -1335,7 +1340,6 @@ class OffloadMoeCache:
         for piece in query.split(ENSURE_QUERY_WIDTH):
             ensure_experts(self, layer_id, piece, record_stats=False)
             self.copy_missing()
-        return self.slot_for_id[layer_id][topk_ids.long()]
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts

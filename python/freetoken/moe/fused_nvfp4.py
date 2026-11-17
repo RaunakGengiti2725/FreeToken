@@ -124,8 +124,9 @@ def _align_routes(
     if slot_of is None:
         return moe_align_block_size(topk_ids, block_m, num_experts)
     sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, block_m, tile_experts)
-    # the blocks past ntpp are never run but hold uninitialized ids
-    return sorted_ids, slot_of.index_select(0, expert_ids.clamp_(0, tile_experts - 1)), ntpp
+    # the blocks past ntpp are never run but hold uninitialized ids, which may name an expert without a slot (-1)
+    # after a demand admission: every block names a row of the banks all the same
+    return sorted_ids, slot_of.index_select(0, expert_ids.clamp_(0, tile_experts - 1)).clamp_(min=0), ntpp
 
 
 def fused_experts_nvfp4(

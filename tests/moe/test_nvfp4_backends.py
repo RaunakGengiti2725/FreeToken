@@ -329,13 +329,16 @@ def test_triton_overlap_prefill_matches_dequant_reference():
 
 
 @cuda
+@pytest.mark.parametrize("skewed", [False, True])
 @pytest.mark.parametrize(("cache_size", "query_width"), [(1100, None), (E, 3)])
-def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatch, cache_size, query_width):
+def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatch, cache_size, query_width, skewed):
     """A short prefill chunk loads only its routed experts, through the slot cache, and runs the
     same grouped GEMM over the slots: its output must equal the whole-layer stream's exactly, and
     its admissions must not count as decode misses. The chunk routes more often than one
     admission query compiles for, and the wider cache aligns past 1024 experts; the cache of one
-    layer's experts, filled three at a time, must keep every query's experts until the GEMM."""
+    layer's experts, filled three at a time, must keep every query's experts until the GEMM.
+    Grouped over the layer's experts, each block reading its expert's slot, the output is the same;
+    skewed routes leave experts without a slot."""
     from freetoken.moe import offload_kernels
     from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
 
@@ -345,7 +348,10 @@ def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatc
     torch.manual_seed(15)
     M = 600
     hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
-    topk_ids = torch.rand(M, E, device=device).argsort(dim=1)[:, :TOPK].to(torch.int32).contiguous()
+    if skewed:
+        topk_ids = _skewed_routes(M, device=device)
+    else:
+        topk_ids = torch.rand(M, E, device=device).argsort(dim=1)[:, :TOPK].to(torch.int32).contiguous()
     topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
 
     streamed_cache, _ = _triton_cache(device)
@@ -368,9 +374,17 @@ def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatc
         routed_experts=E,
     )
 
+    slot_of = demand_cache.slot_for_id[1]
+    by_expert = fused_experts_nvfp4(
+        hidden, *demand_cache.pool_bank_views(1), topk_weights, topk_ids, demand_cache.pool_slots(1), "silu", False,
+        routed_experts=E, slot_of=slot_of,
+    )
+
     assert not torch.equal(slots, topk_ids), "the admission must have mapped expert ids to slots"
     assert torch.equal(demanded, streamed)
+    assert torch.equal(by_expert, streamed)
     assert torch.equal(demand_cache.lru_stats, decode_stats)
+    assert not skewed or int(slot_of.min()) < 0, "an expert the chunk does not route to has no slot"
 
 
 def _skewed_routes(tokens: int, generator: torch.Generator | None = None, device="cpu") -> torch.Tensor:
@@ -427,10 +441,12 @@ def _align_on_cpu(topk_ids: torch.Tensor, block_m: int, num_experts: int):
     return sorted_ids, expert_ids, torch.tensor([start], dtype=torch.int32)
 
 
+@pytest.mark.parametrize("demand", [False, True])
 @pytest.mark.parametrize("tokens", [1, 7, 64, 1000])
-def test_triton_prefill_over_resident_slots_groups_its_routes_over_the_layers_experts(monkeypatch, tokens):
+def test_triton_prefill_over_resident_slots_groups_its_routes_over_the_layers_experts(monkeypatch, tokens, demand):
     """The grouping a resident prefill hands its GEMMs: sized by the layer's experts whatever the pool, every route in
-    a block that names the slot of its expert, and no block, run or not, naming a row outside the banks."""
+    a block that names the slot of its expert, and no block, run or not, naming a row outside the banks. After a
+    demand chunk's admission the experts it does not route to may have no slot (-1)."""
     from freetoken.kernel import nvfp4_moe
     from freetoken.moe import fused_nvfp4
 
@@ -439,6 +455,8 @@ def test_triton_prefill_over_resident_slots_groups_its_routes_over_the_layers_ex
     # the layer's slots lie scattered through the pool
     slot_of = torch.randperm(pool, generator=g)[:E].to(torch.int32)
     topk_ids = _skewed_routes(tokens, g)
+    if demand:
+        slot_of[[1, 3, 4]] = -1
     aligned_over, launches = [], []
 
     def align(ids, block, num_experts):
@@ -470,7 +488,9 @@ def test_triton_prefill_over_resident_slots_groups_its_routes_over_the_layers_ex
     assert by_expert[0].numel() <= by_slot[0].numel()
     assert torch.equal(slot_read_by_each_route(*by_expert), slots.view(-1))
     assert torch.equal(slot_read_by_each_route(*by_slot), slots.view(-1))
-    assert torch.isin(by_expert[1], slot_of).all()
+    named = by_expert[1]
+    assert ((named >= 0) & (named < pool)).all()
+    assert demand or torch.isin(named, slot_of).all()
 
 
 def test_triton_prefill_over_cache_slots_sizes_its_tiles_by_the_routed_layer(monkeypatch):
