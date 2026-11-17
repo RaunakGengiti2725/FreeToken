@@ -75,6 +75,8 @@ def _setup():
     )
     stub._free_req_resources = lambda req: Scheduler._free_req_resources(stub, req)
     stub._commit_tokens = lambda req, tokens: Scheduler._commit_tokens(stub, req, tokens)
+    stub._finish_drained = lambda req: Scheduler._finish_drained(stub, req)
+    stub._stamp_usage = lambda reply: Scheduler._stamp_usage(stub, reply)
     return pool, cm, tm, dm, pm, sent, stub
 
 
