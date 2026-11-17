@@ -369,3 +369,17 @@ def test_engine_takes_the_nearest_benched_shape_but_not_a_far_one(tmp_path, monk
     exact = dict(benched)
     exact[layer_kind_key("nvfp4", {}, 2048, 512, 8, 12)] = row(20.0, 30.0)
     assert _resolve_with_profile(tmp_path, monkeypatch, [("nvfp4", 2048, 512)], exact).hybrid_fetch_fraction == [pytest.approx(0.6)]
+
+
+def test_over_seeds_takes_passes_with_different_warmups():
+    """A calibration's later passes warm up with fewer tokens: each pass has its own by_warm key."""
+    from freetoken.moe import benchdecode
+
+    def one(warm, tok_s):
+        return {"tok_s": tok_s, "gave_up": False, "steps_s": 1.0, "client_tok_s": tok_s, "gap_p95_ms": 1.0, "tokens": 10, "steps": 5,
+                "draft_n": 4, "draft_n_accepted": 2, "early": False, "window": [warm, warm + 256], "ttft_ms": 1.0, "repeat": None,
+                "completion_tokens": 10, "by_warm": {str(warm): tok_s}, "sha1": "ab"}
+
+    out = benchdecode.over_seeds([one(1024, 400.0), one(256, 500.0)])
+    assert out["tok_s"] == pytest.approx(450.0)
+    assert out["by_warm"]["1024"][0] == pytest.approx(400.0) and out["by_warm"]["256"][0] == pytest.approx(500.0)

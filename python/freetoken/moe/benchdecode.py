@@ -620,9 +620,10 @@ def over_seeds(runs: list[dict]) -> dict:
         return sum(r[key] or 0 for r in runs)
 
     ttft = [r["ttft_ms"] for r in runs if r["ttft_ms"] is not None]
+    # the passes after the first may have another warm-up (run_arm's warm_after): a window is averaged over the passes that have it
     by_warm = {}
-    for w in runs[0]["by_warm"]:
-        vals = [r["by_warm"][w] for r in runs if r["by_warm"][w]]
+    for w in dict.fromkeys(w for r in runs for w in r["by_warm"]):
+        vals = [r["by_warm"][w] for r in runs if r["by_warm"].get(w)]
         by_warm[w] = mean_ci(vals) if vals else (None, None)
     return {"tok_s": mean, "ci95": half, "steps_s": avg("steps_s"), "client_tok_s": avg("client_tok_s"), "gap_p95_ms": avg("gap_p95_ms"),
             "tok_per_step": total("tokens") / total("steps"), "accept": total("draft_n_accepted") / total("draft_n") if total("draft_n") else None,
