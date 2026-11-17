@@ -1315,7 +1315,12 @@ def test_preset_takes_hybrid_only_where_the_expert_cache_holds_a_fifth_of_the_ex
     for free, want in ((1474, "hybrid"), (1473, "offload"), (1 << 20, "hybrid")):
         monkeypatch.setattr(engine, "_gpu_free_bytes", lambda free=free: free)
         assert strategy() == want, free
-    monkeypatch.setattr(engine, "_gpu_free_bytes", lambda free=1473: free)
+    # what --preset single-measured times hybrid on is the same line
+    for free, ok in ((1474, True), (1473, False)):
+        monkeypatch.setattr(engine, "_gpu_free_bytes", lambda free=free: free)
+        cfg = _offload_engine_config(model_path=str(decode_rows.model), memory_ratio=0.95)
+        assert engine._preset_hybrid_share_ok(cfg)[0] is ok
+        assert engine._preset_hybrid_share_ok(_offload_engine_config(model_path=str(decode_rows.model), moe_cache_rate=0.05))[0]
     assert strategy(moe_cache_mem=200) == strategy(moe_cache_mem=50) == "hybrid"
     monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: None)
     assert strategy() == "offload" and strategy(moe_cache_mem=50) == "hybrid"
@@ -1472,6 +1477,8 @@ def test_what_single_serves_and_single_measured_times_at_each_memory_level(decod
     assert [c[0] for c in calibrate.candidates(args, static, path)] == candidates8
     if not resident:
         assert [c[0] for c in calibrate.candidates(args, (fewer[0], fewer[1], None), path)] == ["offload@3", "hybrid@3", "hybrid@0", "offload@0"]
+        # nor on an automatic plan under a fifth of the experts (engine._preset_hybrid_share_ok): only offload is timed
+        assert [c[0] for c in calibrate.candidates(args, ("offload", 3, None), path, hybrid=False)] == ["offload@3", "offload@0"]
         # nor is hybrid a candidate where its server would not start
         for typed in ({"reproducible_seeds": True}, {"moe_prefill_demand_tokens": 256}):
             assert [c[0] for c in calibrate.candidates(SimpleNamespace(**vars(args), **typed), ("offload", 3, None), path)] == ["offload@3", "offload@0"]
@@ -1743,6 +1750,13 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     speeds["hybrid", 3] = hybrid
     assert starts(args, argv) == (hybrid_3, 3) and starts(args, argv) == (hybrid_3, 0)
     assert started[-3:] == [("offload", 3), ("hybrid", 3), ("hybrid", 0)]  # offload kept its drafts: no offload@0
+    # an automatic plan under a fifth of the experts (engine._preset_hybrid_share_ok, reported by the static choice's
+    # process): no hybrid candidate is started, as its long prompts would run out of memory
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: ("offload", 3, None, False))
+    small, small_argv = parsed("--memory-ratio", "0.55")
+    choice, timed = starts(small, small_argv)
+    assert timed == 1 and started[-1] == ("offload", 3) and choice == {"speculative_num_steps": 3}
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: (static_strategy[0], 3, None, True))
     # a candidate that fails on two starts in a row is left out from then on, not timed at every start
     del speeds["hybrid", 0]
     again, again_argv = parsed("--memory-ratio", "0.6")

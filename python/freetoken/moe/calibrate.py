@@ -153,7 +153,7 @@ def stored_token_map(args) -> tuple[str, str] | None:
     return path, sha
 
 
-def candidates(args, static: tuple[str, int, str | None], token_map: str | None = None) -> list[tuple[str, str, int | None, str | None]]:
+def candidates(args, static: tuple[str, int, str | None], token_map: str | None = None, hybrid: bool = True) -> list[tuple[str, str, int | None, str | None]]:
     """(name, strategy, depth, token map) of every candidate, in the order they are timed, the static preset's choice
     first. ``static``: (strategy, draft tokens, draft token map) the static preset resolves to (_static_choice).
     ``token_map``: the store's map for this checkpoint (stored_token_map). A depth of None leaves speculative
@@ -164,7 +164,9 @@ def candidates(args, static: tuple[str, int, str | None], token_map: str | None 
     cache that holds part of the experts: both strategies at the preset's depth and hybrid with none, the static
     strategy first; hybrid without drafts comes second where the static choice is hybrid, since a load of each is
     about all the budget holds, and it was the fastest setting at 8 GiB free. offload with none is timed only where
-    offload's server drops its drafts for the size of the cache (engine._settle_preset_drafts): that server is it."""
+    offload's server drops its drafts for the size of the cache (engine._settle_preset_drafts): that server is it.
+    Without ``hybrid`` (an automatic plan under a fifth of the experts, engine._preset_hybrid_share_ok) no hybrid
+    candidate is timed: on short windows it could be chosen, and long prompts then run out of memory."""
     left = args.preset_fields
     drafts = "speculative_algorithm" in left and "speculative_num_steps" in left
     strategy, depth, served = static
@@ -196,7 +198,7 @@ def candidates(args, static: tuple[str, int, str | None], token_map: str | None 
         out.append(cand("hybrid", 0))
     if "offload" in (strategy, *others):
         out.append(cand("offload", 0))
-    return out
+    return out if hybrid else [c for c in out if c[1] != "hybrid"]
 
 
 def choose(tok_s: dict, names: list[str], margin: float = MARGIN) -> tuple[str, float]:
@@ -255,7 +257,7 @@ def _probe_gpu(args) -> tuple[str | None, str | None, int | None]:
     return name, uuid, free
 
 
-def _static_choice(args, argv: list[str]) -> tuple[str, int, str | None] | None:
+def _static_choice(args, argv: list[str]) -> tuple[str, int, str | None, bool] | None:
     """(strategy, draft tokens, draft token map) the static preset resolves to for this command line on the GPU the
     server will bind, from the engine's own _adjust_config in a process of its own (see _probe_gpu); None where that
     cannot be run. The map is None where the command line names one: every candidate's server then has it."""
@@ -274,14 +276,15 @@ def _static_choice(args, argv: list[str]) -> tuple[str, int, str | None] | None:
         "typed = args.speculative_token_map\n"
         "engine._adjust_config(args)\n"
         "depth = args.speculative_num_steps if args.speculative_algorithm is not None else 0\n"
-        "print(json.dumps([args.moe_strategy, depth, None if typed else args.speculative_token_map]))\n"
+        "hybrid = engine._preset_hybrid_share_ok(args)[0]\n"
+        "print(json.dumps([args.moe_strategy, depth, None if typed else args.speculative_token_map, hybrid]))\n"
     )
     try:
         done = subprocess.run([sys.executable, "-c", code, target, *argv], capture_output=True, text=True, timeout=300)
         if done.returncode != 0:
             return None
-        strategy, depth, token_map = json.loads(done.stdout.strip().splitlines()[-1])
-        return str(strategy), int(depth), token_map
+        strategy, depth, token_map, hybrid = json.loads(done.stdout.strip().splitlines()[-1])
+        return str(strategy), int(depth), token_map, bool(hybrid)
     except (subprocess.SubprocessError, ValueError, IndexError, TypeError):
         return None
 
@@ -622,7 +625,10 @@ def measured_choice(args, argv: list[str]) -> dict:
         if resolved is None:
             # timing a guess at it would judge the candidates against a server that does not run
             return static("what the static preset serves on this GPU could not be read")
-        todo = candidates(args, resolved, token_map)
+        hybrid = resolved[3] if len(resolved) > 3 else True
+        if not hybrid:
+            logger.info(f"--preset {PRESET}: hybrid is not a candidate: the automatic expert cache holds under a fifth of the experts")
+        todo = candidates(args, resolved[:3], token_map, hybrid=hybrid)
         names = [c[0] for c in todo]
         if len(todo) == 1:
             where = "every expert fits on the GPU, the store holds no other draft token map to time, and " if resolved[0] == "fused" else ""

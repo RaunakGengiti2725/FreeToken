@@ -455,6 +455,16 @@ def _preset_every_expert_fits(config) -> bool | None:
     return None if free is None else need <= int(config.memory_ratio * free)
 
 
+def _preset_hybrid_share_ok(config) -> tuple[bool, float | None]:
+    """(whether a preset may serve hybrid on this expert cache, the share counted): any cache the command line sized
+    (size, rate or memory), and an automatic plan that holds PRESET_DRAFT_SHARE of the experts or more. Also what
+    --preset single-measured times hybrid on (moe/calibrate.py)."""
+    if config.moe_cache_size > 0 or config.moe_cache_rate or config.moe_cache_mem is not None:
+        return True, None
+    share = _preset_expert_share(config)
+    return share is not None and share >= PRESET_DRAFT_SHARE, share
+
+
 def _preset_expert_share(config) -> float | None:
     """The share of all experts a preset's expert cache holds: a size or rate the command line gave, a --moe-cache-mem
     against the experts' bytes, or, for an automatic cache, the memory ratio's share of the free memory less what the
@@ -3001,9 +3011,8 @@ def _preset_without_row(config, reason: str) -> tuple[str, None] | None:
     # hybrid on a planned cache of 1609 of 10240 experts ran out of memory in long prefills where offload with the same
     # cache answered to 32K tokens. A cache the command line sized leaves the rest of the card free: hybrid at any share
     # (5% caches: 1.6 and 14 times offload's decode on two boxes, no failures)
-    sized = config.moe_cache_size > 0 or config.moe_cache_rate or config.moe_cache_mem is not None
-    share = None if sized else _preset_expert_share(config)
-    if not sized and (share is None or share < PRESET_DRAFT_SHARE):
+    ok, share = _preset_hybrid_share_ok(config)
+    if not ok:
         held = "cannot be counted before the load" if share is None else f"is about {share:.0%}, under {PRESET_DRAFT_SHARE:.0%}"
         logger.info_rank0(f"--preset {config.preset}: offload, not hybrid (the share of the experts the expert cache holds {held})")
         return None
