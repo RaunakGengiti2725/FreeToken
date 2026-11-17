@@ -132,7 +132,6 @@ def chunk_fwd_o(
     scale: Optional[float] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
-    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -145,8 +144,7 @@ def chunk_fwd_o(
         scale = k.shape[-1] ** -0.5
 
     # every row of o belongs to one chunk of one sequence and the kernel stores each chunk whole
-    o = torch.empty_like(v) if output is None else output
-    assert o.shape == v.shape and o.dtype == v.dtype and o.is_contiguous()
+    o = torch.empty_like(v)
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)

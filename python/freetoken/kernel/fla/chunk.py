@@ -41,7 +41,6 @@ def chunk_gated_delta_rule_fwd(
     chunk_indices: torch.LongTensor | None = None,
     track_state: Optional[torch.Tensor] = None,
     value_rows: Optional[torch.Tensor] = None,
-    output: Optional[torch.Tensor] = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -77,7 +76,6 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
-        output=output,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, None, h, None
@@ -104,8 +102,6 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         track_state: Optional[torch.Tensor] = None,
         value_rows: Optional[torch.Tensor] = None,
-        value_start: int = 0,
-        output: Optional[torch.Tensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -131,9 +127,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             track_state=track_state,
-            # sliced here, past the guard, which would copy the strided view it makes
-            value_rows=None if value_rows is None else value_rows[:, value_start : value_start + q.shape[1]],
-            output=output,
+            value_rows=value_rows,
         )
         return o.to(q.dtype), h
 
@@ -153,8 +147,6 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     track_state: Optional[torch.Tensor] = None,
     value_rows: Optional[torch.Tensor] = None,
-    value_start: int = 0,
-    output: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -189,11 +181,6 @@ def chunk_gated_delta_rule(
         value_rows (torch.Tensor):
             The values as `[H * V, T]` contiguous, a row a value dim, read in place of `v`, which is then `None`.
             Needs `cu_seqlens`. Default: `None`.
-        value_start (int):
-            The column of `value_rows` the values of token 0 sit in: `value_rows` may hold more tokens than `q`,
-            and its columns `[value_start, value_start + T)` are read in place. Default: 0.
-        output (torch.Tensor):
-            A contiguous `[B, T, H, V]` tensor of the values' dtype the output is written into. Default: `None`.
 
     Returns:
         o (torch.Tensor):
@@ -232,8 +219,6 @@ def chunk_gated_delta_rule(
     """
     assert (v is None) != (value_rows is None), "the values come as v or as value_rows"
     assert value_rows is None or (cu_seqlens is not None and value_rows.is_contiguous())
-    assert value_rows is None or value_start + q.shape[1] <= value_rows.shape[1]
-    assert output is None or (output.is_contiguous() and output.dtype == q.dtype)
     assert q.dtype == k.dtype == (value_rows if v is None else v).dtype
     assert (
         q.dtype != torch.float32
@@ -286,8 +271,6 @@ def chunk_gated_delta_rule(
         use_qk_l2norm_in_kernel,
         track_state,
         value_rows,
-        value_start,
-        output,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
