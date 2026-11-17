@@ -322,3 +322,97 @@ def test_prefill_hit_d2d_noop_without_spare_slots():
     torch.cuda.synchronize()
     for view, (name, per_layer) in zip(views, sources.items()):
         assert torch.equal(view.cpu(), per_layer[0]), name
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_prefill_routed_copy_stages_the_routed_misses_as_the_stream_does(seed):
+    """The batch memcpy entries of a chunk that copies only its routed misses, on host memory standing in for the
+    device: the small banks' whole-layer entries ahead of the layer and the big banks' runs of routed misses after it
+    leave every routed row, and every small-bank row, as the stream's entries do, and only entries of whole big rows."""
+    import numpy as np
+
+    from freetoken.moe.offload_cache import _SMALL_BANK_FEAT_BYTES, routed_misses, stage_copy_entries
+
+    rng = np.random.default_rng(seed)
+    experts = 16
+    rows = [_SMALL_BANK_FEAT_BYTES, 64, 0, _SMALL_BANK_FEAT_BYTES + 32]  # big, small, a role the layer lacks, big
+    sizes = [experts * feat for feat in rows]
+    host = rng.integers(0, 256, sum(sizes), dtype=np.uint8)
+    src = list(np.cumsum([0] + sizes[:-1]))
+    stage = [base + len(host) for base in src]
+
+    def staged(*batches):
+        memory = np.concatenate([host, np.zeros(len(host), dtype=np.uint8)])
+        for dst, source, nbytes in batches:
+            for d, s, n in zip(dst, source, nbytes):
+                memory[d : d + n] = memory[s : s + n]
+        return [memory[st : st + size].reshape(experts, max(feat, 1)) if feat else None for st, size, feat in zip(stage, sizes, rows)]
+
+    miss = np.sort(rng.choice(experts, int(rng.integers(1, experts)), replace=False))
+    routed = rng.random(experts) < 0.5
+    stream = staged(stage_copy_entries(rows, stage, src, experts, miss, small=True, large=True))
+    ahead = stage_copy_entries(rows, stage, src, experts, miss, small=True, large=False)
+    after = stage_copy_entries(rows, stage, src, experts, routed_misses(miss, routed), small=False, large=True)
+    routed_copy = staged(ahead, after)
+
+    copied = miss[routed[miss]]
+    for feat, by_stream, by_routes in zip(rows, stream, routed_copy):
+        if not feat:
+            continue
+        if feat < _SMALL_BANK_FEAT_BYTES:
+            assert np.array_equal(by_routes, by_stream)
+        else:
+            assert np.array_equal(by_routes[copied], by_stream[copied])
+            assert not by_routes[np.setdiff1d(miss, copied)].any(), "an unrouted miss crossed"
+    # no entry under the driver's async floor in the batch issued after the layer's routes
+    assert all(n >= _SMALL_BANK_FEAT_BYTES for n in after[2])
+    assert sum(after[2]) == copied.size * (rows[0] + rows[3])
+
+
+@CUDA
+@JIT
+@BATCH_API
+@pytest.mark.parametrize("decode_target", ["gpu", "hybrid"])
+def test_prefill_routed_copy_matches_the_stream_layer_for_layer(monkeypatch, decode_target):
+    """A chunk that copies only the absent experts it routes to, after each layer's routes, stages every routed row
+    bit for bit as the stream that copies every absent expert ahead of the layer, layer for layer, and leaves the
+    slot map as the stream does (hybrid decode reads residency). gate_up counts as a big bank here, down as a small
+    one; the hit slots are full, so the stream keeps nothing either."""
+    from freetoken.moe import offload_cache
+
+    monkeypatch.setattr(offload_cache, "_SMALL_BANK_FEAT_BYTES", 300)  # gate_up rows are 512 bytes, down rows 256
+    routes = torch.tensor([[1, 5], [5, 2], [0, 7]], dtype=torch.int32, device="cuda")
+    rows = routes.view(-1).unique().long()
+
+    def run(routed_copy_tokens):
+        torch.manual_seed(0)
+        cache, sources = _make_cache()
+        cache.decode_target = decode_target
+        cache.prefill_routed_copy_tokens = routed_copy_tokens
+        # every hit slot full: experts 1 and 3 of each layer, and others; expert 0 of layer 1 sits in a staging slot, poisoned
+        for layer_id in range(NUM_LAYERS):
+            for k, e in enumerate((1, 3) if layer_id < 2 else (1, 3, 4, 6)):
+                _seed_resident(cache, sources, layer_id, e, 2 * E + 2 * layer_id + k if layer_id < 2 else 2 * E + 4 + k)
+        _seed_resident(cache, sources, layer_id=1, expert_id=0, slot=2)
+        for name in sources:
+            cache.bank_caches[name][2].fill_(float("nan"))
+        cache.begin_prefill(num_routes=routes.numel(), num_tokens=routes.shape[0])
+        assert cache._prefill_routed_copy == bool(routed_copy_tokens)
+        staged = []
+        for layer_id in range(NUM_LAYERS):
+            cache.prefetch_prefill_layer(layer_id)
+            cache.prefetch_prefill_layer(layer_id + 1)
+            views = cache.wait_prefill_layer(layer_id, routes)
+            torch.cuda.synchronize()
+            staged.append([view[rows].clone() for view in views])
+            for view, (name, per_layer) in zip(views, sources.items()):
+                assert torch.equal(view[rows].cpu(), per_layer[layer_id][rows.cpu()]), (layer_id, name)
+            cache.release_prefill_layer(layer_id)
+        torch.cuda.synchronize()
+        return staged, cache.slot_for_id.clone(), cache.id_of_slot.clone(), cache.prefill_hit_rows
+
+    stream, routed = run(0), run(64)
+    for layer_id, (by_stream, by_routes) in enumerate(zip(stream[0], routed[0])):
+        for a, b in zip(by_stream, by_routes):
+            assert torch.equal(a, b), layer_id
+    assert torch.equal(stream[1], routed[1]) and torch.equal(stream[2], routed[2]) and stream[3] == routed[3]

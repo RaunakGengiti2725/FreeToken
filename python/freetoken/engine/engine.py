@@ -291,19 +291,37 @@ def _drop_preset_demand(config, reason: str) -> None:
 
 # A/B switch: FREETOKEN_PREFILL_DEMAND_BY_MISSES=0 leaves a preset's demand-loaded chunks to the token count alone
 _PREFILL_DEMAND_BY_MISSES = os.getenv("FREETOKEN_PREFILL_DEMAND_BY_MISSES", "1") != "0"
+# A streamed hit-d2d chunk of at most this many tokens copies only the absent experts it routes to (the cache's
+# prefill_routed_copy_tokens); FREETOKEN_PREFILL_ROUTED_COPY_TOKENS=0 copies every absent expert, for an A/B.
+# unmeasured: where it stops paying. Each layer's copy waits for that layer's routes, so it no longer runs under the
+# layer before; near 2048 tokens at 8 routes a token a chunk reaches nearly every expert of a 256-expert layer and
+# copies about what the stream does, without the overlap. 512 until the 1024 and 2048 arms are read.
+_PREFILL_ROUTED_COPY_TOKENS = int(os.getenv("FREETOKEN_PREFILL_ROUTED_COPY_TOKENS", "512"))
+# where the routed copy serves the chunks above it, a preset loads on demand only chunks this short: their routes
+# reach fewer experts than a layer has, and the demand path needs no host sync a layer
+PRESET_ROUTED_DEMAND_TOKENS = 32
 
 
 def _settle_preset_demand(config, decode_target: str, pool_sizes: list[int], cache=None) -> None:
     """A preset's short prefill chunks load their experts on demand only through a GPU-decoded expert cache that cannot
     hold every expert. Called before the cache is built, which refuses them on another decode target, and with the cache.
     There a longer chunk is loaded on demand too when that copies less than streaming it (cache.choose_prefill_path)."""
-    if decode_target != "gpu":
+    from freetoken.moe.offload_cache import HYBRID_PREFILL_DEMAND
+
+    if decode_target != "gpu" and not (decode_target == "hybrid" and HYBRID_PREFILL_DEMAND):
         _drop_preset_demand(config, f"the expert cache decodes on {decode_target}")
+    elif cache is not None and (reason := cache.demand_refusal()) is not None:
+        if "moe_prefill_demand_tokens" not in getattr(config, "preset_fields", ()) and config.moe_prefill_demand_tokens:
+            raise ValueError(f"--moe-prefill-demand-tokens: {reason}")
+        _drop_preset_demand(config, reason)
     elif min(pool_sizes) < config.model_config.num_experts:
         _drop_preset_demand(config, f"a slot pool of {min(pool_sizes)} slots cannot hold the experts a chunk routes to in one layer")
     elif cache is not None and cache.keeps_streamed_experts and cache.holds_every_expert:
         # a prefill reads the slots once they are filled, and until then it fills them by streaming
         _drop_preset_demand(config, "the expert cache has a slot for every expert")
+    if cache is not None and "moe_prefill_demand_tokens" in getattr(config, "preset_fields", ()):
+        if config.moe_prefill_demand_tokens and cache.copies_routed_misses(config.moe_prefill_demand_tokens):
+            object.__setattr__(config, "moe_prefill_demand_tokens", min(config.moe_prefill_demand_tokens, PRESET_ROUTED_DEMAND_TOKENS))
     if cache is not None:
         cache.prefill_demand_tokens = config.moe_prefill_demand_tokens
         cache.prefill_demand_by_misses = _PREFILL_DEMAND_BY_MISSES and "moe_prefill_demand_tokens" in config.preset_fields
@@ -1531,6 +1549,9 @@ class Engine:
                 parts.append("a prefill streams the experts that are not resident (--moe-prefill-hit-d2d)")
             if demand := self.moe_offload_cache.prefill_demand_tokens:
                 parts.append(f"a prefill chunk of at most {demand} tokens loads only the experts it routes to")
+            routed = self.moe_offload_cache.prefill_routed_copy_tokens
+            if routed > demand and self.moe_offload_cache.copies_routed_misses(routed):
+                parts.append(f"a streamed chunk of at most {routed} tokens copies only the absent experts it routes to")
         elif getattr(config.model_config, "is_moe", False):
             parts.append(f"every expert resident ({config.moe_strategy})")
         parts.append(f"{num_tokens} KV tokens")
@@ -1751,6 +1772,7 @@ class Engine:
             device=self.device,
             cache_policy=config.moe_cache_policy,
             prefill_demand_tokens=config.moe_prefill_demand_tokens,
+            prefill_routed_copy_tokens=_PREFILL_ROUTED_COPY_TOKENS,
             prefill_overlap=config.moe_prefill_overlap,
             prefill_hit_d2d=config.moe_prefill_hit_d2d,
             quant_format=banks.quant_format,

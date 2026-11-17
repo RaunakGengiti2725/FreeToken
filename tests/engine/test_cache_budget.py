@@ -1553,8 +1553,10 @@ def test_preset_loads_short_prefill_chunks_on_demand_only_into_a_gpu_decoded_cac
     engine = decode_rows.engine
     monkeypatch.setattr(OffloadMoeCache, "keeps_streamed_experts", property(lambda self: self.prefill_hit_d2d))
 
-    def settled(extra, decode_target="gpu", pool_sizes=None, fields=("moe_prefill_demand_tokens",), tokens=512, by_misses=True):
+    def settled(extra, decode_target="gpu", pool_sizes=None, fields=("moe_prefill_demand_tokens",), tokens=512, by_misses=True, routed=0, cpu_layers=frozenset(), usable=True):
         monkeypatch.setattr(engine, "_PREFILL_DEMAND_BY_MISSES", by_misses)
+        # a CPU cache has no copy stream for the hit-d2d split
+        monkeypatch.setattr(OffloadMoeCache, "_hit_d2d_usable", lambda self: usable)
         config = SimpleNamespace(
             preset="single", preset_fields=fields, moe_prefill_demand_tokens=tokens, model_config=SimpleNamespace(num_experts=4),
         )
@@ -1562,24 +1564,37 @@ def test_preset_loads_short_prefill_chunks_on_demand_only_into_a_gpu_decoded_cac
         engine._settle_preset_demand(config, decode_target, pool_sizes)  # before the cache: it refuses demand chunks off the GPU
         cache = OffloadMoeCache(
             num_layers=10, num_experts=4, cache_size=40 + extra, device=torch.device("cpu"), prefill_overlap=True, prefill_hit_d2d=True,
-            prefill_demand_tokens=config.moe_prefill_demand_tokens, decode_target=decode_target,
+            prefill_demand_tokens=config.moe_prefill_demand_tokens, decode_target=decode_target, prefill_routed_copy_tokens=routed,
         )
         cache.set_bank_sources({"gate_up": [torch.randn(4, 32, 8) for _ in range(10)], "down": [torch.randn(4, 8, 16) for _ in range(10)]})
+        cache.cpu_layer_ids = cpu_layers
         engine._settle_preset_demand(config, decode_target, pool_sizes, cache)
         assert cache.prefill_demand_tokens == config.moe_prefill_demand_tokens
         # only the preset's chunks may also go by the bytes each way copies, and FREETOKEN_PREFILL_DEMAND_BY_MISSES=0 stops that
         assert cache.prefill_demand_by_misses == (by_misses and "moe_prefill_demand_tokens" in config.preset_fields)
-        assert ("moe_prefill_demand_tokens" in config.preset_fields) == (bool(fields) and config.moe_prefill_demand_tokens == 512)
+        assert ("moe_prefill_demand_tokens" in config.preset_fields) == (bool(fields) and config.moe_prefill_demand_tokens in (512, 32))
         return config.moe_prefill_demand_tokens
 
     # 40 experts, 8 staging slots: a slot for every expert outside them, or one short of it
     assert settled(7) == 512 and settled(0) == 512 and settled(8) == 0 and settled(7, by_misses=False) == 512
     assert settled(0, decode_target="hybrid") == 0 and settled(0, decode_target="cpu") == 0
     assert settled(0, pool_sizes=[3, 37]) == 0  # a pool smaller than a layer: a chunk can route to every expert of one
+    # where a streamed chunk copies only its routed misses up to the preset's length or past it, the preset loads on
+    # demand only chunks of up to 32 tokens; typed tokens stay as typed
+    assert settled(7, routed=2048) == 32 and settled(7, routed=512) == 32 and settled(7, routed=256) == 512
+    assert settled(7, routed=2048, usable=False) == 512  # no batch memcpy or no hit region: no routed copy either
+    assert settled(8, routed=2048) == 0 and settled(8, fields=(), routed=2048) == 512
     # typed tokens are the command line's: kept on any cache, and refused by it as without the preset
     assert settled(8, fields=()) == 512 and settled(8, fields=(), tokens=32) == 32
     with pytest.raises(ValueError, match="needs GPU decode"):
         settled(0, decode_target="hybrid", fields=())
+    # FREETOKEN_HYBRID_PREFILL_DEMAND=1: hybrid loads on demand as GPU decode does, unless a layer decodes on the CPU
+    monkeypatch.setattr("freetoken.moe.offload_cache.HYBRID_PREFILL_DEMAND", True)
+    assert settled(0, decode_target="hybrid") == 512 and settled(0, decode_target="hybrid", fields=()) == 512
+    assert settled(0, decode_target="hybrid", routed=2048) == 32 and settled(0, decode_target="cpu") == 0
+    assert settled(0, decode_target="hybrid", cpu_layers=frozenset({3})) == 0
+    with pytest.raises(ValueError, match="1 layer decode on the CPU"):
+        settled(0, decode_target="hybrid", fields=(), cpu_layers=frozenset({3}))
     # resident experts have no cache to load into
     fields = ("max_running_req", "moe_prefill_demand_tokens")
     fused = _resolved(decode_rows, preset="single", preset_fields=fields, moe_strategy="fused", moe_prefill_demand_tokens=512)

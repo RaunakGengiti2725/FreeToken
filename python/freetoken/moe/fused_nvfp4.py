@@ -126,8 +126,13 @@ def _align_routes(
     if slot_of is None:
         return moe_align_block_size(topk_ids, block_m, num_experts)
     sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, block_m, tile_experts)
-    # the blocks past ntpp are never run but hold uninitialized ids
-    return sorted_ids, slot_of.index_select(0, expert_ids.clamp_(0, tile_experts - 1)), ntpp
+    # the blocks past ntpp are never run but hold uninitialized ids, which may name an expert without a slot (-1)
+    # after a demand admission: those name row 0. A block that runs and names no slot is a routed expert the
+    # admission did not load, and stops the forward instead of reading a row before the banks.
+    slots = slot_of.index_select(0, expert_ids.clamp_(0, tile_experts - 1))
+    runs = torch.arange(slots.numel(), device=slots.device) * block_m < ntpp.to(slots.device)
+    torch._assert_async(((slots >= 0) | ~runs).all())
+    return sorted_ids, torch.where(runs, slots, 0), ntpp
 
 
 def fused_experts_nvfp4(

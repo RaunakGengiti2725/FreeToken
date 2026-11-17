@@ -329,13 +329,17 @@ def test_triton_overlap_prefill_matches_dequant_reference():
 
 
 @cuda
+@pytest.mark.parametrize("decode_target", ["gpu", "hybrid"])
+@pytest.mark.parametrize("skewed", [False, True])
 @pytest.mark.parametrize(("cache_size", "query_width"), [(1100, None), (E, 3)])
-def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatch, cache_size, query_width):
+def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatch, cache_size, query_width, skewed, decode_target):
     """A short prefill chunk loads only its routed experts, through the slot cache, and runs the
     same grouped GEMM over the slots: its output must equal the whole-layer stream's exactly, and
     its admissions must not count as decode misses. The chunk routes more often than one
     admission query compiles for, and the wider cache aligns past 1024 experts; the cache of one
-    layer's experts, filled three at a time, must keep every query's experts until the GEMM."""
+    layer's experts, filled three at a time, must keep every query's experts until the GEMM.
+    Grouped over the layer's experts, each block reading its expert's slot, the output is the same;
+    skewed routes leave experts without a slot. A hybrid cache (FREETOKEN_HYBRID_PREFILL_DEMAND=1) loads the same way."""
     from freetoken.moe import offload_kernels
     from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
 
@@ -345,7 +349,10 @@ def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatc
     torch.manual_seed(15)
     M = 600
     hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
-    topk_ids = torch.rand(M, E, device=device).argsort(dim=1)[:, :TOPK].to(torch.int32).contiguous()
+    if skewed:
+        topk_ids = _skewed_routes(M, device=device)
+    else:
+        topk_ids = torch.rand(M, E, device=device).argsort(dim=1)[:, :TOPK].to(torch.int32).contiguous()
     topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
 
     streamed_cache, _ = _triton_cache(device)
@@ -356,6 +363,7 @@ def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatc
     )
 
     demand_cache, _ = _triton_cache(device, cache_size=cache_size)
+    demand_cache.decode_target = decode_target
     demand_cache.collect_stats = True
     # decode left the other layer's experts and one of this layer's resident, so slots are not expert ids
     for layer_id, resident in ((0, [7, 6]), (1, [2])):
@@ -368,9 +376,17 @@ def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatc
         routed_experts=E,
     )
 
+    slot_of = demand_cache.slot_for_id[1]
+    by_expert = fused_experts_nvfp4(
+        hidden, *demand_cache.pool_bank_views(1), topk_weights, topk_ids, demand_cache.pool_slots(1), "silu", False,
+        routed_experts=E, slot_of=slot_of,
+    )
+
     assert not torch.equal(slots, topk_ids), "the admission must have mapped expert ids to slots"
     assert torch.equal(demanded, streamed)
+    assert torch.equal(by_expert, streamed)
     assert torch.equal(demand_cache.lru_stats, decode_stats)
+    assert not skewed or int(slot_of.min()) < 0, "an expert the chunk does not route to has no slot"
 
 
 def _skewed_routes(tokens: int, generator: torch.Generator | None = None, device="cpu") -> torch.Tensor:
@@ -427,10 +443,13 @@ def _align_on_cpu(topk_ids: torch.Tensor, block_m: int, num_experts: int):
     return sorted_ids, expert_ids, torch.tensor([start], dtype=torch.int32)
 
 
+@pytest.mark.parametrize("demand", [False, True])
 @pytest.mark.parametrize("tokens", [1, 7, 64, 1000])
-def test_triton_prefill_over_resident_slots_groups_its_routes_over_the_layers_experts(monkeypatch, tokens):
+def test_triton_prefill_over_resident_slots_groups_its_routes_over_the_layers_experts(monkeypatch, tokens, demand):
     """The grouping a resident prefill hands its GEMMs: sized by the layer's experts whatever the pool, every route in
-    a block that names the slot of its expert, and no block, run or not, naming a row outside the banks."""
+    a block that names the slot of its expert, and no block, run or not, naming a row outside the banks. After a
+    demand chunk's admission the experts it does not route to may have no slot (-1); a routed one without a slot
+    is an error, not a read of row 0."""
     from freetoken.kernel import nvfp4_moe
     from freetoken.moe import fused_nvfp4
 
@@ -439,6 +458,8 @@ def test_triton_prefill_over_resident_slots_groups_its_routes_over_the_layers_ex
     # the layer's slots lie scattered through the pool
     slot_of = torch.randperm(pool, generator=g)[:E].to(torch.int32)
     topk_ids = _skewed_routes(tokens, g)
+    if demand:
+        slot_of[[1, 3, 4]] = -1
     aligned_over, launches = [], []
 
     def align(ids, block, num_experts):
@@ -470,7 +491,15 @@ def test_triton_prefill_over_resident_slots_groups_its_routes_over_the_layers_ex
     assert by_expert[0].numel() <= by_slot[0].numel()
     assert torch.equal(slot_read_by_each_route(*by_expert), slots.view(-1))
     assert torch.equal(slot_read_by_each_route(*by_slot), slots.view(-1))
-    assert torch.isin(by_expert[1], slot_of).all()
+    named, runs = by_expert[1], int(by_expert[2]) // block_m
+    assert ((named >= 0) & (named < pool)).all()
+    # the blocks that run name their expert's slot; the others, row 0
+    assert torch.isin(named[:runs], slot_of[slot_of >= 0]).all() and not named[runs:].any()
+    # a routed expert without a slot stops the forward
+    unloaded = slot_of.clone()
+    unloaded[topk_ids[0, 0].long()] = -1
+    with pytest.raises(RuntimeError):
+        fused_nvfp4.fused_experts_nvfp4(hidden, *banks, weights, topk_ids, pool, routed_experts=E, slot_of=unloaded)
 
 
 def test_triton_prefill_over_cache_slots_sizes_its_tiles_by_the_routed_layer(monkeypatch):
@@ -1027,3 +1056,69 @@ def test_b12x_pack_keeps_per_layer_banks_and_flat_alphas():
     assert len(cache.bank_sources["gate_up"]) == L
     assert sum(t.shape[0] for t in cache.bank_sources["gate_up"]) == total
     assert cache.gate_up_alpha.shape == (total,)
+
+
+@cuda
+@pytest.mark.parametrize("fmt", ["bf16", "nvfp4"])
+def test_prefill_routed_copy_gemm_reads_no_unrouted_staging_row(monkeypatch, fmt):
+    """Under the routed copy a staging buffer's unrouted rows keep whatever they held, here NaN in every byte (0xFF:
+    NaN in bf16, e4m3 and fp32). The prefill GEMM over the routed copy's buffer must equal, bit for bit, the GEMM
+    over the stream's, which writes every row: no route reads an unrouted row, with or without weight. The hit
+    slots hold two routed and two unrouted experts of each layer; the packed banks count as big, the scales small."""
+    from freetoken.moe import offload_cache
+    from freetoken.moe.fused import fused_experts_impl
+    from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setattr(offload_cache, "_SMALL_BANK_FEAT_BYTES", 8192)
+    device = torch.device("cuda")
+    if fmt == "nvfp4":
+        sources, kwargs = _make_native_sources(device, seed=11), {"quant_format": "nvfp4"}
+    else:
+        g = torch.Generator().manual_seed(11)
+        sources = {
+            "gate_up": [(torch.randn(E, 2 * I, H, generator=g) / 8).to(torch.bfloat16).pin_memory() for _ in range(L)],
+            "down": [(torch.randn(E, H, I, generator=g) / 8).to(torch.bfloat16).pin_memory() for _ in range(L)],
+        }
+        kwargs = {}
+    torch.manual_seed(12)
+    M = 6
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    topk_ids = _skewed_routes(M, device=device)  # never 1, 3 or 4
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+
+    def run(routed_copy_tokens):
+        cache = OffloadMoeCache(
+            num_layers=L, num_experts=E, cache_size=2 * E + 4 * L, device=device, prefill_overlap=True, prefill_hit_d2d=True, **kwargs
+        )
+        cache.set_bank_sources({name: sources[name] for name in cache.bank_schema})
+        cache.prefill_routed_copy_tokens = routed_copy_tokens
+        # every hit slot full: experts 0 and 6 (routed), 1 and 3 (not) of each layer
+        for layer in range(L):
+            for k, e in enumerate((0, 6, 1, 3)):
+                slot = 2 * E + 4 * layer + k
+                cache.slot_for_id[layer, e] = slot
+                cache.id_of_slot[slot] = layer * E + e
+                for name, per_layer in sources.items():
+                    cache.bank_caches[name][slot].copy_(per_layer[layer][e])
+        for (_, bank), stage in zip(cache.banks, cache._stage_bytes):
+            bank.view(-1).view(torch.uint8)[: 2 * stage].fill_(0xFF)
+        cache.begin_prefill(num_routes=topk_ids.numel(), num_tokens=M)
+        assert cache._prefill_routed_copy == bool(routed_copy_tokens)
+        outs = []
+        for layer in range(L):
+            cache.prefetch_prefill_layer(layer)
+            cache.prefetch_prefill_layer(layer + 1)
+            views = cache.wait_prefill_layer(layer, topk_ids)
+            if fmt == "nvfp4":
+                out = fused_experts_nvfp4(hidden.clone(), *views, topk_weights, topk_ids.clone(), E, "silu", False)
+            else:
+                out = fused_experts_impl(hidden.clone(), *views, topk_weights, topk_ids.clone(), "silu", False)
+            outs.append(out.clone())
+            cache.release_prefill_layer(layer)
+        torch.cuda.synchronize()
+        return outs
+
+    for layer, (by_stream, by_routes) in enumerate(zip(run(0), run(64))):
+        assert torch.isfinite(by_stream).all(), layer
+        assert torch.equal(by_routes, by_stream), layer

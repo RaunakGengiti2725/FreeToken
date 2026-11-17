@@ -286,6 +286,60 @@ def test_pool_sizing_covers_4mr_floor():
         assert _linear_pool_num_slots(c) >= 4 * mr + 1, (mr, _linear_pool_num_slots(c))
 
 
+def test_one_request_pool_runs_a_chat_on_the_lowest_snapshot_floors(monkeypatch):
+    """FREETOKEN_ONE_REQUEST_SNAPSHOT_FLOOR=1 lowers one request's snapshot cache to 1 (2 at the default ratio). The
+    pool admits every turn and commits every snapshot on any floor down to none, and a chat that only grows hits its
+    whole previous prompt on each; what fewer snapshots lose is a return to an older turn's prefix."""
+    from freetoken.kvcache import linear_state_pool
+    from freetoken.kvcache.linear_state_pool import _linear_pool_num_slots
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    def slots(ratio, mr=1):
+        return _linear_pool_num_slots(SimpleNamespace(max_running_req=mr, cache_type="hybrid_radix", linear_state_cache_ratio=ratio))
+
+    assert (slots(2.0), slots(0.1), slots(2.0, mr=2)) == (9, 9, 13)
+    monkeypatch.setattr(linear_state_pool, "ONE_REQUEST_SNAPSHOT_FLOOR", True)
+    assert (slots(2.0), slots(0.1), slots(2.0, mr=2)) == (7, 6, 13)
+
+    def cached_lens(num_slots, prompts):
+        pt = torch.zeros(2, 4096, dtype=torch.int32)
+        cm = CacheManager(4096, 1, pt, "hybrid_radix", linear_state_pool=_pool(num_slots))
+        tm = TableManager(max_running_reqs=1, page_table=pt)
+        pm = PrefillManager(cm, tm, DecodeManager(page_size=1))
+        hits = []
+        for prompt in prompts:
+            pm.pending_list = [PendingReq(0, torch.tensor(prompt, dtype=torch.int32), SamplingParams(max_tokens=1))]
+            req = None
+            while req is None or isinstance(req, ChunkedReq):
+                batch = pm.schedule_next_batch(128)
+                assert batch is not None, "admission refused"
+                if req is None:
+                    hits.append(batch.reqs[0].cached_len)
+                req = batch.reqs[0]
+                cm.allocate_paged([req])
+                # the chunk's forward: a snapshot at the deepest 64-token boundary strictly inside it
+                boundary = (req.cached_len + req.extend_len - 1) // 64 * 64
+                if boundary > req.cached_len:
+                    req.mamba_last_track_seqlen, req.mamba_next_track_idx = boundary, 1 - req.mamba_next_track_idx
+                req.complete_one()
+            cm.cache_req(req, finished=False)
+            cm.cache_req(req, finished=True)
+            tm.free(req.table_idx)
+        return hits
+
+    turns = [list(range(1, 301))]
+    for turn in range(1, 4):
+        turns.append(turns[-1] + list(range(1000 * turn + 1, 1000 * turn + 301)))
+    for num_slots in (5, 6, 7, 9):
+        assert cached_lens(num_slots, turns) == [0, 300, 600, 900], num_slots
+    # the second turn's prompt again after the fourth: two snapshots of cache keep it, one keeps part, none nothing
+    again = turns + [turns[1] + [7, 7, 7]]
+    assert [cached_lens(n, again)[-1] for n in (5, 6, 7, 9)] == [0, 192, 300, 300]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
