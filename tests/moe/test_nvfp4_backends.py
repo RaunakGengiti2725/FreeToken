@@ -329,16 +329,17 @@ def test_triton_overlap_prefill_matches_dequant_reference():
 
 
 @cuda
+@pytest.mark.parametrize("decode_target", ["gpu", "hybrid"])
 @pytest.mark.parametrize("skewed", [False, True])
 @pytest.mark.parametrize(("cache_size", "query_width"), [(1100, None), (E, 3)])
-def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatch, cache_size, query_width, skewed):
+def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatch, cache_size, query_width, skewed, decode_target):
     """A short prefill chunk loads only its routed experts, through the slot cache, and runs the
     same grouped GEMM over the slots: its output must equal the whole-layer stream's exactly, and
     its admissions must not count as decode misses. The chunk routes more often than one
     admission query compiles for, and the wider cache aligns past 1024 experts; the cache of one
     layer's experts, filled three at a time, must keep every query's experts until the GEMM.
     Grouped over the layer's experts, each block reading its expert's slot, the output is the same;
-    skewed routes leave experts without a slot."""
+    skewed routes leave experts without a slot. A hybrid cache (FREETOKEN_HYBRID_PREFILL_DEMAND=1) loads the same way."""
     from freetoken.moe import offload_kernels
     from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
 
@@ -362,6 +363,7 @@ def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatc
     )
 
     demand_cache, _ = _triton_cache(device, cache_size=cache_size)
+    demand_cache.decode_target = decode_target
     demand_cache.collect_stats = True
     # decode left the other layer's experts and one of this layer's resident, so slots are not expert ids
     for layer_id, resident in ((0, [7, 6]), (1, [2])):

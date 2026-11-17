@@ -25,6 +25,11 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
+# FREETOKEN_HYBRID_PREFILL_DEMAND=1 lets a hybrid cache load prefill chunks on demand. The prefill's output is the
+# stream's, but its admissions leave other experts resident, and hybrid decode computes a non-resident expert on the
+# CPU, which rounds differently: the text after it can change, so it is off unless asked for.
+HYBRID_PREFILL_DEMAND = os.getenv("FREETOKEN_HYBRID_PREFILL_DEMAND", "0") == "1"
+
 from freetoken.kernel.fast_index_copy import default_blocks_per_bank
 from freetoken.utils import init_logger
 
@@ -185,9 +190,10 @@ class OffloadMoeCache:
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
-        if self.prefill_demand_tokens and self.decode_target != "gpu":
+        if self.prefill_demand_tokens and not self.decodes_demand_chunks:
             raise ValueError(
-                f"--moe-prefill-demand-tokens needs GPU decode; this cache decodes on {self.decode_target!r}"
+                f"--moe-prefill-demand-tokens needs GPU decode, or hybrid with FREETOKEN_HYBRID_PREFILL_DEMAND=1; "
+                f"this cache decodes on {self.decode_target!r}"
             )
         if self.layer_layouts is not None:
             assert self.layout is None, "pass layout or layer_layouts, not both"
@@ -1356,6 +1362,20 @@ class OffloadMoeCache:
             self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
+
+    @property
+    def decodes_demand_chunks(self) -> bool:
+        """Whether this cache's decode target reads what a demand-loaded chunk admits: GPU decode, and hybrid when
+        HYBRID_PREFILL_DEMAND allows it. cpu decode does not read the slot cache."""
+        return self.decode_target == "gpu" or (self.decode_target == "hybrid" and HYBRID_PREFILL_DEMAND)
+
+    def demand_refusal(self) -> str | None:
+        """Why this cache's layers cannot load a chunk on demand, or None. A layer without a device alias (locked or
+        pageable host banks) copies only whole layers, or through its capped staging, and a CPU-only layer has no
+        slots of its own."""
+        if self.cpu_layer_ids or self._unpinned_layers:
+            return f"{_layers(len(self.cpu_layer_ids | self._unpinned_layers))} decode on the CPU or have no pinned host banks"
+        return None
 
     def loads_prefill_on_demand(self, num_tokens: int) -> bool:
         return 0 < num_tokens <= self.prefill_demand_tokens

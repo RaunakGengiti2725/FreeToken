@@ -301,8 +301,14 @@ def _settle_preset_demand(config, decode_target: str, pool_sizes: list[int], cac
     """A preset's short prefill chunks load their experts on demand only through a GPU-decoded expert cache that cannot
     hold every expert. Called before the cache is built, which refuses them on another decode target, and with the cache.
     There a longer chunk is loaded on demand too when that copies less than streaming it (cache.choose_prefill_path)."""
-    if decode_target != "gpu":
+    from freetoken.moe.offload_cache import HYBRID_PREFILL_DEMAND
+
+    if decode_target != "gpu" and not (decode_target == "hybrid" and HYBRID_PREFILL_DEMAND):
         _drop_preset_demand(config, f"the expert cache decodes on {decode_target}")
+    elif cache is not None and (reason := cache.demand_refusal()) is not None:
+        if "moe_prefill_demand_tokens" not in getattr(config, "preset_fields", ()) and config.moe_prefill_demand_tokens:
+            raise ValueError(f"--moe-prefill-demand-tokens: {reason}")
+        _drop_preset_demand(config, reason)
     elif min(pool_sizes) < config.model_config.num_experts:
         _drop_preset_demand(config, f"a slot pool of {min(pool_sizes)} slots cannot hold the experts a chunk routes to in one layer")
     elif cache is not None and cache.keeps_streamed_experts and cache.holds_every_expert:

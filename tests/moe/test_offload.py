@@ -447,13 +447,17 @@ def test_offload_moe_cache_marlin_rejects_slot_count_beyond_kernel_limit():
         )
 
 
+@pytest.mark.parametrize("switch", [False, True])
 @pytest.mark.parametrize("decode_target", ["cpu", "hybrid"])
-def test_offload_moe_cache_rejects_demand_prefill_without_gpu_decode(decode_target):
-    # a demand-loaded chunk admits its experts into GPU decode's slot cache, which cpu and hybrid decode do not read
+def test_offload_moe_cache_rejects_demand_prefill_without_gpu_decode(monkeypatch, decode_target, switch):
+    # a demand-loaded chunk admits its experts into the slot cache, which cpu decode does not read, and whose new
+    # residents change what hybrid decode computes on the CPU: hybrid takes them only with FREETOKEN_HYBRID_PREFILL_DEMAND=1
     from freetoken.moe.offload_cache import OffloadMoeCache
 
-    with pytest.raises(ValueError, match="needs GPU decode"):
-        OffloadMoeCache(
+    monkeypatch.setattr("freetoken.moe.offload_cache.HYBRID_PREFILL_DEMAND", switch)
+
+    def build():
+        return OffloadMoeCache(
             num_layers=1,
             num_experts=4,
             cache_size=6,
@@ -461,6 +465,12 @@ def test_offload_moe_cache_rejects_demand_prefill_without_gpu_decode(decode_targ
             decode_target=decode_target,
             prefill_demand_tokens=64,
         )
+
+    if switch and decode_target == "hybrid":
+        assert build().loads_prefill_on_demand(64)
+        return
+    with pytest.raises(ValueError, match="needs GPU decode"):
+        build()
 
 
 def test_prefill_overlap_prefetch_invalidates_borrowed_unified_cache_slots():
