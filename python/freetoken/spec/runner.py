@@ -410,3 +410,14 @@ class SpecRunner:
 
     def release(self, req: Req) -> None:
         self.proposer.release(req)
+
+    @property
+    def keeps_full_hits(self) -> bool:
+        """Whether the proposer can hand over and take back its per-row state after a prompt (scheduler/full_hit.py)."""
+        return hasattr(self.proposer, "full_hit_rows")
+
+    def full_hit_rows(self, table_idx: int):
+        return self.proposer.full_hit_rows(table_idx)
+
+    def restore_full_hit_rows(self, table_idx: int, rows) -> None:
+        self.proposer.restore_full_hit_rows(table_idx, rows)

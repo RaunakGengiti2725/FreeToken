@@ -283,6 +283,13 @@ class MTPProposer(Proposer):
         self._prefill_state.clear()
         super().detach(keep_kv=keep_kv)
 
+    def full_hit_rows(self, row: int) -> tuple[torch.Tensor, ...]:
+        """Copies of the relay rows a prompt's draft pass left at table row ``row``: what the first proposal reads."""
+        return self.relay.hidden[row].clone(), self.relay.d1[row].clone(), self.relay.carry[row].clone()
+
+    def restore_full_hit_rows(self, row: int, rows: tuple[torch.Tensor, ...]) -> None:
+        self.relay.hidden[row], self.relay.d1[row], self.relay.carry[row] = rows
+
     def release(self, req: Req) -> None:
         self._prefill_state.pop(req.table_idx, None)
         if self.chain_graphs is not None:

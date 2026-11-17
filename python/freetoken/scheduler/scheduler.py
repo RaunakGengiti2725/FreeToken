@@ -27,6 +27,7 @@ from freetoken.message import (
     UserMsg,
 )
 from freetoken.utils import (
+    div_ceil,
     init_logger,
     load_eos_token_ids,
     load_generation_sampling,
@@ -40,7 +41,8 @@ from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .mm import cut_image_spans, plan_mm_batch
-from .prefill import ChunkedReq, PrefillManager
+from .full_hit import FullHitEntry, FullHitStore, first_token_key, tree_pages
+from .prefill import ChunkedReq, PrefillManager, _maybe_pinned
 from .reasoning import OPEN_TAIL, ReasoningTracker, ThinkTokens
 from .status import SchedulerStatusReporter
 from .table import TableManager
@@ -178,6 +180,14 @@ class Scheduler(SchedulerIOMixin):
         self._think_void: torch.Tensor | None = None
         # (table row, rows) of each request of the last decode batch and the device tensor built from them: steps over the same requests repeat it
         self._sent_rows: Tuple[List[Tuple[int, int]], torch.Tensor] | None = None
+        self.full_hits: FullHitStore | None = None
+        # stored at a prefill's drain, which must come before the next step of the request: the normal loop's order
+        normal_loop = ENV.DISABLE_OVERLAP_SCHEDULING or self.spec is not None
+        if ENV.FULL_HIT and self.cache_manager.is_hybrid and normal_loop and not config.model_config.model_is_mrope:
+            if self.spec is None or self.spec.keeps_full_hits:
+                self.full_hits = FullHitStore(self.cache_manager.linear_state_pool.free)
+                self.cache_manager.on_evict = self.full_hits.clear
+                self.engine.keep_prefill_logits = True
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -324,6 +334,8 @@ class Scheduler(SchedulerIOMixin):
             # indices, a mamba resize leaves stale GDN-snapshot slot ids, and a window-pool resize
             # (num_swa_pages) reallocates the SWA/window token pool, leaving stale slot ids in the
             # radix tree. Rebuild the prefix cache + reclaim the resized free-lists.
+            if getattr(self, "full_hits", None) is not None:
+                self.full_hits.clear()  # before the pool's slots are all reclaimed
             self.cache_manager.rebuild(self.engine.num_pages, self.engine.page_table)
             if num_pages is not None:
                 # token_pool is sized to the page table; only a KV-page resize reallocates it.
@@ -468,6 +480,9 @@ class Scheduler(SchedulerIOMixin):
         new_finished_reqs: Set[Req] = set()
         generated = None
         held: List[Callable[[], None]] = []
+        # (request, batch row, first token) of each prompt a full hit may be stored for, once the batch's page operations ran
+        keep: List[Tuple[Req, int, int]] = []
+        full_hit, prefill_logits = getattr(batch, "full_hit", None), getattr(output, "prefill_logits", None)
         # without a draft pass every page operation runs in its place
         hold = held.append if draft_prefill is not None else (lambda action: action())
         with self.cache_manager.lazy_free_region():
@@ -506,6 +521,11 @@ class Scheduler(SchedulerIOMixin):
                     if msg.finished or req.sampling_params.timings_per_token:
                         msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
                     finished = msg.finished
+                    if full_hit is not None and msg.next_tokens != [full_hit.first_token]:
+                        # its state, draft rows and tree path are those of the first send's token
+                        raise RuntimeError(f"a full hit sampled {msg.next_tokens}, not the stored first token {full_hit.first_token}")
+                    if batch.is_prefill and not finished and full_hit is None and prefill_logits is not None:
+                        keep.append((req, i, msg.next_tokens[0]))
 
                     # NOTE: overlap scheduling may make the request freed twice, skip second free
                     if finished and req not in self.finished_reqs:
@@ -531,6 +551,8 @@ class Scheduler(SchedulerIOMixin):
                     # the frees and inserts run even when the pass raises
                     for action in held:
                         action()
+            for req, row, token in keep:
+                self._keep_full_hit(req, prefill_logits[row : row + 1], token)
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
@@ -1184,6 +1206,12 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self, hold: Iterable[Req] = ()) -> ForwardInput | None:
         """``hold``: decoding requests this launch leaves out."""
+        if getattr(self, "full_hits", None) is not None and (hit := self._full_hit_batch()) is not None:
+            # nothing to compute: the sampling arguments and where the token goes, as _prepare_batch has them
+            hit.padded_reqs = hit.reqs
+            forward_input = ForwardInput(hit, self.engine.sampler.prepare(hit), None, _make_write_tuple(hit, self.device))
+            self._report_prompt_admissions(hit)
+            return forward_input
         # TODO: support other policies: e.g. DECODE first
         batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
@@ -1194,6 +1222,91 @@ class Scheduler(SchedulerIOMixin):
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    def _full_hit_batch(self) -> Batch | None:
+        """A prefill batch of the request at the head of the queue where it is a full hit (scheduler/full_hit.py): it
+        holds the tree's pages for its whole prompt, fresh state slots and a copy of the stored state to restore."""
+        store, pending_list = self.full_hits, self.prefill_manager.pending_list
+        if store is None or not len(store) or not pending_list or self.table_manager.available_size == 0:
+            return None
+        pending = pending_list[0]
+        if pending.chunked_req is not None or pending.mm_items or self.cache_manager.skips_prefix_cache(pending):
+            return None
+        entry = store.find(pending.input_ids, pending.sampling_params)
+        if entry is None:
+            return None
+        found = tree_pages(self.cache_manager, entry)
+        if not found:
+            if found is False:
+                store.drop(entry)
+            return None
+        handle, pages = found
+        cm, tm, pool = self.cache_manager, self.table_manager, self.cache_manager.linear_state_pool
+        n, page = pending.input_len, cm.page_size
+        reserve = (div_ceil(n + pending.output_len + self.prefill_manager.token_headroom, page) - div_ceil(n, page)) * page
+        if reserve > cm.available_size:
+            return None
+        cm.lock(handle)
+        if pool.num_free_slots < 3:
+            cm.ensure_mamba_slots(3)
+        # making room may have dropped the entry and given its slot back
+        if pool.num_free_slots < 3 or entry not in store.entries:
+            cm.unlock(handle)
+            return None
+        table_idx = tm.allocate()
+        tm.page_table[table_idx, :n].copy_(pages)
+        tm.token_pool[table_idx, :n].copy_(_maybe_pinned(pending.input_ids), non_blocking=True)
+        # cached_len n - 1 and device_len n, as a prefill of its last token has them until complete_one
+        req = Req(input_ids=pending.input_ids, table_idx=table_idx, cached_len=n - 1, output_len=pending.output_len,
+                  uid=pending.uid, sampling_params=pending.sampling_params, cache_handle=handle, prompt_len=n)
+        req.stats = pending.stats
+        req.stats.first_chunk_at = time.perf_counter()
+        req.stats.cache_n, req.stats.prompt_n = n, 0
+        req.linear_slot_idx = pool.alloc(1)[0]
+        req.mamba_ping_pong = tuple(pool.alloc(2))
+        req.mamba_restore_src = entry.state_slot
+        req.turn_anchor_len = pending.turn_anchor_len
+        pending_list.pop(0)
+        batch = Batch(reqs=[req], phase="prefill")
+        batch.full_hit = entry
+        batch.prompt_admissions = [(req.uid, n, n)]
+        batch.log_new_tokens, batch.log_cached_tokens = 0, n
+        return batch
+
+    def _forward_full_hit(self, forward_input: ForwardInput) -> ForwardOutput:
+        """The full hit's step: the stored draft rows back in place and its first token sampled from the stored logits
+        (_restore_linear_states has copied the stored GDN state into its live slot)."""
+        from freetoken.engine import ForwardOutput
+
+        batch, sample_args, _, output_mapping = forward_input
+        entry, (req,) = batch.full_hit, batch.reqs
+        if self.spec is not None:
+            self.spec.restore_full_hit_rows(req.table_idx, entry.draft_rows)
+        req.complete_one()
+        next_tokens_gpu = self.engine.sampler.sample(entry.logits, sample_args).to(torch.int32)
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        copy_done = torch.cuda.Event()
+        copy_done.record(self.engine.stream)
+        self.token_pool[output_mapping] = next_tokens_gpu
+        self.decode_manager.filter_reqs(batch.reqs)
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done)
+
+    def _keep_full_hit(self, req: Req, logits: torch.Tensor, token: int) -> None:
+        """Store what a prompt's final prefill left for an identical resend: on the engine stream, after the draft pass
+        and before the request's next step."""
+        store, cm = self.full_hits, self.cache_manager
+        pool = cm.linear_state_pool
+        key = first_token_key(req.sampling_params)
+        if key is None or req.mm_items or cm.skips_prefix_cache(req):
+            return
+        # an admission needs three slots: the store never takes the last of them
+        if pool.num_free_slots < 4:
+            return
+        rows = self.spec.full_hit_rows(req.table_idx) if self.spec is not None else None
+        slot = pool.alloc(1)[0]
+        pool.copy_from(req.linear_slot_idx, slot)
+        n = req.cached_len
+        store.add(FullHitEntry(req.input_ids[:n].clone(), cm.page_table[req.table_idx, :n].clone(), slot, logits, rows, token, key))
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.
@@ -1220,6 +1333,8 @@ class Scheduler(SchedulerIOMixin):
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
+        if getattr(batch, "full_hit", None) is not None:
+            return self._forward_full_hit(forward_input)
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
