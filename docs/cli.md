@@ -44,7 +44,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--port` | 1919 | Bind port |
 | `--api-key` | `$FREETOKEN_API_KEY`, else off | Require the key on every route except `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`; other requests get a 401 |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
-| `--preset` | — | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. `single-fast`: `single` with captured prefill forwards, whose replies can differ from `single`'s. `multi`: `single` for several requests at a time, 8 unless `--max-running-requests` names another number. See [Presets](#presets) |
+| `--preset` | — | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. `single-fast`: `single` with a captured prefill forward for continuations of up to 64 tokens, with `single`'s replies. `multi`: `single` for several requests at a time, 8 unless `--max-running-requests` names another number. See [Presets](#presets) |
 | `--calibrate-again` | off | With `--preset single-measured`: time on this start also when a choice is stored for this checkpoint, flags and machine: the candidates the stored calibration had no time for, or all of them once none is left. See [Presets](#presets) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
@@ -291,25 +291,24 @@ does not start is not chosen, the log names it, and the next start times the can
 candidate that fails on two starts in a row is left out from then on). The 10% margin, the token
 counts and the 1.1 are not tuned on measurements.
 
-`--preset single-fast` is `--preset single` with `--prefill-graph-tokens 448` and
-`--prefill-graph-chunks 1-64,128-384:64`: when a prompt continues a cached one by at most 448
-tokens (a resend, the next turn of a conversation), those tokens run as one or two captured
-forwards instead of an eager one, and the first token comes sooner.
+`--preset single-fast` is `--preset single` with `--prefill-graph-tokens 64` and
+`--prefill-graph-chunks 1-64`: when a prompt continues a cached one by at most 64 tokens (a resend,
+a short next turn), those tokens run as one captured forward instead of an eager one, and the first
+token comes sooner. A longer continuation runs eagerly, as under `single`.
 
-It is a preset of its own because it does not always give the text `single` gives. `single`
-runs a prefill chunk as one eager forward, as a server without the preset does. A captured forward
-computes what an eager forward of the same tokens computes, bit for bit, but `single-fast` cuts a
-chunk in other pieces: a multiple of 64 tokens, then the rest. A prompt computed in other pieces
-differs in the last bits of its numbers, and where two tokens are nearly tied the reply takes
-another one and goes on differently. Each reply is still the model's, computed from the full
-prompt; it is not the same reply. Compare or cache replies across the two presets only with that
-in mind.
+Its replies are the text `single` gives. A captured forward computes what an eager forward of the
+same tokens computes, bit for bit, and `single-fast` replays each chunk of up to 64 tokens whole,
+never cut into pieces. Earlier versions of the preset also captured multiples of 64 up to 448 tokens
+and cut a longer chunk into a multiple of 64 and the rest; a prompt computed in other pieces differs
+in the last bits of its numbers, and where two tokens are nearly tied the reply takes another one.
+That is gone: `--prefill-graph-tokens` and `--prefill-graph-chunks` typed on the command line still
+allow it, and then the replies can differ from `single`'s.
 
 The captures read the experts where they lie, so they need every expert on the GPU (resident, or
 an expert cache with a slot for each outside the prefill staging buffers), and speculative decoding,
 whose verify step they are captured beside. They take GPU memory, which the preset leaves free in
 addition to the prefill chunk: 2.25 GiB, from 2.1 GiB measured for 70 sizes of Qwen3.6-35B-A3B
-NVFP4 on an RTX 5090, and not measured elsewhere. Where the plan with that memory left free does not
+NVFP4 on an RTX 5090 (the preset now captures 64 of them), and not measured elsewhere. Where the plan with that memory left free does not
 keep every expert resident and the KV reserve, or speculative decoding is off, the server runs as
 `--preset single` and one log line says why. `--prefill-graph-tokens` or `--prefill-graph-chunks`
 on the command line are kept as typed; typed chunks get no memory left free for them.

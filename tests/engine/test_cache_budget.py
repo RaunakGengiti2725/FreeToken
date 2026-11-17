@@ -878,7 +878,7 @@ def test_auto_does_not_use_a_row_measured_with_other_settings(decode_rows, serve
 # the draft expert quant the preset fills in since: a row measured with the draft's bf16 experts is another setup
 _KEY_HEAD = "ckpt@bf41ffe2|cache=auto:0.95|cpu=0/4@e5b47b|spec=mtp:3|tp=1|req=1|dtype=bfloat16|embed_weights=host|kv_reserve_tokens=36864|moe_prefill_hit_d2d=True"
 _KEY_SINGLE = _KEY_HEAD + "|speculative_draft_quant=fp8"
-_KEY_SINGLE_FAST = _KEY_HEAD + "|prefill_graph_chunks=1-64,128-384:64|prefill_graph_tokens=448|speculative_draft_quant=fp8"
+_KEY_SINGLE_FAST = _KEY_HEAD + "|prefill_graph_chunks=1-64|prefill_graph_tokens=64|speculative_draft_quant=fp8"
 
 
 @pytest.mark.parametrize(
@@ -1167,11 +1167,11 @@ def test_preset_single_fast_serves_as_single_where_its_captures_do_not_fit(decod
         monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: free)
         flags = {"speculative_algorithm": "mtp", "speculative_num_steps": 3, "memory_ratio": 1.0, "preset_fields": ("moe_strategy", *captures), **flags}
         return _resolved(
-            decode_rows, preset="single-fast", max_seq_len_override=40960, prefill_graph_tokens=448, prefill_graph_chunks="1-64,128-384:64", **flags,
+            decode_rows, preset="single-fast", max_seq_len_override=40960, prefill_graph_tokens=64, prefill_graph_chunks="1-64", **flags,
         )
 
     def kept(config):
-        return (config.prefill_graph_tokens, config.prefill_graph_chunks) == (448, "1-64,128-384:64") and set(captures) <= set(config.preset_fields)
+        return (config.prefill_graph_tokens, config.prefill_graph_chunks) == (64, "1-64") and set(captures) <= set(config.preset_fields)
 
     def single(config):
         return (config.prefill_graph_tokens, config.prefill_graph_chunks) == (0, "") and not set(captures) & set(config.preset_fields)
@@ -1206,7 +1206,7 @@ def test_preset_single_fast_serves_as_single_where_its_captures_do_not_fit(decod
     assert single(planned(16 << 30)) and single(planned(1 << 40, staging=0))  # a small card; several pools or CPU experts
     # typed chunks are not the preset's to drop
     typed = planned(16 << 30, preset_fields=("moe_strategy", "prefill_graph_tokens"))
-    assert typed.prefill_graph_chunks == "1-64,128-384:64" and typed.prefill_graph_tokens == 448
+    assert typed.prefill_graph_chunks == "1-64" and typed.prefill_graph_tokens == 64
 
 
 def test_preset_serves_the_stores_draft_token_map_only_where_every_expert_is_resident(decode_rows, monkeypatch):

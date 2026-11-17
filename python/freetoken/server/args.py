@@ -141,9 +141,11 @@ _PRESETS: dict[str, dict] = {
 }
 # the same, and the strategy and the number of draft tokens are timed on the first start (moe/calibrate.py)
 _PRESETS["single-measured"] = dict(_PRESETS["single"])
-# 'single' and the captured prefill forwards, which cut a chunk in other pieces than the eager forward: other text.
-# The engine drops them where not every expert is resident (engine._drop_preset_captures).
-_PRESETS["single-fast"] = {**_PRESETS["single"], "prefill_graph_tokens": 448, "prefill_graph_chunks": "1-64,128-384:64"}
+# 'single' and a captured prefill forward for every chunk of 1 to 64 tokens. Each such chunk is replayed whole, never cut,
+# and a capture computes what the eager forward of the same tokens computes, bit for bit: the text is 'single''s. Longer
+# chunks run eagerly, as under 'single'. The engine drops the captures where not every expert is resident
+# (engine._drop_preset_captures).
+_PRESETS["single-fast"] = {**_PRESETS["single"], "prefill_graph_tokens": 64, "prefill_graph_chunks": "1-64"}
 # 'single' for several requests at a time: 8 unless the command line names another number. The KV reserve and the decode
 # batch sizes captured as graphs follow that number (_apply_preset).
 _PRESETS["multi"] = {**_PRESETS["single"], "max_running_req": 8, "cuda_graph_bs": None}
@@ -1228,10 +1230,10 @@ def parse_args(
             "the static choice against 3 drafts without the map (every expert resident) or against offload, hybrid and hybrid without drafts (one server start each, as many as fit in 300 s), "
             "keeps the choice next to the `ft bench decode` rows and logs how long that took; later starts read the "
             "choice, and --calibrate-again times again. "
-            "'single-fast' is 'single' with --prefill-graph-tokens 448 --prefill-graph-chunks 1-64,128-384:64: a prompt "
-            "that continues a cached one by up to 448 tokens starts sooner. Its replies are not always the text 'single' "
-            "gives: such a chunk is computed in one or two captured pieces instead of one forward, which changes the last "
-            "bits of the numbers and, where two tokens are nearly tied, the token. It needs every expert on the GPU and "
+            "'single-fast' is 'single' with --prefill-graph-tokens 64 --prefill-graph-chunks 1-64: a prompt "
+            "that continues a cached one by up to 64 tokens starts sooner, as one captured forward of those tokens, which "
+            "computes what the eager forward computes, so its replies are the text 'single' gives; longer continuations "
+            "run eagerly, as under 'single'. It needs every expert on the GPU and "
             "leaves 2.25 GiB free for the captures; where that does not fit it serves as 'single' and the log says so. "
             "'multi' is 'single' for several requests at a time: --max-running-requests 8 (a typed number is kept, e.g. "
             f"16), a --kv-reserve-tokens of a {PRESET_PROMPT_TOKENS}-token prompt and as long an answer for each of them, and "

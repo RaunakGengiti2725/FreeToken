@@ -248,7 +248,8 @@ def _drop_preset_fields(config, *names: str) -> None:
 
 
 # --preset single-fast: its prefill graphs took 2.1 GiB on the one checkpoint and card they were measured on (70 sizes,
-# Qwen3.6-35B-A3B NVFP4, RTX 5090); the margin on top is unmeasured
+# Qwen3.6-35B-A3B NVFP4, RTX 5090); the preset now captures the 64 sizes 1 to 64, which is kept under the same bound;
+# the margin on top is unmeasured
 PRESET_CAPTURE_BYTES = 2304 << 20
 
 

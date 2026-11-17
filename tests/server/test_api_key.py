@@ -154,7 +154,7 @@ def test_preset_single_fast_is_single_and_the_captured_prefill_forwards():
     single, fast = _parse("--preset", "single"), _parse("--preset", "single-fast")
     differ = {f.name for f in dataclasses.fields(single) if getattr(single, f.name) != getattr(fast, f.name)}
     assert differ == {"preset", "preset_fields", "prefill_graph_tokens", "prefill_graph_chunks"}
-    assert (fast.prefill_graph_tokens, fast.prefill_graph_chunks) == (448, "1-64,128-384:64")
+    assert (fast.prefill_graph_tokens, fast.prefill_graph_chunks) == (64, "1-64")
     assert fast.preset_fields == (*single.preset_fields, "prefill_graph_tokens", "prefill_graph_chunks")
     # typed chunks are the user's: the engine leaves no memory free for those, and never drops them
     typed = _parse("--preset", "single-fast", "--prefill-graph-chunks", "1-64")
