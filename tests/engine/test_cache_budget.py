@@ -872,9 +872,11 @@ def test_auto_does_not_use_a_row_measured_with_other_settings(decode_rows, serve
     assert differs in decode_rows.dp.key_diff(key, config.moe_decode_key)
 
 
-# the keys these command lines got before the preset set a prefill demand length (7cad44b), with the stand-ins below
-_KEY_SINGLE = "ckpt@bf41ffe2|cache=auto:0.95|cpu=0/4@e5b47b|spec=mtp:3|tp=1|req=1|dtype=bfloat16|embed_weights=host|kv_reserve_tokens=36864|moe_prefill_hit_d2d=True"
-_KEY_SINGLE_FAST = _KEY_SINGLE + "|prefill_graph_chunks=1-64,128-384:64|prefill_graph_tokens=448"
+# the keys these command lines got before the preset set a prefill demand length (7cad44b), with the stand-ins below, and
+# the draft expert quant the preset fills in since: a row measured with the draft's bf16 experts is another setup
+_KEY_HEAD = "ckpt@bf41ffe2|cache=auto:0.95|cpu=0/4@e5b47b|spec=mtp:3|tp=1|req=1|dtype=bfloat16|embed_weights=host|kv_reserve_tokens=36864|moe_prefill_hit_d2d=True"
+_KEY_SINGLE = _KEY_HEAD + "|speculative_draft_quant=fp8"
+_KEY_SINGLE_FAST = _KEY_HEAD + "|prefill_graph_chunks=1-64,128-384:64|prefill_graph_tokens=448|speculative_draft_quant=fp8"
 
 
 @pytest.mark.parametrize(
@@ -1018,11 +1020,16 @@ def test_explicit_strategy_never_reads_the_decode_profile(decode_rows, monkeypat
         assert config.moe_strategy == asked and config.moe_decode_key is None  # nor is the key made for it
 
 
-def test_preset_speculative_decoding_is_dropped_where_an_explicit_start_is_refused(decode_rows, monkeypatch):
+@pytest.mark.parametrize("draft_quant", [False, True])  # the fields of --preset single, with and without its draft quant
+def test_preset_speculative_decoding_is_dropped_where_an_explicit_start_is_refused(decode_rows, monkeypatch, draft_quant):
     def resolved(preset: bool, model_path=str(decode_rows.model)):
         fields = ("speculative_algorithm", "speculative_num_steps") if preset else ()
+        quant = {}
+        if preset and draft_quant:
+            fields, quant = (*fields, "speculative_draft_quant"), {"speculative_draft_quant": "fp8"}
         config = _offload_engine_config(
             model_path=model_path, speculative_algorithm="mtp", speculative_num_steps=3, preset="single" if preset else None, preset_fields=fields,
+            **quant,
         )
         # a checkpoint of a family that registers no MTP draft
         object.__setattr__(config, "hf_config", SimpleNamespace(architectures=["FakeForCausalLM"]))
@@ -1034,12 +1041,63 @@ def test_preset_speculative_decoding_is_dropped_where_an_explicit_start_is_refus
         resolved(preset=False)
     config = resolved(preset=True)
     assert (config.speculative_algorithm, config.speculative_num_steps, config.preset_fields) == (None, 0, ())
-    assert "|spec=off|" in config.moe_decode_key
+    assert config.speculative_draft_quant == "none"
+    assert "|spec=off|" in config.moe_decode_key and "speculative_draft_quant" not in config.moe_decode_key
     # where the checks pass it stays, and a checkpoint that is not on disk cannot be checked
     monkeypatch.setattr(decode_rows.engine, "_adjust_spec_config", lambda config, override, windowed_kv: None)
     config = resolved(preset=True)
     assert config.speculative_algorithm == "mtp" and "speculative_algorithm" in config.preset_fields
-    assert resolved(preset=True, model_path=str(decode_rows.tmp / "not-downloaded")).speculative_algorithm is None
+    gone = resolved(preset=True, model_path=str(decode_rows.tmp / "not-downloaded"))
+    assert (gone.speculative_algorithm, gone.speculative_draft_quant) == (None, "none")
+
+
+def test_preset_draft_quant_is_fp8_with_every_expert_resident_and_nvfp4_on_an_expert_cache(decode_rows, monkeypatch):
+    engine = decode_rows.engine
+    refused = set()  # the draft quants the stand-in for the drafts' checks refuses
+
+    def check(config, override, windowed_kv):
+        if config.speculative_draft_quant in refused:
+            raise ValueError(f"the draft's experts are already {config.speculative_draft_quant}")
+
+    monkeypatch.setattr(engine, "_adjust_spec_config", check)
+    fitting = []
+    monkeypatch.setattr(engine, "_preset_takes_fused", lambda config: bool(fitting))
+    preset = ("speculative_algorithm", "speculative_num_steps", "speculative_draft_quant", "moe_strategy")
+
+    def resolved(fields=preset, quant="fp8", fits=False, **flags):
+        flags = {"speculative_algorithm": "mtp", "speculative_num_steps": 3, **flags}
+        fitting[:] = [True] if fits else []
+        config = _offload_engine_config(
+            model_path=str(decode_rows.model), preset="single", preset_fields=fields, speculative_draft_quant=quant, **flags,
+        )
+        engine._adjust_config(config)
+        return config
+
+    assert (resolved(fits=True).moe_strategy, resolved(fits=True).speculative_draft_quant) == ("fused", "fp8")
+    config = resolved()
+    assert (config.moe_strategy, config.speculative_draft_quant) == ("offload", "nvfp4")
+    assert "speculative_draft_quant=nvfp4" in config.moe_decode_key
+    assert resolved(moe_strategy="fused").speculative_draft_quant == "fp8"
+    assert resolved(moe_strategy="hybrid").speculative_draft_quant == "nvfp4"
+    # `ft bench decode`'s servers type the strategy: their rows are filed under the key the preset's auto looks up
+    _file_row(decode_rows, _HYBRID_FASTER, asked="hybrid", preset="single", preset_fields=preset, speculative_algorithm="mtp",
+              speculative_num_steps=3, speculative_draft_quant="fp8")
+    assert resolved().moe_strategy == "hybrid"
+    # a quant the command line typed, "none" included, is served as typed
+    no_quant = tuple(n for n in preset if n != "speculative_draft_quant")
+    assert resolved(fields=no_quant, quant="nvfp4", fits=True).speculative_draft_quant == "nvfp4"
+    assert resolved(fields=no_quant, quant="none").speculative_draft_quant == "none"
+    # a draft that refuses the quant keeps its drafts, with its experts as stored
+    refused.add("fp8")
+    config = resolved(fits=True)
+    assert (config.speculative_algorithm, config.speculative_draft_quant) == ("mtp", "none")
+    assert "speculative_draft_quant" not in config.preset_fields
+    refused.clear()
+    # no speculative decoding: the preset's quant goes with it, where a typed one is refused
+    config = resolved(speculative_algorithm=None, speculative_num_steps=0)
+    assert config.speculative_draft_quant == "none" and "speculative_draft_quant" not in config.preset_fields
+    with pytest.raises(ValueError, match="needs --speculative-algorithm mtp"):
+        resolved(fields=no_quant, speculative_algorithm=None, speculative_num_steps=0)
 
 
 def test_preset_serves_every_expert_resident_where_the_checkpoint_fits_and_the_strategy_was_left_alone(decode_rows, monkeypatch):

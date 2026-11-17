@@ -453,6 +453,45 @@ def _settle_preset_map_drafts(config, override, windowed_kv: bool) -> None:
         logger.info_rank0(f"MoE decode setup: {config.moe_decode_key}")
 
 
+def _drop_preset_draft_quant(config, override) -> None:
+    if "speculative_draft_quant" in getattr(config, "preset_fields", ()):
+        override("speculative_draft_quant", EngineConfig.speculative_draft_quant)
+        _drop_preset_fields(config, "speculative_draft_quant")
+
+
+def _adjust_spec_with_preset_draft_quant(config, override, windowed_kv: bool, adjust_spec) -> None:
+    """``adjust_spec``, where a draft expert quant the preset filled in is dropped first if the drafts' checks refuse
+    it: the drafts are then served with their experts as the checkpoint stores them, and one log line says why."""
+    if "speculative_draft_quant" in getattr(config, "preset_fields", ()):
+        try:
+            _adjust_spec_config(config, override, windowed_kv)
+        except (ValueError, KeyError, OSError) as exc:
+            _drop_preset_draft_quant(config, override)
+            adjust_spec(config, override, windowed_kv)
+            if config.speculative_algorithm is not None:
+                logger.info_rank0(f"--preset {config.preset}: the draft's experts stay as the checkpoint stores them ({exc})")
+            return
+    adjust_spec(config, override, windowed_kv)
+
+
+def _settle_preset_draft_quant(config, override, resident: bool, log: bool = True) -> None:
+    """--preset single's draft expert quant once it is known whether every expert is resident: fp8 there, where the
+    draft's experts take no expert cache slots; nvfp4 on an expert cache, where the bytes they free are slots. The
+    decode-profile key follows it. A quant from the command line, or none left by the drafts' checks, is kept."""
+    if "speculative_draft_quant" not in getattr(config, "preset_fields", ()) or config.speculative_algorithm is None:
+        return
+    quant = "fp8" if resident else "nvfp4"
+    if config.speculative_draft_quant != quant:
+        override("speculative_draft_quant", quant)
+        if getattr(config, "moe_decode_key", None) is not None:
+            override("moe_decode_key", _decode_decision_key(config))
+            logger.info_rank0(f"MoE decode setup: {config.moe_decode_key}")
+    if not log:
+        return
+    where = "every expert is resident" if resident else "the experts are served from an expert cache"
+    logger.info_rank0(f"--preset {config.preset}: --speculative-draft-quant {quant}, as {where}")
+
+
 def _adjust_preset_spec_config(config, override, windowed_kv: bool) -> None:
     """Speculative decoding a preset turned on: kept where an explicit start's checks pass and the draft's source is
     on disk to be checked, dropped with one log line elsewhere."""
@@ -471,6 +510,7 @@ def _adjust_preset_spec_config(config, override, windowed_kv: bool) -> None:
         override("speculative_num_steps", 0)
     override("spec_slot_states", ())
     _drop_preset_fields(config, "speculative_algorithm", "speculative_num_steps")
+    _drop_preset_draft_quant(config, override)
 
 
 def _validate_kv_format(config, model_config) -> None:
@@ -1195,9 +1235,9 @@ class Engine:
         slots, what = counted
         before = self._sync_get_memory()[0]
         self.spec = None
-        for name in ("speculative_algorithm", "speculative_num_steps", "spec_slot_states"):
+        for name in ("speculative_algorithm", "speculative_num_steps", "spec_slot_states", "speculative_draft_quant"):
             object.__setattr__(config, name, getattr(EngineConfig, name))
-        _drop_preset_fields(config, "speculative_algorithm", "speculative_num_steps")
+        _drop_preset_fields(config, "speculative_algorithm", "speculative_num_steps", "speculative_draft_quant")
         gc.collect()
         torch.cuda.empty_cache()
         # the draft's weights were counted with the target's: what the driver got back is free for the caches again
@@ -3140,7 +3180,9 @@ def _adjust_config(config: EngineConfig):
     _validate_attention_backend_choice(config, override, required_attn_types)
     if getattr(config, "speculative_algorithm", None) is not None:
         adjust_spec = _adjust_preset_spec_config if "speculative_algorithm" in preset_fields else _adjust_spec_config
-        adjust_spec(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
+        _adjust_spec_with_preset_draft_quant(config, override, is_dsv4 or is_dsv41 or has_swa_attention, adjust_spec)
+    elif "speculative_draft_quant" in preset_fields:
+        _drop_preset_draft_quant(config, override)
     elif getattr(config, "speculative_draft_quant", "none") != "none":
         raise ValueError("--speculative-draft-quant needs --speculative-algorithm mtp")
     if _preset_capture_bytes(config) and getattr(config, "speculative_algorithm", None) is None:
@@ -3177,6 +3219,9 @@ def _adjust_config(config: EngineConfig):
             "and let every layer decode on the GPU offload path instead."
         )
 
+    if is_moe:
+        # auto settles on fused below, or on an expert cache under the key made here, which `ft bench decode`'s servers share
+        _settle_preset_draft_quant(config, override, resident=config.moe_strategy == "fused", log=config.moe_strategy != "auto")
     bench_server = config.moe_strategy in ("offload", "hybrid") and os.getenv("FREETOKEN_BENCH_DECODE_KEY") == "1"
     if is_moe and (config.moe_strategy == "auto" or bench_server) and isinstance(config, EngineConfig):
         # the key auto looks its decode row up under; `ft bench decode` asks its offload and hybrid servers for the same key
@@ -3221,6 +3266,7 @@ def _adjust_config(config: EngineConfig):
         if default_backend == "offload" and _preset_takes_fused(config):
             # the one case where it is known that the experts fit: no slot cache, and a prefill reads them in place
             default_backend = "fused"
+            _settle_preset_draft_quant(config, override, resident=True, log=False)  # before the map drafts remake the key
             _settle_preset_map_drafts(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
         if default_backend == "offload" and getattr(config, "moe_decode_key", None) is not None:
             # hybrid only on a decode row measured for this setup, on this machine and release; offload without one
@@ -3228,6 +3274,7 @@ def _adjust_config(config: EngineConfig):
             override("moe_decode_row", row)
         override("moe_strategy", default_backend)
         logger.info_rank0(f"Auto-selected MoE strategy: {config.moe_strategy}")
+        _settle_preset_draft_quant(config, override, resident=default_backend == "fused")
 
         if (
             is_offload_moe_strategy(config.moe_strategy)

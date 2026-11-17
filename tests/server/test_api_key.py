@@ -101,7 +101,8 @@ def test_key_stays_out_of_the_logged_config(monkeypatch):
 
 _PRESET_SINGLE = {
     "max_running_req": 1, "embed_weights": "host", "memory_ratio": 0.95, "moe_prefill_hit_d2d": True,
-    "moe_prefill_demand_tokens": 512, "speculative_algorithm": "mtp", "speculative_num_steps": 3, "kv_reserve_tokens": 32768 + 4096,
+    "moe_prefill_demand_tokens": 512, "speculative_algorithm": "mtp", "speculative_num_steps": 3, "speculative_draft_quant": "fp8",
+    "kv_reserve_tokens": 32768 + 4096,
 }
 
 
@@ -132,6 +133,7 @@ def test_preset_single_changes_its_fields_and_nothing_without_the_flag():
         (("--speculative-algorithm", "OFF"), "speculative_algorithm", None),
         (("--speculative-algorithm", "dflash"), "speculative_algorithm", "dflash"),
         (("--speculative-num-steps", "5"), "speculative_num_steps", 5),
+        (("--speculative-draft-quant", "none"), "speculative_draft_quant", "none"),
         (("--kv-reserve-tokens", "8192"), "kv_reserve_tokens", 8192),
         (("--moe-strategy", "offload"), "moe_strategy", "offload"),
         (("--moe-strategy", "auto"), "moe_strategy", "auto"),  # typed: the engine's auto, which never takes fused for the preset

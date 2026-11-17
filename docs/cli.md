@@ -169,6 +169,15 @@ decode cells of Qwen3.6-35B-A3B NVFP4 on RTX 5090s, the preset with 3 drafts aga
 flags: slower at 512 and 701 of 10240 slots, faster at 2048 and 2991. Nothing was measured between
 6.8% and 20%.
 
+With its drafts on, the preset quantizes the draft's bf16 routed experts at load
+(`--speculative-draft-quant`): `fp8` where every expert is resident (`fused`), `nvfp4` where the
+experts are served from an expert cache, whose slots get the bytes that frees. The target still
+verifies every draft, so the output distribution is the same; only the acceptance rate can change.
+A draft whose experts the checkpoint already quantizes, or any other draft that refuses the flag, is
+served as stored, with one log line. A typed `--speculative-draft-quant`, `none` included, is kept.
+`ft bench decode` rows filed for the preset before it set the draft quant are another setup and are
+not read.
+
 Where every expert fits on the GPU the preset stops streaming them, in one of two ways, and the
 plan line says which. Both give the same output as the expert cache does.
 

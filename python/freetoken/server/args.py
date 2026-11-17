@@ -119,8 +119,7 @@ class ServerArgs(SchedulerConfig):
 # unmeasured: the prompt a preset's KV reserve allows for on top of the default max output tokens
 PRESET_PROMPT_TOKENS = 4096
 
-# --preset: what each one sets where the command line says nothing. A draft expert quant belongs in "single" once
-# ft serve has a flag for it.
+# --preset: what each one sets where the command line says nothing.
 _PRESETS: dict[str, dict] = {
     "single": {
         "max_running_req": 1,
@@ -132,6 +131,8 @@ _PRESETS: dict[str, dict] = {
         "moe_prefill_demand_tokens": 512,
         "speculative_algorithm": "mtp",
         "speculative_num_steps": 3,
+        # nvfp4 where the experts are served from an expert cache (engine._settle_preset_draft_quant)
+        "speculative_draft_quant": "fp8",
         "kv_reserve_tokens": None,  # the default max output tokens + PRESET_PROMPT_TOKENS (_apply_preset)
         # as the default: listed so that the engine can tell a strategy the command line left alone, which it serves
         # 'fused' where every expert fits (engine._preset_takes_fused)
@@ -1186,7 +1187,8 @@ def parse_args(
             "checkpoint has the MTP layers and an offload expert cache holds a fifth of the experts or more, and a --kv-reserve-tokens that holds the default max output tokens and "
             f"a {PRESET_PROMPT_TOKENS}-token prompt where the expert cache's minimum still fits. Where every expert fits "
             "on the GPU it serves them resident (--moe-strategy fused), or from an expert cache with a slot for each, so "
-            "that a prefill streams nothing; a typed --moe-strategy is kept. Resident, it drafts 5 tokens with the draft "
+            "that a prefill streams nothing; a typed --moe-strategy is kept. The draft's bf16 routed experts are quantized at load "
+            "(--speculative-draft-quant): fp8 with every expert resident, nvfp4 on an expert cache. Resident, it drafts 5 tokens with the draft "
             "token map scripts/make_token_map.py --store or --install put in the store for the checkpoint, if there is one. "
             "The log says what it set. "
             "'single-measured' is 'single', but times the map instead of serving it: on its first start for a checkpoint, flags and machine it also times "
