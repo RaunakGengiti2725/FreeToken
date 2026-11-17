@@ -97,17 +97,36 @@ _DROPPED = ("--model-path", "--model", "--host", "--port", "--api-key", "--moe-s
 
 
 def token_map_path(model_path: str) -> str:
-    """Where the calibration looks for a draft token map of this checkpoint: in the directory of the decode profile,
-    under the checkpoint's fingerprint. Not in the checkpoint's folder, where a .bin file would change that fingerprint."""
+    """Where a draft token map of this checkpoint is written to the store (find_token_map reads it): in the directory of
+    the decode profile, under the checkpoint's fingerprint. Not in the checkpoint's folder, where a .bin file would
+    change that fingerprint."""
     store = os.path.dirname(decode_profile._path(None, None))
     return os.path.join(store, "token_maps", decode_profile.model_fingerprint(model_path) + ".bin")
 
 
+def find_token_map(model_path: str) -> str:
+    """The store's draft token map for this checkpoint: the file under its fingerprint (token_map_path), else one under
+    another fingerprint with the same hash. The name part is the checkpoint's folder name, which differs between a copy
+    of the checkpoint and the Hugging Face snapshot of it (a commit hash); the hash is of its weight files and config.
+    Where neither exists, token_map_path."""
+    exact = token_map_path(model_path)
+    if os.path.isfile(exact):
+        return exact
+    folder, name = os.path.split(exact)
+    tail = "@" + name.rsplit("@", 1)[-1]
+    try:
+        same = sorted(n for n in os.listdir(folder) if n.endswith(tail) and n != name)
+    except OSError:
+        return exact
+    # the log lines of its readers name the file they found
+    return os.path.join(folder, same[0]) if same else exact
+
+
 def store_token_map(model_path: str) -> tuple[str, str | None, str | None]:
     """(path, sha256 of the file, sha256 its manifest <path>.json records) of the store's draft token map for this
-    checkpoint; both sha256 are None where the map or its manifest cannot be read. --preset single serves the map
-    where the two are equal, as this calibration times it."""
-    path = token_map_path(model_path)
+    checkpoint (find_token_map); both sha256 are None where the map or its manifest cannot be read. --preset single
+    serves the map where the two are equal, as this calibration times it."""
+    path = find_token_map(model_path)
     try:
         with open(path, "rb") as f:
             sha = hashlib.sha256(f.read()).hexdigest()

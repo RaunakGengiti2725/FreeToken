@@ -1788,6 +1788,34 @@ def test_token_map_builder_refuses_benchmark_text_and_records_what_it_counted(tm
         with pytest.raises(SystemExit):
             tool.main([str(model), "--install", str(built)])
         assert calibrate.stored_token_map(args) == (stored, sha)
+    # nor is a map of another tokenizer: a vocabulary its manifest records that is not the checkpoint's, or an id past it
+    for ids, fields in ((np.arange(5), {"vocab": 65}), (np.array([0, 1, 64]), {}), (np.array([0, -1]), {})):
+        built.write_bytes(ids.astype("<i4").tobytes())
+        Path(str(built) + ".json").write_text(json.dumps({"map_sha256": hashlib.sha256(built.read_bytes()).hexdigest(), **fields}))
+        with pytest.raises(SystemExit):
+            tool.main([str(model), "--install", str(built)])
+        assert calibrate.stored_token_map(args) == (stored, sha)
+    built.write_bytes(np.arange(64, dtype="<i4").tobytes())
+    Path(str(built) + ".json").write_text(json.dumps({"map_sha256": hashlib.sha256(built.read_bytes()).hexdigest(), "vocab": 64}))
+    assert tool.main([str(model), "--install", str(built)]) == 0
+    # the store is read under the checkpoint's hash too: a Hugging Face snapshot folder of the same files finds the map
+    # installed from a copy with another folder name, and a checkpoint with other files does not
+    def checkpoint(path, size=100):
+        path.mkdir(parents=True)
+        (path / "config.json").write_text('{"model_type": "fake"}')
+        (path / "model-00001.safetensors").write_bytes(b"x" * size)
+        return SimpleNamespace(speculative_token_map=None, model_path=str(path))
+
+    named, snapshot = checkpoint(tmp_path / "Qwen3.6-NVFP4"), checkpoint(tmp_path / "hub" / "snapshots" / "0123abcd")
+    other = checkpoint(tmp_path / "hub" / "snapshots" / "4567ef01", size=101)
+    assert tool.main([named.model_path, "--install", str(built)]) == 0
+    installed = calibrate.token_map_path(named.model_path)
+    assert calibrate.token_map_path(snapshot.model_path) != installed and calibrate.find_token_map(snapshot.model_path) == installed
+    assert calibrate.stored_token_map(snapshot) == (installed, hashlib.sha256(built.read_bytes()).hexdigest())
+    assert calibrate.stored_token_map(other) is None and calibrate.find_token_map(other.model_path) == calibrate.token_map_path(other.model_path)
+    # a map under the snapshot's own name comes first
+    assert tool.main([snapshot.model_path, "--install", str(built)]) == 0
+    assert calibrate.find_token_map(snapshot.model_path) == calibrate.token_map_path(snapshot.model_path)
 
 
 def test_a_request_and_a_server_end_at_their_deadline_whatever_the_server_does():

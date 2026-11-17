@@ -219,8 +219,12 @@ A draft token map is one more candidate where the calibration's store holds one 
 `python scripts/make_token_map.py MODEL --store ...` writes the map there under the checkpoint's
 fingerprint with its manifest; a file whose manifest is missing or names another sha256 is not timed.
 `python scripts/make_token_map.py MODEL --install MAP` copies a map built before and its `MAP.json`
-there, if the sha256 the manifest records (as `map_sha256` or `sha256`) is the file's, and prints
-where it went.
+there, if the sha256 the manifest records (as `map_sha256` or `sha256`) is the file's and the map
+fits MODEL's tokenizer (the vocabulary size the manifest records, where it records one, and every id
+below it), and prints where it went. The fingerprint is the checkpoint's folder name and a hash of
+its weight files and `config.json`; where no map is stored under the full fingerprint, one stored
+under the same hash is read, so the Hugging Face snapshot folder of a checkpoint finds a map
+installed from a copy of it with another folder name.
 A `--speculative-token-map` on the command line is not a candidate: every server then has that map.
 No map is shipped: one has to be built for the checkpoint, from text that no benchmark uses.
 
