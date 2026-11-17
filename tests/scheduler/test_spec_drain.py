@@ -496,6 +496,11 @@ def test_an_identical_resend_takes_the_first_sends_state_logits_and_pages_with_n
     assert resend(5, prompt, SamplingParams(temperature=0.7, max_tokens=8, ignore_eos=True)) is None
     assert [p.uid for p in pm.pending_list] == [3, 4, 5] and len(store) == 1
     pm.pending_list.clear()
+    # an answer that fits the pool beside the prompt's evictable pages but not once they are locked: no hit, nothing held
+    avail = cm.available_size
+    assert resend(7, prompt, SamplingParams(max_tokens=avail - PROMPT + 1 - K, ignore_eos=True)) is None
+    assert cm.available_size == avail and len(store) == 1 and [p.uid for p in pm.pending_list] == [7]
+    pm.pending_list.clear()
 
     batch = resend(6, prompt, greedy)
     assert batch is not None and batch.full_hit is entry and not pm.pending_list
@@ -518,9 +523,19 @@ def test_an_identical_resend_takes_the_first_sends_state_logits_and_pages_with_n
     assert [(m.uid, m.next_tokens, m.finished) for m in sent] == [(6, [31], False)]
     assert len(store) == 1, "a full hit stores nothing again"
 
-    # the resend finishes; then an eviction drops the entry and gives its state slot back
+    # the resend finishes; a third send that ends on its first token still hits, and its timings count nothing computed
     with cm.lazy_free_region():
         stub._finish_drained(req)
+    batch = resend(8, prompt, SamplingParams(max_tokens=1, ignore_eos=True, timings_per_token=True))
+    assert batch is not None
+    stub._restore_linear_states(batch)
+    output = stub._forward_full_hit((batch, None, None, (torch.tensor([batch.reqs[0].table_idx]), torch.tensor([PROMPT]))))
+    sent.clear()
+    Scheduler._process_last_data(stub, (SimpleNamespace(batch=batch), output))
+    (msg,) = sent
+    assert (msg.next_tokens, msg.finished, msg.finish_reason) == ([31], True, "length")
+    assert (msg.timings["cache_n"], msg.timings["prompt_n"]) == (PROMPT, 0) and batch.reqs[0].table_idx == -1
+    # then an eviction drops the entry and gives its state slot back
     free_slots = pool.num_free_slots
     cm.flush()
     assert len(store) == 0 and pool.num_free_slots > free_slots

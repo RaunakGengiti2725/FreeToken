@@ -1249,8 +1249,8 @@ class Scheduler(SchedulerIOMixin):
         cm.lock(handle)
         if pool.num_free_slots < 3:
             cm.ensure_mamba_slots(3)
-        # making room may have dropped the entry and given its slot back
-        if pool.num_free_slots < 3 or entry not in store.entries:
+        # the lock took the prompt's pages out of the evictable ones, and making room may have dropped the entry
+        if reserve > cm.available_size or pool.num_free_slots < 3 or entry not in store.entries:
             cm.unlock(handle)
             return None
         table_idx = tm.allocate()
