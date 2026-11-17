@@ -45,6 +45,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--api-key` | `$FREETOKEN_API_KEY`, else off | Require the key on every route except `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`; other requests get a 401 |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
 | `--preset` | — | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. `single-fast`: `single` with captured prefill forwards, whose replies can differ from `single`'s. See [Presets](#presets) |
+| `--calibrate-again` | off | With `--preset single-measured`: time on this start also when a choice is stored for this checkpoint, flags and machine: the candidates the stored calibration had no time for, or all of them once none is left. See [Presets](#presets) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
@@ -114,7 +115,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does, [performa
 | `--speculative-algorithm`, `--spec-algo` | off | Draft method; `off` keeps it off under a [preset](#presets). `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF or GGUF checkpoints, and Qwen3.8-Flash-Next HF or GGUF; Gemma-4 (dense, E2B / E4B and MoE) keeps no draft in the target file and drafts from an `mtp-*.gguf` assistant sidecar (architecture `gemma4-assistant`) given with `--speculative-draft-model-path` / `--spec-draft-model`. `dflash` drafts a block of tokens per step with a DFlash 2 draft checkpoint over the target's layer outputs, for the Qwen3.5 / Qwen3.6 / Qwen3.8 family and Qwen3.8-Flash-Next: `incoai/Qwen3.8-27B-DFlash2` for Qwen3.8-27B, `incoai/Qwen3.6-35B-A3B-DFlash2` for Qwen3.6-35B-A3B, `incoai/Qwen3.8-Flash-Next-DFlash2` for Qwen3.8-Flash-Next |
 | `--speculative-num-steps`, `--spec-num-steps` | the method's default (3 for `mtp`, the draft's `block_size` - 1 for `dflash`) | Draft tokens per decode step, 1 to 8 for `mtp`; 1 to the draft's `block_size` - 1 for `dflash` |
 | `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from. A Qwen3.8-Flash-Next target also takes a Strata MTP pack (a GGUF that keeps the checkpoint's `mtp.*` tensors under their HF names), and a Qwen3.8-Flash-Next GGUF target needs one; a Qwen3.5 / Qwen3.6 GGUF target drafts from its own `nextn` MTP block (the block llama.cpp keeps after the last decoder layer), or from an `mtp-*.gguf` sidecar of the same model (unsloth's `MTP/` releases) given here; for `mtp`, a separate checkpoint folder is an HF-target option, read with the target's quantization config, and a GGUF target refuses a folder draft. `dflash` requires it: the DFlash 2 draft checkpoint (bf16 safetensors with its `config.json`), whose `target_layer_ids`, `num_target_layers`, hidden size and vocabulary must match the target |
-| `--speculative-token-map`, `--spec-token-map` | off | `mtp` only. A file of distinct little-endian int32 token ids (`python scripts/make_token_map.py MODEL` writes one): the draft computes its logits over those LM head rows alone, from a copy made at startup whose size is logged. That VRAM comes out of the expert cache when `--moe-cache-auto` sizes it (the default for hybrid and offload without a cache size), and out of the KV cache otherwise. The target still verifies over the whole vocabulary, so the output distribution does not depend on the file, only the acceptance rate does. A tied or block-FP8 LM head is refused |
+| `--speculative-token-map`, `--spec-token-map` | off | `mtp` only. A file of distinct little-endian int32 token ids (`python scripts/make_token_map.py MODEL` writes one, from token ids in order or from text: the checkpoint's own replies, text files, a directory of code and prose; it writes a manifest of what it counted beside the map and refuses a file whose name or text marks it as a benchmark's, since a map built from a test set's tokens raises the acceptance on that test set only): the draft computes its logits over those LM head rows alone, from a copy made at startup whose size is logged. That VRAM comes out of the expert cache when `--moe-cache-auto` sizes it (the default for hybrid and offload without a cache size), and out of the KV cache otherwise. The target still verifies over the whole vocabulary, so the output distribution does not depend on the file, only the acceptance rate does. A tied or block-FP8 LM head is refused |
 
 Speculative decoding needs `--tp 1` and runs without overlap scheduling; a target with sliding-window KV is served only by the Gemma-4 assistant, which reads the target's cache through a read-only view; every other target with sliding-window KV is refused at startup, and so is every target with DSV4 window-tier KV. The Gemma-4 assistant keeps no KV of its own: it reads the target's cache, so it adds nothing to the KV budget and its weights cost about 149 MiB for the E4B draft, about 425-428 MiB for the 12b and 26B-A4B Q8_0 ones. `mtp` refuses an FTW checkpoint as the draft source, since FTW drops the `mtp.*` tensors, and a Qwen3.5 / Qwen3.6 GGUF converted without its MTP layer (llama.cpp `--no-mtp`) when no `mtp-*.gguf` sidecar is given: such a trunk has no draft of its own to read, while a `--no-mtp` trunk plus a sidecar works (the trunk config's shapes, the sidecar's weights).
 
@@ -140,9 +141,27 @@ slots than a server without the preset plans. The preset's memory ratio comes wi
 of one prefill chunk of `--max-prefill-length` tokens left free on top of its headroom (1.03 GiB for
 8192 tokens on Qwen3.6-35B-A3B, counted from the GatedDeltaNet layer's tensor shapes): `--memory-ratio
 0.95` alone leaves less than that on a 16 GB card, and a long prompt then ends the server with a CUDA
-out-of-memory error. For a model without GatedDeltaNet layers the preset keeps the default ratio. A
+out-of-memory error. An automatically sized expert cache takes that memory from the KV tokens above
+`--kv-reserve-tokens` first and from expert slots after, and neither cache goes under its minimum.
+Where that cannot leave the whole chunk free, the preset's own KV reserve gives way before the chunk
+does: it is lowered to the largest reserve that can, at the least to a prompt as long as the chunk
+and 1024 tokens of answer (never under the default reserve). If the plan is still short, the server
+starts, the plan line says how much it keeps free, and one warning names the prompt length that
+fits: a longer prompt can end the server. For a model
+without GatedDeltaNet layers the preset keeps the default ratio. A
 typed `--memory-ratio` gets no such reserve. The startup log lists what the preset set,
 what each setting did to the `--moe-cache-auto` plan, and the resulting expert slots and KV tokens.
+
+Under `offload` the preset serves without its drafts where the expert cache holds under 20% of all
+experts: a `--moe-cache-rate`, `--moe-cache-size` or `--moe-cache-mem` that small, or an automatic
+plan that small with the drafts loaded and the preset's KV reserve (counted before the expert banks
+load, a slot's bytes taken from the bank layout). At such a cache the drafted rows miss the cache
+more often than their accepted tokens pay back. One log line says so and how much GPU memory the
+draft's weights gave back to the caches. A `--speculative-num-steps` or `--speculative-algorithm` on
+the command line keeps the drafts, and so do `hybrid` and `--moe-cpu-layers`. The 20% comes from four
+decode cells of Qwen3.6-35B-A3B NVFP4 on RTX 5090s, the preset with 3 drafts against a server with no
+flags: slower at 512 and 701 of 10240 slots, faster at 2048 and 2991. Nothing was measured between
+6.8% and 20%.
 
 Where every expert fits on the GPU the preset stops streaming them, in one of two ways, and the
 plan line says which. Both give the same output as the expert cache does.
@@ -163,32 +182,62 @@ plan line says which. Both give the same output as the expert cache does.
 above, else with `offload` (or what `--moe-strategy auto` takes from an
 [`ft bench decode`](#ft-bench-decode) row), and 3 draft tokens. `--preset single-measured`
 is the same preset, and on its first start for a checkpoint, set of flags and machine it times the
-candidates the preset cannot choose between: `offload` and `hybrid`, each with no drafts, 3 and 5
-MTP draft tokens. Each candidate is one server start that decodes two built-in prompts (a math
-problem and a coding task) twice over, with the checkpoint's sampling: each time 512 timed tokens
-after 1024 warm-up tokens that fill the expert cache. A candidate's lead over `offload` with 3 draft
-tokens is taken per prompt from the means over the two passes and is the smaller of the two prompts';
-a candidate behind in any single pass has none. The candidate with the largest lead runs, if that
-lead is above 10%, and otherwise the static preset's choice runs, with `--moe-strategy` as
-the command line left it. This is measured on the first start, before the server loads; the log
-prints the time (`calibration took N s`): six model loads and about 37,000 decoded tokens, so
-expect it to take a while. A strategy or a speculative setting given on the command line is not
+candidates the preset cannot choose between: `offload` and `hybrid`, each with 3, 4 and 5 MTP draft
+tokens and with none. Each candidate is one server start that decodes two built-in prompts (a math
+problem and a coding task) twice over, with the checkpoint's sampling: 256 timed tokens after 1024
+warm-up tokens that fill the expert cache, then 256 timed tokens after 256 warm-up tokens on the
+cache the first pass left. A candidate's lead over the static preset's choice is taken per prompt
+from the means over the two passes and is the smaller of the two prompts'; a candidate behind in any
+single pass has none. The candidate with the largest lead runs, if that lead is above 10%, and
+otherwise the static preset's choice runs, with `--moe-strategy` as the command line left it. The
+strategy and the number of draft tokens are chosen together by that one rule; a depth is not chosen
+per prompt.
+
+A draft token map is one more candidate where the calibration's store holds one for the checkpoint:
+5 draft tokens with the map, per strategy. The store is the directory of the decode profile, and
+`python scripts/make_token_map.py MODEL --store ...` writes the map there under the checkpoint's
+fingerprint with its manifest; a file whose manifest is missing or names another sha256 is not timed.
+A `--speculative-token-map` on the command line is not a candidate: every server then has that map.
+No map is shipped: one has to be built for the checkpoint, from text that no benchmark uses.
+
+The calibration runs before the server loads and has 300 seconds. Every candidate is a model load,
+because a running server cannot change its strategy or its draft depth, so the candidates are timed
+in a fixed order and only as many as fit, the static choice first. Where it serves every expert
+from the GPU (`fused`, or an expert cache with a slot for each), the next are 5 draft tokens with
+the map (5 without one where there is no map), then 4 draft tokens, then the other strategy with 3,
+then the rest: on full cards 5 drafts with a 32K map was the one setting measured ahead of the
+static choice. Where the cache holds part of the experts, the next is the other strategy with 3
+draft tokens, then 5 draft tokens with the map, 4, 5 and no draft tokens for the strategy that is
+ahead of those two, then for the other one: there the strategy decided most. A candidate is started only while 1.1 times the longest candidate so far still fits in
+what is left, and its server is stopped if it is not ready with time left for its requests. The end
+of the 300 seconds is also a deadline for every load and every request, the static choice's
+included: what is still running then is ended, and that server is gone at most 30 seconds later,
+by SIGKILL if it does not stop. If the static choice itself is not timed by then, the static preset
+runs untimed and the log says so. On a machine that loads the model in 80
+seconds that is two or three candidates; the log names the ones that were not started, and prints
+the time (`calibration took N s`). A candidate that was not timed is stored as such, is not chosen,
+and is not timed on a later start; `--calibrate-again` keeps the stored timings and spends another
+300 seconds on the candidates not timed yet. A strategy or a speculative setting given on the command line is not
 timed, and a checkpoint that drafts nothing is timed for the strategy alone (two model loads).
 Where the static preset serves the experts resident, `fused` is every candidate's strategy and only
-the three draft settings are timed (three model loads): with every expert on the GPU `hybrid` has
-nothing to compute on the CPU.
+the draft settings are timed: with every expert on the GPU `hybrid` has
+nothing to compute on the CPU. Where the static preset dropped its drafts for the size of an
+`offload` cache (above), that is the static choice, and `offload` is not timed with drafts.
 SIGTERM, SIGHUP or Ctrl-C during the calibration stops the candidate's server and ends the launcher
 with exit code 128 + the signal.
 
 The timings are kept in the decode profile, next to the `ft bench decode` rows, and are read under
 the same conditions as those rows (same checkpoint and flags, same machine and release), so later
-starts measure nothing and say which calibration they read. A `--moe-cache-rate` or `--moe-cache-size`
+starts measure nothing and say which calibration they read. `--calibrate-again` times on this
+start whatever is stored: the candidates the stored calibration had no time for, or, once every
+candidate has been timed, all of them again. A `--moe-cache-rate` or `--moe-cache-size`
 is part of those flags. With an automatically sized cache the timings are read only while about as
 much GPU memory is free as when they were taken: clearly more or clearly less is timed again. Where
 the calibration cannot be done or its
 static candidate does not start, the static preset runs and one log line says why; a candidate that
 does not start is not chosen, the log names it, and the next start times the candidates again (a
-candidate that fails on two starts in a row is left out from then on). The 10% margin and the token counts are not tuned on measurements.
+candidate that fails on two starts in a row is left out from then on). The 10% margin, the token
+counts and the 1.1 are not tuned on measurements.
 
 `--preset single-fast` is `--preset single` with `--prefill-graph-tokens 448` and
 `--prefill-graph-chunks 1-64,128-384:64`: when a prompt continues a cached one by at most 448

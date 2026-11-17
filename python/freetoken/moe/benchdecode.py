@@ -354,10 +354,10 @@ def tail(log_path: str, n: int = 25) -> str:
         return ""
 
 
-def stop_server(proc: subprocess.Popen) -> None:
-    """SIGTERM the whole session (frontend and workers), then SIGKILL; as benchmarks/bench_decode_moe.py does."""
+def stop_server(proc: subprocess.Popen, term_s: float = 90) -> None:
+    """SIGTERM the whole session (frontend and workers), then SIGKILL after ``term_s`` seconds; as benchmarks/bench_decode_moe.py does."""
     try:
-        for sig, wait_s in ((signal.SIGTERM, 90), (signal.SIGKILL, 30)):
+        for sig, wait_s in ((signal.SIGTERM, term_s), (signal.SIGKILL, 30)):
             try:
                 os.killpg(proc.pid, sig)
             except ProcessLookupError:
@@ -439,10 +439,11 @@ def eos_strings(model_path: str) -> tuple[str, ...]:
     return tuple(sorted(x for x in found if isinstance(x, str) and x))
 
 
-def stream_chat(origin: str, body: dict, floor: float | None = None) -> dict:
+def stream_chat(origin: str, body: dict, floor: float | None = None, deadline: float | None = None) -> dict:
     """One streamed chat completion, as it arrived: ``marks`` (see window_stats), ``pieces`` (tokens so far, text),
     the usage, the last timings object and the finish reason. With ``floor``, a request whose first EARLY tokens
-    ran slower than that is abandoned (``gave_up``): a collapsed hybrid arm would otherwise take hours to say the same."""
+    ran slower than that is abandoned (``gave_up``): a collapsed hybrid arm would otherwise take hours to say the same.
+    With ``deadline`` (a time.monotonic() value) the request ends there with an error, whether the server streams or is silent."""
     req = urllib.request.Request(f"{origin}/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     marks: list[tuple] = []
@@ -450,12 +451,27 @@ def stream_chat(origin: str, body: dict, floor: float | None = None) -> dict:
     out = {"marks": marks, "pieces": pieces, "usage": None, "timings": None, "finish_reason": None, "early": None, "gave_up": False,
            "clock": "server timings", "first_s": None}
     t0 = time.perf_counter()
+    left = 3600 if deadline is None else deadline - time.monotonic()
+    if left <= 0:
+        raise RuntimeError("the request was not sent: its deadline had passed")
     try:
-        resp = urllib.request.urlopen(req, timeout=3600)
+        resp = urllib.request.urlopen(req, timeout=left)
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"request failed: HTTP {e.code}: {e.read()[:300]!r}") from e
     with resp:
-        for raw in resp:
+        while True:
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise RuntimeError("the request ran past its deadline")
+                # urlopen's timeout counts from every read, so a server that streams and then goes silent would get
+                # it all over again: what is left of the deadline goes on the socket before each read
+                sock = getattr(getattr(resp.fp, "raw", None), "_sock", None)
+                if sock is not None:
+                    sock.settimeout(left)
+            raw = resp.readline()
+            if not raw:
+                break
             line = raw.strip()
             if not line.startswith(b"data:"):
                 continue
@@ -543,9 +559,9 @@ def measure(raw: dict, warm: int, decode: int, warms: list[int], eos: tuple[str,
 
 
 def timed_request(origin: str, model_id: str, prompt: str, sampling: dict, warm: int, decode: int, floor: float | None = None,
-                  warms: list[int] | None = None, eos: tuple[str, ...] = ()) -> dict:
+                  warms: list[int] | None = None, eos: tuple[str, ...] = (), deadline: float | None = None) -> dict:
     """One streamed chat completion of warm + decode tokens, thinking on, measured over its last ``decode`` tokens."""
-    raw = stream_chat(origin, chat_body(model_id, prompt, sampling, warm + decode), floor)
+    raw = stream_chat(origin, chat_body(model_id, prompt, sampling, warm + decode), floor, deadline)
     return measure(raw, warm, decode, warms or [warm], eos)
 
 
@@ -604,9 +620,10 @@ def over_seeds(runs: list[dict]) -> dict:
         return sum(r[key] or 0 for r in runs)
 
     ttft = [r["ttft_ms"] for r in runs if r["ttft_ms"] is not None]
+    # the passes after the first may have another warm-up (run_arm's warm_after): a window is averaged over the passes that have it
     by_warm = {}
-    for w in runs[0]["by_warm"]:
-        vals = [r["by_warm"][w] for r in runs if r["by_warm"][w]]
+    for w in dict.fromkeys(w for r in runs for w in r["by_warm"]):
+        vals = [r["by_warm"][w] for r in runs if r["by_warm"].get(w)]
         by_warm[w] = mean_ci(vals) if vals else (None, None)
     return {"tok_s": mean, "ci95": half, "steps_s": avg("steps_s"), "client_tok_s": avg("client_tok_s"), "gap_p95_ms": avg("gap_p95_ms"),
             "tok_per_step": total("tokens") / total("steps"), "accept": total("draft_n_accepted") / total("draft_n") if total("draft_n") else None,
@@ -677,7 +694,14 @@ def context_turns(origin: str, model_id: str, sizes: list[int], sampling: dict) 
 
 
 def run_arm(ns, extra, arm: str, rate: float | None, single, together, sampling: dict, floors: list[float] | None = None,
-            passes: int | None = None) -> dict:
+            passes: int | None = None, warm_after: int | None = None, deadline: float | None = None, grace: float = 30.0) -> dict:
+    """``warm_after``: the warm-up tokens of the passes after the first, which find the expert cache as the pass before left it.
+    ``deadline`` (a time.monotonic() value): the server must be ready and every request done by then, and the server is
+    gone ``grace`` seconds after it at the latest (SIGKILL where SIGTERM has not ended it 10 s before that)."""
+
+    def left() -> float:
+        return float("inf") if deadline is None else deadline - time.monotonic()
+
     passes = passes or ns.seeds
     port = free_port()
     origin = f"http://127.0.0.1:{port}"
@@ -689,7 +713,7 @@ def run_arm(ns, extra, arm: str, rate: float | None, single, together, sampling:
     with os.fdopen(fd, "wb") as log_f:
         proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, start_new_session=True, env=env)
         try:
-            wait_ready(origin, proc, log_path, ns.server_timeout)
+            wait_ready(origin, proc, log_path, min(ns.server_timeout, left()))
             ready_s = time.monotonic() - t_start
             model_id = get_json(f"{origin}/v1/models")["data"][0]["id"]
             gpus = get_json(f"{origin}/v1/stats").get("gpus") or [{}]
@@ -699,8 +723,9 @@ def run_arm(ns, extra, arm: str, rate: float | None, single, together, sampling:
             gave_up = False
             # pass after pass, not prompt after prompt: pass k is then the same requests in the same order however many passes there are
             for rep in range(1, passes + 1):
+                warm, warms = (ns.warm, ns.warms) if rep == 1 or warm_after is None else (warm_after, [warm_after])
                 for i, (_, text) in enumerate(single):
-                    r = timed_request(origin, model_id, text, sampling, ns.warm, ns.decode, floors[i] if floors else None, ns.warms, ns.eos)
+                    r = timed_request(origin, model_id, text, sampling, warm, ns.decode, floors[i] if floors else None, warms, ns.eos, deadline)
                     runs[i].append({**r, "rep": rep})
                     if r["gave_up"]:
                         gave_up = True
@@ -721,7 +746,7 @@ def run_arm(ns, extra, arm: str, rate: float | None, single, together, sampling:
         except SERVER_GONE as e:
             raise RuntimeError(f"the server stopped answering ({type(e).__name__}: {e}); log: {log_path}") from e
         finally:
-            stop_server(proc)
+            stop_server(proc, max(0.0, min(90.0, left() + grace - 10.0)))
     time.sleep(ns.settle)  # let the driver reclaim VRAM before the next server
     key = free = resolved = threads = None
     capped = False
