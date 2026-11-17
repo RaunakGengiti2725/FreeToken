@@ -1502,6 +1502,8 @@ def test_preset_kv_reserve_goes_to_its_floor_where_the_plan_holds_under_a_fifth_
         # a chunk of 8192 tokens and 1024 of answer; about 310 slots more
         assert reserve == 9216 and 300 < gained < 320 and fields == ("kv_reserve_tokens",)
         assert any("the KV reserve is 9216 tokens, not 36864" in line and "under 20%" in line for line in lines)
+        # what a longer request then gets: the scheduler refuses the prompt, it is not cut at a length
+        assert any("a longer prompt is refused (context_length_exceeded)" in line for line in lines)
     else:
         assert (reserve, gained) == (36864, 0) and not lines
     # several running requests keep theirs, and so does a typed --max-output-tokens, which the reserve was sized for;

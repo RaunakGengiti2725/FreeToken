@@ -145,7 +145,9 @@ slots than a server without the preset plans. Where the automatic plan at that r
 under 20% of all experts, with one running request, the reserve goes down to a prompt as long as a
 prefill chunk and 1024 tokens of answer (never under the default): there each slot its pages take is
 one miss more on every decode step (about 310 slots of Qwen3.6-35B-A3B NVFP4 with 8 GiB free). A
-longer prompt and answer then end with finish_reason length, and a warning says so. A typed
+request then holds about that many tokens of prompt and answer: a longer prompt is refused with
+`context_length_exceeded`, an answer is cut where the pool ends (`finish_reason: length`), and a
+warning says so. A typed
 `--kv-reserve-tokens`, `--max-output-tokens`, `--moe-cache-rate` or `--moe-cache-size` is left as it is. The preset's memory ratio comes with the working memory
 of one prefill chunk of `--max-prefill-length` tokens left free on top of its headroom (0.65 GiB for
 8192 tokens on Qwen3.6-35B-A3B, counted from the GatedDeltaNet layer's tensor shapes; the layer runs
