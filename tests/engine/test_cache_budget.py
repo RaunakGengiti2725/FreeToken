@@ -872,6 +872,35 @@ def test_auto_does_not_use_a_row_measured_with_other_settings(decode_rows, serve
     assert differs in decode_rows.dp.key_diff(key, config.moe_decode_key)
 
 
+# the keys these command lines got before the preset set a prefill demand length (7cad44b), with the stand-ins below
+_KEY_SINGLE = "ckpt@bf41ffe2|cache=auto:0.95|cpu=0/4@e5b47b|spec=mtp:3|tp=1|req=1|dtype=bfloat16|embed_weights=host|kv_reserve_tokens=36864|moe_prefill_hit_d2d=True"
+_KEY_SINGLE_FAST = _KEY_SINGLE + "|prefill_graph_chunks=1-64,128-384:64|prefill_graph_tokens=448"
+
+
+@pytest.mark.parametrize(
+    "flags, key",
+    [
+        (("--preset", "single"), _KEY_SINGLE),
+        (("--preset", "single-measured"), _KEY_SINGLE),
+        (("--preset", "single-fast"), _KEY_SINGLE_FAST),
+        # a demand length changes a prefill only: typed, it does not make another setup either
+        (("--preset", "single", "--moe-prefill-demand-tokens", "32"), _KEY_SINGLE),
+        (("--moe-prefill-demand-tokens", "32"), "ckpt@bf41ffe2|cache=auto:0.9|cpu=0/4@e5b47b|spec=off|tp=1|req=4|dtype=bfloat16"),
+    ],
+)
+def test_a_preset_start_finds_the_rows_filed_before_its_prefill_demand_length(decode_rows, monkeypatch, flags, key):
+    from unittest.mock import patch
+
+    from freetoken.server.args import parse_args
+
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1, 2, 3}, raising=False)
+    monkeypatch.setattr(decode_rows.dp, "perf_env", lambda environ=None: {})
+    hf = SimpleNamespace(to_dict=lambda: {"architectures": ["Qwen3MoeForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: hf):
+        args = parse_args(["--model", str(decode_rows.model), *flags])[0]
+    assert decode_rows.engine._decode_decision_key(args) == key
+
+
 def test_auto_tells_speculative_methods_and_environment_switches_apart(decode_rows, monkeypatch):
     monkeypatch.setattr(decode_rows.engine, "_adjust_spec_config", lambda *a, **k: None)
     _file_row(decode_rows, _HYBRID_FASTER, speculative_algorithm="mtp", speculative_num_steps=3)

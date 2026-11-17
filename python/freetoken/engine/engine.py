@@ -2647,6 +2647,8 @@ _DECODE_KEY_OWN = frozenset((
     "memory_ratio", "moe_cpu_threads", "max_running_req", "speculative_algorithm", "speculative_num_steps", "spec_slot_states",
     "moe_decode_key", "moe_decode_row", "preset", "preset_fields",
 ))
+# settings that change a prefill and never a decode step: a row measured with another value still describes the decode
+_DECODE_KEY_PREFILL_ONLY = frozenset(("moe_prefill_demand_tokens",))
 
 
 def _moe_cache_is_auto(config: EngineConfig) -> bool:
@@ -2656,7 +2658,7 @@ def _moe_cache_is_auto(config: EngineConfig) -> bool:
 
 
 def _decode_decision_key(config: EngineConfig) -> str:
-    """This setup's key in the decode profile (moe/decode_profile.py): the checkpoint, the cache, the CPUs, speculative decoding, and every other engine setting that is not at its default."""
+    """This setup's key in the decode profile (moe/decode_profile.py): the checkpoint, the cache, the CPUs, speculative decoding, and every other engine setting that is not at its default, but those of a prefill only (_DECODE_KEY_PREFILL_ONLY)."""
     from freetoken.moe import decode_profile
 
     spec = f"{config.speculative_algorithm}:{config.speculative_num_steps}" if config.speculative_algorithm is not None else "off"
@@ -2670,7 +2672,7 @@ def _decode_decision_key(config: EngineConfig) -> str:
         spec=spec,
         tp_size=config.tp_info.size,
         max_running_req=config.max_running_req,
-        extra=decode_profile.non_default_settings(config, EngineConfig, skip=_DECODE_KEY_OWN),
+        extra=decode_profile.non_default_settings(config, EngineConfig, skip=_DECODE_KEY_OWN | _DECODE_KEY_PREFILL_ONLY),
         env=decode_profile.perf_env(),
     )
 
