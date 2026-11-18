@@ -333,19 +333,25 @@ def test_the_keyed_draw_samples_the_rows_distribution_and_never_a_token_it_cut()
     assert keyed_draw(probs[1:2], torch.tensor([0.0])).tolist() == [5]
 
 
-@pytest.mark.parametrize("per_row,neighbors", [
-    (True, {}), (False, {}),
+@pytest.mark.parametrize("per_row,own,neighbors", [
+    (True, {}, {}), (False, {}, {}),
     # the requests beside it turn a filter on that it leaves off
-    (True, {"top_k": 20}), (True, {"top_p": 0.9}), (True, {"min_p": 0.05}),
-    (True, {"top_k": 20, "top_p": 0.9, "min_p": 0.05}),
-], ids=["per-row", "batched", "per-row-top-k", "per-row-top-p", "per-row-min-p", "per-row-all"])
-def test_a_seeded_row_draws_alone_what_it_draws_in_a_batch_and_leaves_the_unseeded_rows_alone(monkeypatch, per_row, neighbors):
+    (True, {}, {"top_k": 20}), (True, {}, {"top_p": 0.9}), (True, {}, {"min_p": 0.05}),
+    (True, {}, {"top_k": 20, "top_p": 0.9, "min_p": 0.05}),
+    # its own filters, among requests that turn on others
+    (True, {"top_k": 20, "top_p": 0.95}, {"min_p": 0.05}), (True, {"min_p": 0.05}, {"top_k": 20}),
+], ids=["per-row", "batched", "per-row-top-k", "per-row-top-p", "per-row-min-p", "per-row-all",
+        "per-row-own-top-k-top-p", "per-row-own-min-p"])
+def test_a_seeded_row_draws_alone_what_it_draws_in_a_batch_and_leaves_the_unseeded_rows_alone(monkeypatch, per_row, own, neighbors):
     """One seeded request alone and as request 0, a middle one and the last of 2, 8 and 16, beside seeded and unseeded
-    requests, in a decode step and a verify step of 3 rows: the same tokens, by the default per-row draw and by
-    FREETOKEN_SEEDED_DRAW=batched, also when the requests beside it turn on filters it leaves off. The unseeded rows
-    draw from the shared stream exactly as in the same step without a seed, and the stream stands where it would.
-    Stand-in kernels as above, which run a row alone as in a batch; each draw entry point mixes its own salt into the
-    seed, as the real kernels run another algorithm per entry point. The CUDA test checks the arithmetic of the kernels."""
+    requests, in a decode step (Sampler.sample) and a verify step of 3 rows: the same tokens, by the default per-row
+    draw and by FREETOKEN_SEEDED_DRAW=batched, also when the requests beside it turn on filters it leaves off. By the
+    per-row draw they are the tokens sample_impl gives the row called with its key and its own filters only. The
+    unseeded rows draw from the shared stream exactly as in the same step without a seed, and the stream stands where
+    it would. Stand-in kernels as above, which run a row alone as in a batch; each draw entry point mixes its own salt
+    into the seed, as the real kernels run another algorithm per entry point. The CUDA test checks the arithmetic of
+    the kernels."""
+    from contextlib import nullcontext
     from types import SimpleNamespace
 
     from freetoken.core import Batch, Req, SamplingParams
@@ -385,6 +391,8 @@ def test_a_seeded_row_draws_alone_what_it_draws_in_a_batch_and_leaves_the_unseed
     )
     monkeypatch.setattr(sample, "sampling_module", lambda: kernels)
     monkeypatch.setattr(sample, "is_sm90_supported", lambda: False)
+    # a CPU build of torch has no NVTX
+    monkeypatch.setattr(torch.cuda.nvtx, "range", lambda name: nullcontext())
     vocab = 512
     sampler = sample.Sampler(device=torch.device("cpu"), vocab_size=vocab)
     g = torch.Generator().manual_seed(11)
@@ -396,19 +404,28 @@ def test_a_seeded_row_draws_alone_what_it_draws_in_a_batch_and_leaves_the_unseed
 
     def step(batch, at, width, seeded=True):
         reqs = [req(None if i % 2 or not seeded else 100 + i, **neighbors) for i in range(batch - 1)]
-        reqs = reqs[:at] + [req(7 if seeded else None)] + reqs[at:]
+        reqs = reqs[:at] + [req(7 if seeded else None, **own)] + reqs[at:]
         logits = torch.cat([*others[:at, :width], mine[:width], *others[at : batch - 1, :width]])
+        torch.manual_seed(1)
         if width == 1:
-            args = sampler.prepare(Batch(reqs=reqs, phase="decode"))
+            tokens = sampler.sample(logits, sampler.prepare(Batch(reqs=reqs, phase="decode"))).view(batch, 1)
         else:
             args = sampler.prepare(Batch(reqs=reqs, phase="verify", rows_per_req=width))
-        torch.manual_seed(1)
-        # a decode step goes through sample_verify with no drafts: Sampler.sample opens an NVTX range, which a CPU build of torch lacks
-        tokens = sampler.sample_verify(logits, args, torch.zeros(batch, width - 1, dtype=torch.int64)).view(batch, width)
+            tokens = sampler.sample_verify(logits, args, torch.zeros(batch, width - 1, dtype=torch.int64)).view(batch, width)
         return tokens, torch.rand(1), [i for i, r in enumerate(reqs) if r.sampling_params.seed is None]
+
+    def drawn_alone(width):
+        """The request's tokens from sample_impl called a row at a time with the row's key and its own filters only."""
+        k = torch.tensor([own["top_k"]], dtype=torch.int32) if "top_k" in own else None
+        p = torch.tensor([own["top_p"]]) if "top_p" in own else None
+        m = torch.tensor([own["min_p"]]) if "min_p" in own else None
+        return torch.cat([sample.sample_impl(mine[j : j + 1], torch.tensor([0.8]), k, p, m, sample.draw_key(7, 40 + j))
+                          for j in range(width)])
 
     for width in (1, 3):
         alone = step(1, 0, width)[0][0]
+        if per_row:
+            assert alone.tolist() == drawn_alone(width).tolist(), width
         for batch in (2, 8, 16):
             for at in sorted({0, batch // 2, batch - 1}):
                 tokens, after, unseeded = step(batch, at, width)
