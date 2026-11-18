@@ -141,9 +141,9 @@ class EngineConfig:
     # from them what the checkpoint or the memory budget cannot take (speculative decoding, host embeddings, the KV reserve).
     preset: str | None = field(default=None, repr=False)
     preset_fields: tuple[str, ...] = field(default=(), repr=False)
-    # --preset single-measured: (candidate, strategy, draft tokens, expert slots) of the calibration's choice, which the
-    # server must end up serving (moe/calibrate.py); None for draft tokens or slots where the calibration does not know them
-    preset_calibrated: tuple | None = field(default=None, repr=False)
+    # --preset single-measured: what the calibration's choice and the static choice were timed with, and where the
+    # calibration is stored (moe/calibrate.py measured_choice); _adjust_config serves the static preset where the choice resolves otherwise
+    preset_calibrated: dict | None = field(default=None, repr=False, compare=False)
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size

@@ -91,7 +91,7 @@ READY_S = 900             # the longest a candidate's server may take to load
 PROMPTS = ("math", "code")
 DEPTHS = (3, 0)           # the static preset's first; 4 and 5 drafts are a candidate only with the map
 MAP_DEPTH = 5             # draft tokens of the candidate with a draft token map
-_VERSION = 7
+_VERSION = 8
 _now, _sleep = time.monotonic, time.sleep
 
 # removed from the command line of a candidate's server: the bench names these itself, and the preset must not measure again
@@ -225,7 +225,9 @@ def choose(tok_s: dict, names: list[str], margin: float = MARGIN) -> tuple[str, 
 def _usable(row: dict) -> bool:
     """What every reader of a calibration row relies on; the file can be edited by hand."""
     tok = row.get("tok_s")
-    if not isinstance(tok, dict) or not tok or not all(isinstance(row.get(k, {}), dict) for k in ("failed", "skipped")):
+    if not isinstance(tok, dict) or not tok or not all(isinstance(row.get(k, {}), dict) for k in ("failed", "skipped", "static", "candidate_slots")):
+        return False
+    if not all(v is None or (isinstance(v, int) and not isinstance(v, bool)) for v in row.get("candidate_slots", {}).values()):
         return False
     width = len(PROMPTS)
     if not all(row.get(k) is None or (isinstance(row[k], int) and not isinstance(row[k], bool)) for k in ("cache_slots", "total_slots", "slot_bytes", "gpu_free_bytes")):
@@ -455,10 +457,11 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
     t0 = _now()
     static, names = todo[0], [c[0] for c in todo]
     # failed: did not start or answer, timed again on the next start. skipped: left out for a reason that holds then too
-    tok_s, failed, skipped, wall = {}, {}, {}, {}
+    tok_s, failed, skipped, wall, slots = {}, {}, {}, {}, {}
     first, tail = None, 0.0  # tail: the longest a candidate took after its server was ready (its requests and its stop)
     if known is not None:
         tok_s = {n: v for n, v in known["tok_s"].items() if n in names}
+        slots = {n: v for n, v in (known.get("candidate_slots") or {}).items() if n in tok_s}
         skipped = {n: why for n, why in known.get("skipped", {}).items() if n in names and why != OUT_OF_TIME}
         wall = {n: float(v) for n, v in (known.get("wall_s") or {}).items() if n in tok_s} or {static[0]: 0.0}
         first = {**known["static"], **{k: known.get(k) for k in ("cache_slots", "total_slots", "slot_bytes", "gpu_free_bytes")}}
@@ -520,7 +523,7 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
                 skipped.setdefault(offload_none, f"the preset keeps offload's drafts at this cache size: {name} is offload's candidate")
             elif first is not None:
                 skipped[name] = f"the preset serves offload without drafts at this cache size: timed as {offload_none}"
-                tok_s[offload_none] = r["tok_s"]
+                tok_s[offload_none], slots[offload_none] = r["tok_s"], r["cache_slots"]
                 continue
         if first is not None and depth and not r["drafts"] and (first["drafts"] or first.get("no_drafts")):
             # the engine served it without the drafts it was started with (a token map it refuses, a draft that does
@@ -528,12 +531,12 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
             failed[name] = "its server ran without drafts"
             continue
         first = first or r
-        tok_s[name] = r["tok_s"]
+        tok_s[name], slots[name] = r["tok_s"], r["cache_slots"]
     return {
         "tok_s": tok_s, "failed": failed, "skipped": skipped, "columns": list(PROMPTS), "warm": WARM, "warm_again": WARM_AGAIN,
         "decode": _decode_window(static[1]), "passes": PASSES, "budget_s": BUDGET_S, "wall_s": {n: round(v, 1) for n, v in wall.items()}, "tail_s": round(tail, 1),
         "static": {"early": first.get("early"), "drafts": first["drafts"], "no_drafts": bool(first.get("no_drafts"))},
-        "cache_slots": first["cache_slots"], "total_slots": first["total_slots"], "slot_bytes": first["slot_bytes"],
+        "cache_slots": first["cache_slots"], "candidate_slots": slots, "total_slots": first["total_slots"], "slot_bytes": first["slot_bytes"],
         "gpu_free_bytes": first["gpu_free_bytes"], "seconds": round(_now() - t0, 1),
         "measured_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
     }
@@ -543,6 +546,8 @@ def _stale(row: dict, names: list[str], free: int | None, args) -> str | None:
     """Why a stored row does not answer for this start, or None."""
     from freetoken.engine.engine import _moe_cache_is_auto
 
+    if isinstance(row.get("stale"), str):
+        return row["stale"]  # a server resolved its choice otherwise than it was timed (engine._serve_as_timed)
     if names[0] not in row["tok_s"]:
         return f"it has no timing of {names[0]}"
     if missing := [n for n in names if n not in row["tok_s"] and n not in row.get("skipped", {})]:
@@ -576,14 +581,14 @@ def _memory_objection(row: dict, free: int | None, memory_ratio: float) -> str |
 def _overrides(args, strategy: str, depth: int | None, static: bool = False, token_map: str | None = None) -> dict:
     """The fields of ``args`` that make it run the candidate. The ``static`` choice leaves the strategy as the
     command line did: --moe-strategy auto then resolves as it does for --preset single (a filed decode row, a
-    unified-memory GPU), which an explicit offload would bypass. Its depth is left as the command line did too where
-    the static preset itself serves no drafts: replayed as --speculative-algorithm off, the drafts would no longer be
-    the preset's, and a rule that keys on that would resolve the strategy otherwise than for the choice timed."""
+    unified-memory GPU), which an explicit offload would bypass. Without drafts (the preset dropped them while
+    resolving the command line) nothing is replaced: the static choice is then the static preset's command line as is,
+    where a typed --speculative-algorithm off would make the drafts the command line's instead of the preset's."""
     from freetoken.moe import is_offload_moe_strategy
 
     out: dict = {}
     if static and (token_map or depth == 0):
-        # the static preset's own map or its own drop of the drafts: the engine resolves both as the static choice did
+        # the static preset's own map, or its own drop of the drafts: the engine resolves both as for the static choice
         return out
     if "moe_strategy" in args.preset_fields and not static:
         out["moe_strategy"] = strategy
@@ -670,14 +675,14 @@ def measured_choice(args, argv: list[str]) -> dict:
                     f"--preset {PRESET}: not timed, and so not chosen: " + "; ".join(f"{n} ({why})" for n, why in row["failed"].items())
                     + ". The next start times the candidates again"
                 )
-            took = f"calibration took {row['seconds']:.0f} s"
+            took, fresh = f"calibration took {row['seconds']:.0f} s", True
             try:
                 decode_profile.store(key, row, gpu={"name": gpu_name, "uuid": gpu_uuid})
             except (OSError, ValueError, TypeError) as exc:
                 # the timings are in hand: serve their choice, and the next start times again
                 logger.warning(f"--preset {PRESET}: the calibration could not be kept ({type(exc).__name__}: {exc}); the next start times again")
         else:
-            took = f"read the calibration of {row.get('measured_at')}, which took {row.get('seconds')} s"
+            took, fresh = f"read the calibration of {row.get('measured_at')}, which took {row.get('seconds')} s", False
         name, lead = choose(row["tok_s"], names)
     except (RuntimeError, OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError) as exc:
         return static(f"the calibration failed: {type(exc).__name__}: {str(exc).splitlines()[0][:300] if str(exc) else ''}")
@@ -693,19 +698,33 @@ def measured_choice(args, argv: list[str]) -> dict:
     if untimed := "; ".join(f"{n} ({left[n]})" for n in names if n in left):
         timed += f"; not timed: {untimed}"
     logger.info(f"--preset {PRESET}: {took}; mean tok/s on {'/'.join(PROMPTS)}: {timed}; taking {name}: {why}")
-    static_choice = name == names[0]
-    drafts = depth  # what the chosen candidate's server ran with, which the engine checks it serves (engine._check_preset_calibrated)
-    if static_choice and token_map:
-        drafts = None  # the engine serves the map's depth, or 3 drafts where it refuses the map
-    elif static_choice and depth and (row.get("static") or {}).get("drafts") is None:
-        drafts = None  # a row that does not say what its server drafted (edited by hand): the depth is not checked
-    elif static_choice and depth and not row["static"]["drafts"]:
-        drafts = 0  # its server drafted nothing: the static preset drops the drafts at this cache size
-    # the row keeps the expert cache of the static choice's server only
-    slots = row.get("cache_slots") if static_choice else None
+    if name != names[0] and isinstance(row.get("fallback"), str):
+        # the start that timed it resolved it otherwise and served the static preset: so does every start after it
+        logger.info(f"--preset {PRESET}: serving the static preset {names[0]}, not {name}: {row['fallback']}")
+        name = names[0]
+        _, strategy, depth, token_map = todo[0]
+
+    def timed_as(n: str) -> dict:
+        """What the server of candidate ``n`` ran with: its strategy, its depth at the start (None: the command
+        line's, or the map's), the draft tokens it served once loaded (None where not known) and its expert slots."""
+        _, s, d, m = todo[names.index(n)]
+        drafts = d
+        if n == names[0] and m:
+            drafts = d = None  # the engine serves the map's depth, or 3 drafts where it refuses the map
+        elif n == names[0] and d and row.get("static", {}).get("no_drafts") is True:
+            drafts = 0  # its server dropped the preset's drafts for the size of its cache (engine._settle_preset_drafts)
+        return {"name": n, "strategy": s, "depth": d, "drafts": drafts, "slots": row.get("candidate_slots", {}).get(n)}
+
+    out = _overrides(args, strategy, depth, static=name == names[0], token_map=token_map)
+    # the parsed values the replay replaces: the static preset is served from them where the choice resolves otherwise
+    undo = {k: getattr(args, k) for k, v in out.items() if getattr(args, k) != v}
+    chosen = timed_as(name)
+    cache = f"{chosen['slots']} slots timed" if chosen["slots"] else "not stored"
     logger.info(
-        f"--preset {PRESET} serves {name} ({'timed on this start' if took.startswith('calibration took') else 'the stored calibration'}): "
-        f"strategy {strategy}, {'the depth the engine settles' if drafts is None else drafts} draft tokens, KV reserve {args.kv_reserve_tokens} "
-        f"tokens, expert cache {f'{slots} slots as timed' if slots else 'as the engine plans it (not stored for this candidate)'}"
+        f"--preset {PRESET} serves {name} ({'timed on this start' if fresh else 'the stored calibration'}): strategy {strategy}, "
+        f"{'the depth the engine settles' if chosen['drafts'] is None else chosen['drafts']} draft tokens, KV reserve {args.kv_reserve_tokens} tokens asked, "
+        f"expert cache {cache}"
+        + ("; the server serves the static preset where its plan resolves another strategy or depth" if undo else "; the static preset's own command line")
     )
-    return {**_overrides(args, strategy, depth, static=static_choice, token_map=token_map), "preset_calibrated": (name, strategy, drafts, slots)}
+    calibrated = {**chosen, "static": timed_as(names[0]), "undo": undo or None, "key": key, "gpu": (gpu_name, gpu_uuid), "fresh": fresh}
+    return {**out, "preset_calibrated": calibrated}

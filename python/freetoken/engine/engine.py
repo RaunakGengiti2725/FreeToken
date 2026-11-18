@@ -1050,7 +1050,7 @@ class Engine:
         )
         if config.preset is not None:
             self._log_preset_plan(config, num_tokens)
-            _check_preset_calibrated(config, config.moe_cache_size if self.moe_offload_cache is not None else None)
+            _log_preset_calibrated(config, config.moe_cache_size if self.moe_offload_cache is not None else None)
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -3051,30 +3051,75 @@ def _cpu_pool_threads(config) -> int:
     return pool_threads(config.moe_cpu_threads)
 
 
-def _check_preset_calibrated(config, slots: int | None) -> None:
-    """Stop a --preset single-measured server that resolved another strategy, draft depth or expert cache than the
-    calibration's choice (``config.preset_calibrated``, moe/calibrate.py) was timed with: it would serve a setting
-    nobody measured under the name of one that was. ``slots``: the expert slots planned, None without an expert cache.
-    The cache may differ by as much as a stored calibration still answers for (decode_profile.SLOT_GROWTH)."""
+def _served_depth(config) -> int:
+    """Draft tokens a decode step of this config proposes: none with speculative decoding off, whatever the step count says."""
+    return config.speculative_num_steps if config.speculative_algorithm is not None else 0
+
+
+def _serve_as_timed(config, parsed, calibrated: dict) -> None:
+    """--preset single-measured, at the end of _adjust_config: the calibration's choice (moe/calibrate.py) is served
+    only where this start resolves the strategy and draft depth its server was timed with. Elsewhere the static
+    preset is served, resolved again from the command line as parsed (``parsed``, taken before any resolution), and
+    the stored calibration is marked: timed on this start, every later start serves the static preset; read from the
+    store, the next start times again."""
+    strategy, depth = config.moe_strategy, _served_depth(config)
+    if strategy == calibrated["strategy"] and calibrated["depth"] in (None, depth):
+        return
+    static = copy.copy(parsed)
+    for name, value in {**calibrated["undo"], "preset_calibrated": calibrated["static"]}.items():
+        object.__setattr__(static, name, value)
+    _adjust_config(static)
+
+    def words(c) -> str:
+        cache = "automatic" if c.moe_cache_auto else c.moe_cache_size or c.moe_cache_rate or c.moe_cache_mem
+        return f"strategy {c.moe_strategy}, {_served_depth(c)} draft tokens, KV reserve {c.kv_reserve_tokens} tokens, expert cache {cache}"
+
+    timed = f"strategy {calibrated['strategy']}, {calibrated['depth']} draft tokens"
+    line = f"{calibrated['name']} was timed with {timed}, and this start resolves it to {words(config)}"
+    logger.warning_rank0(
+        f"--preset {config.preset}: {line}: serving the static preset {calibrated['static']['name']} ({words(static)}); "
+        + ("every later start serves it too" if calibrated["fresh"] else "the next start times the candidates again")
+    )
+    vars(config).clear()
+    vars(config).update(vars(static))
+    _mark_calibration(calibrated, "fallback" if calibrated["fresh"] else "stale", line)
+
+
+def _mark_calibration(calibrated: dict, mark: str, why: str) -> None:
+    """Note on the stored calibration row that its choice was not served (moe/calibrate.py reads both marks)."""
+    from freetoken.moe import calibrate, decode_profile
+
+    gpu_name, gpu_uuid = calibrated["gpu"]
+    try:
+        stamp = decode_profile.stamp(gpu_name, gpu_uuid)
+        row, _ = decode_profile.lookup(calibrated["key"], gpu_name=gpu_name, gpu_uuid=gpu_uuid, now=stamp, well_formed=calibrate._usable)
+        if row is not None:
+            decode_profile.store(calibrated["key"], {**row, mark: why}, gpu={"name": gpu_name, "uuid": gpu_uuid})
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning_rank0(f"--preset single-measured: the stored calibration could not be marked ({type(exc).__name__}: {exc})")
+
+
+def _log_preset_calibrated(config, slots: int | None) -> None:
+    """One line, once the plan is final: what a --preset single-measured server serves against what its candidate's
+    server ran with. A warning where the drafts or the expert cache differ; neither is served otherwise for it: the
+    drafts follow the preset's own rule for the cache (_settle_preset_drafts), and the cache follows the free memory
+    and, under auto, a decode row's cap. ``slots``: the expert slots planned, None without an expert cache."""
     from freetoken.moe import decode_profile
 
-    if getattr(config, "preset_calibrated", None) is None:  # duck-typed test configs omit it
+    calibrated = getattr(config, "preset_calibrated", None)
+    if calibrated is None:
         return
-    name, strategy, drafts, timed_slots = config.preset_calibrated
-    served = config.speculative_num_steps if config.speculative_algorithm is not None else 0
-    wrong = []
-    if config.moe_strategy != strategy:
-        wrong.append(f"strategy {strategy} was timed, {config.moe_strategy} resolved")
-    if drafts is not None and served != drafts:
-        wrong.append(f"{drafts} draft tokens were timed, {served} resolved")
-    if timed_slots and slots is not None and abs(slots - timed_slots) > decode_profile.SLOT_GROWTH * timed_slots:
-        wrong.append(f"{timed_slots} expert slots were timed, {slots} planned")
-    if wrong:
-        raise RuntimeError(
-            f"--preset {config.preset} chose {name}, and this server would serve another setting: {'; '.join(wrong)} "
-            f"(KV reserve {config.kv_reserve_tokens} tokens). --calibrate-again times the candidates again; "
-            "--moe-strategy offload serves offload"
-        )
+    drafts, timed_slots = calibrated["drafts"], calibrated["slots"]
+    differs = (drafts is not None and _served_depth(config) != drafts) or (
+        timed_slots and slots is not None and abs(slots - timed_slots) > decode_profile.SLOT_GROWTH * timed_slots
+    )
+    line = (
+        f"--preset {config.preset} serves {calibrated['name']}: strategy {config.moe_strategy}, {_served_depth(config)} draft tokens, "
+        f"KV reserve {config.kv_reserve_tokens} tokens, {slots if slots is not None else 'no'} expert slots; its server ran with "
+        f"strategy {calibrated['strategy']}, {'unrecorded' if drafts is None else drafts} draft tokens, "
+        f"{timed_slots or 'unrecorded'} expert slots"
+    )
+    (logger.warning_rank0 if differs else logger.info_rank0)(line)
 
 
 def _preset_without_row(config, reason: str) -> tuple[str, None] | None:
@@ -3379,6 +3424,9 @@ def _adjust_config(config: EngineConfig):
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
     preset_fields = getattr(config, "preset_fields", ())  # duck-typed test configs omit it
+    calibrated = getattr(config, "preset_calibrated", None)
+    # the command line as parsed, before any resolution: where single-measured's choice resolves otherwise, the static preset is served from it
+    parsed = copy.copy(config) if calibrated is not None and calibrated.get("undo") else None
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
@@ -3724,3 +3772,5 @@ def _adjust_config(config: EngineConfig):
     if getattr(config, "reproducible_seeds", False):
         resolved.append("reproducible_seeds=True")
     logger.info_rank0(f"Resolved config: {', '.join(resolved)}")
+    if parsed is not None:
+        _serve_as_timed(config, parsed, calibrated)

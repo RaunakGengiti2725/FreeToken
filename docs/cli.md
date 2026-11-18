@@ -242,11 +242,15 @@ the order they are timed, a candidate replaces the one chosen so far where it le
 than 10%, so a candidate barely ahead of another that leads is not taken. What is chosen runs; the
 static choice runs with `--moe-strategy` as the command line left it, and with the static preset's
 own drafts, also where the preset drops them. The strategy and the number of
-draft tokens are chosen together by that one rule; a depth is not chosen per prompt. One log line
-names what is served (strategy, draft tokens, KV reserve and expert cache), after a calibration and
-after a stored one alike. A server that would resolve another strategy, number of draft tokens or
-expert cache (by more than 5% of the slots timed) than the candidate chosen stops with an error that
-names both; `--calibrate-again` times again, and `--moe-strategy offload` serves offload.
+draft tokens are chosen together by that one rule; a depth is not chosen per prompt. The launcher logs
+the choice in one line (strategy, draft tokens, the KV reserve asked and the expert cache timed), after
+a calibration and after a stored one alike. Where a start resolves another strategy or number of draft
+tokens than the chosen candidate's server was timed with, it serves the static preset instead, before
+any weights load, with one warning that names both settings. A stored calibration is then timed again on
+the next start; one timed on that start serves the static preset on every start after it, until
+`--calibrate-again`. Once the plan is final the server logs the strategy, draft tokens, KV reserve and
+expert slots it serves beside those of the candidate's server; drafts that the preset drops or keeps for
+the size of the cache, or an expert cache more than 5% off, are a warning only.
 
 The draft token map is the store's for the checkpoint: under a typed `--moe-strategy fused`, 5 draft
 tokens with it are a candidate against the static 3. The store is the directory of the decode profile, and
