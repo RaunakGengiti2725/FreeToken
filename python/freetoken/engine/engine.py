@@ -1289,8 +1289,9 @@ class Engine:
         cache_per_page += draft_page
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
-        chunk, reserve = _prefill_working_bytes(config)
-        return dict(
+        from freetoken.engine.cache_budget import plan_holds_every_expert
+
+        terms = dict(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,
@@ -1303,12 +1304,18 @@ class Engine:
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
             max_slots=max_slots if max_slots is not None or method is None else method.slot_limit(),
-            # every automatic plan leaves one prefill chunk's working memory out of both caches, with or without a preset:
-            # this is the only place a plan counts it. The planner takes it from KV pages above the reserve first, then
-            # from expert slots. A plan that keeps it also keeps the KV a prompt of one chunk needs
-            reserve_bytes=reserve,
-            kv_soft_tokens=_prefill_kv_tokens(config, chunk) if reserve else 0,
+            reserve_bytes=0,
+            kv_soft_tokens=0,
         )
+        # an automatic plan that offloads experts leaves one prefill chunk's working memory out of both caches, with or
+        # without a preset, and a preset's memory ratio leaves it out of every plan: this is the only place a plan counts
+        # it. A plan that holds every expert without it plans as it did before the reserve. The planner takes it from KV
+        # pages above the reserve first, then from expert slots. A plan that keeps it also keeps the KV a prompt of one
+        # chunk needs
+        chunk, reserve = _prefill_working_bytes(config)
+        if reserve and (self._preset_prefill_reserve(config) or not plan_holds_every_expert(terms)):
+            terms.update(reserve_bytes=reserve, kv_soft_tokens=_prefill_kv_tokens(config, chunk))
+        return terms
 
     def _budget_stages(self, config: EngineConfig, banks, method, max_slots) -> list[tuple[str, dict]]:
         """What budget_advice tries, as (flags, resolver arguments): the current settings, then each
@@ -1415,8 +1422,8 @@ class Engine:
         one prefill chunk of the longest length (--max-prefill-length). The ratio's headroom alone is smaller than that
         on a 16 GB card, and a prompt it does not hold ends the server with a CUDA out-of-memory error. This is the
         reserve of the KV pools the plan does not size (every expert resident, a cache the command line sized, a
-        rebuild); an automatic expert cache leaves the same bytes free with or without a preset (_auto_cache_terms),
-        so a preset's automatic plan counts them once."""
+        rebuild); an automatic expert cache leaves the same bytes free once (_auto_cache_terms): under a preset's ratio
+        always, and without it where the plan offloads experts."""
         if "memory_ratio" not in getattr(config, "preset_fields", ()):  # duck-typed test configs omit it
             return 0
         return _prefill_working_bytes(config)[1]
@@ -1510,18 +1517,19 @@ class Engine:
         return low
 
     def _settle_preset_chunk_reserve(self, config: EngineConfig, banks, method, max_slots) -> None:
-        """A prefill chunk's working memory, which every automatic plan leaves free (_auto_cache_terms), comes before a
+        """A prefill chunk's working memory, where the automatic plan leaves it free (_auto_cache_terms), comes before a
         preset's raised KV reserve: where the plan cannot leave the whole chunk free, the reserve is lowered to the
         largest that can, at the least to a chunk-long prompt and PRESET_CHUNK_ANSWER_TOKENS of answer (and never under
         the default). What the plan then leaves free is kept for the plan line, and where that is still under the
         chunk's working memory one warning, with or without a preset, names the prompt length it holds."""
         from freetoken.engine.cache_budget import kv_reserve_keeping, reserve_kept
 
-        chunk, need = _prefill_working_bytes(config)
+        chunk = _prefill_working_bytes(config)[0]
+        terms = self._auto_cache_terms(config, banks, method, max_slots)
+        need = terms["reserve_bytes"]
         if not need:
             return
         who = f"--preset {config.preset}" if getattr(config, "preset", None) is not None else "--moe-cache-auto"
-        terms = self._auto_cache_terms(config, banks, method, max_slots)
         if reserve_kept(terms) < need and "kv_reserve_tokens" in getattr(config, "preset_fields", ()):
             page, default = terms["page_size"], EngineConfig.kv_reserve_tokens
             floor = max(default, min(_preset_kv_target(config), align_ceil(chunk + PRESET_CHUNK_ANSWER_TOKENS, page)))
@@ -1591,8 +1599,8 @@ class Engine:
             steps.append((label, ("speculative_algorithm", "spec_slot_states")))
         if "kv_reserve_tokens" in filled:
             steps.append((f"--kv-reserve-tokens {config.kv_reserve_tokens}", ("kv_reserve_tokens",)))
-        # a prefill chunk's working memory is in every stage, the plan without the preset's settings included: every
-        # automatic plan leaves it free (_auto_cache_terms). The prefill graphs' memory is the preset's own
+        # a prefill chunk's working memory is no step of its own: the plan without the preset's settings leaves it free
+        # too wherever it offloads experts (_auto_cache_terms). The prefill graphs' memory is the preset's own
         if captures := _preset_capture_bytes(config):
             # on wherever the staged config's preset_fields say so: right after the ratio's own step, where there is one
             at = next((i + 1 for i, (_, names) in enumerate(steps) if names == ("memory_ratio",)), len(steps))
@@ -1637,7 +1645,7 @@ class Engine:
         elif getattr(config.model_config, "is_moe", False):
             parts.append(f"every expert resident ({config.moe_strategy})")
         parts.append(f"{num_tokens} KV tokens")
-        if self._preset_prefill_reserve(config) or (config.moe_cache_auto and _prefill_working_bytes(config)[1]):
+        if self._preset_prefill_reserve(config) or hasattr(self, "_preset_reserve_kept"):
             parts.append(self._preset_left_free(config))
         if captures := _preset_capture_bytes(config):
             parts.append(f"{mem_GB(captures)} left free for the prefill graphs of chunks up to {config.prefill_graph_tokens} tokens")
@@ -2283,8 +2291,9 @@ class Engine:
 
     def _warn_if_prefill_short(self, config: EngineConfig) -> None:
         """One warning when startup or a cache resize left less GPU memory free than one prefill chunk works in.
-        --moe-cache-auto keeps that much out of its plan, and a preset out of its KV pool; a typed cache size without
-        a preset, a resize, and a plan held at its floors do not."""
+        --moe-cache-auto keeps that much out of a plan that offloads experts, and a preset out of its KV pool; a typed
+        cache size without a preset, a resize, a plan held at its floors, and a plan without a preset that holds every
+        expert do not."""
         tokens, need = _prefill_working_bytes(config)
         if not need:
             return

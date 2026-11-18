@@ -241,6 +241,12 @@ def _plan_or_short(terms: dict) -> tuple[tuple[int, int, bool] | None, int]:
         return None, exc.short
 
 
+def plan_holds_every_expert(terms: dict) -> bool:
+    """Whether resolve_moe_cache_auto's plan for ``terms`` gives every expert a slot; False where it does not fit."""
+    plan, _ = _plan_or_short(terms)
+    return plan is not None and plan[0] >= terms["total_experts"]
+
+
 def plan_kv_target(terms: dict, target_tokens: int) -> tuple[tuple[int, int, bool] | None, tuple[int, int, bool] | None, tuple[int, int]]:
     """resolve_moe_cache_auto's ``terms`` with the KV reserve raised to ``target_tokens``: (that plan, the plan of ``terms``,
     (the largest reserve that fits, its expert slots)).

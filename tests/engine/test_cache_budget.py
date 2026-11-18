@@ -580,10 +580,11 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
         size, pages, _ = engine._resolve_auto_moe_cache_size(config, StubBanks())
         if kept is None:
             # 16384 tokens do not fit in 70 MiB: the largest reserve that keeps the slots of a server without the preset.
-            # Both leave the prefill chunk's working memory free, so one page more costs slots: here down to their floor
-            assert default < config.kv_reserve_tokens < 16384 and size >= plain[0]
+            # Both plans hold every expert, so neither leaves a prefill chunk free and one page more is over the budget
+            assert default < config.kv_reserve_tokens < 16384 and size >= plain[0] == 8
             config.kv_reserve_tokens += 16
-            assert engine._resolve_auto_moe_cache_size(config, StubBanks())[0] == 4 < plain[0]
+            with pytest.raises(ValueError, match="budget too small"):
+                engine._resolve_auto_moe_cache_size(config, StubBanks())
             config.kv_reserve_tokens -= 16
         else:
             assert config.kv_reserve_tokens == kept  # never more than the model's context, never less than the default
@@ -709,6 +710,43 @@ def test_prefill_kv_hold_leaves_a_prompt_of_one_chunk_its_reply(rows):
     assert _prefill_kv_tokens(config(kv_reserve_tokens=2048), 8192) == 0
     assert _prefill_kv_tokens(config(kv_reserve_tokens=36864), 8192) == 0
     assert _prefill_kv_tokens(config(num_page_override=8192), 8192) == 0
+
+
+@pytest.mark.parametrize(
+    "budget, preset_fields, plan, left_free",
+    [
+        # 8 experts of 10000 B, 100 B a page, a KV floor of 256 pages, a chunk working in 5000 B
+        (110_000, (), (8, 300), 0),  # every expert fits: the plan of a server without the reserve, KV takes the rest
+        # a preset's ratio leaves the chunk free on any plan: the 44 pages above the floor are short of it, so a slot pays
+        # and KV takes the 5000 B the slot leaves over
+        (110_000, ("memory_ratio",), (7, 350), 5000),
+        (88_600, (), (5, 336), 5000),  # (6, 286) without it, so experts are offloaded: here too one slot pays
+    ],
+)
+def test_prefill_reserve_is_planned_only_where_experts_are_offloaded_or_a_preset_sets_the_ratio(
+    monkeypatch, budget, preset_fields, plan, left_free
+):
+    from freetoken.engine import engine as eng
+    from freetoken.engine.engine import Engine
+
+    class Pool:
+        @staticmethod
+        def kv_cost(config):
+            return 100, 0, 16, 0  # page bytes, fixed bytes, page tokens, smallest reserve
+
+    monkeypatch.setattr(eng, "_prefill_working_bytes", lambda config: (8192, 5000))
+    monkeypatch.setattr(eng, "state_pool_bytes", lambda config, *a: 0)
+    monkeypatch.setattr(eng, "_preset_capture_bytes", lambda config: 0)
+    engine = Engine.__new__(Engine)
+    engine._pool_cls, engine._baseline_free, engine._weights_bytes = Pool, budget, 0
+    config = SimpleNamespace(
+        memory_ratio=1.0, moe_prefill_overlap=True, kv_reserve_tokens=4096, num_page_override=None, decode_rows_per_req=1,
+        preset_fields=preset_fields, model_config=SimpleNamespace(num_experts=2, num_moe_layers=4),
+    )
+    terms = engine._auto_cache_terms(config, None, per_expert_bytes=10_000)
+    assert terms["reserve_bytes"] == left_free
+    got = resolve_moe_cache_auto(**terms)
+    assert got[:2] == plan and budget - got[0] * 10_000 - got[1] * 100 == left_free
 
 
 def test_prefill_working_bytes_counts_gdn_models_only():
