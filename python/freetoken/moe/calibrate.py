@@ -576,12 +576,14 @@ def _memory_objection(row: dict, free: int | None, memory_ratio: float) -> str |
 def _overrides(args, strategy: str, depth: int | None, static: bool = False, token_map: str | None = None) -> dict:
     """The fields of ``args`` that make it run the candidate. The ``static`` choice leaves the strategy as the
     command line did: --moe-strategy auto then resolves as it does for --preset single (a filed decode row, a
-    unified-memory GPU), which an explicit offload would bypass."""
+    unified-memory GPU), which an explicit offload would bypass. Its depth is left as the command line did too where
+    the static preset itself serves no drafts: replayed as --speculative-algorithm off, the drafts would no longer be
+    the preset's, and a rule that keys on that would resolve the strategy otherwise than for the choice timed."""
     from freetoken.moe import is_offload_moe_strategy
 
     out: dict = {}
-    if static and token_map:
-        # the static preset's own map: the engine serves both the depth and the map, or neither where it refuses the map
+    if static and (token_map or depth == 0):
+        # the static preset's own map or its own drop of the drafts: the engine resolves both as the static choice did
         return out
     if "moe_strategy" in args.preset_fields and not static:
         out["moe_strategy"] = strategy
@@ -691,4 +693,19 @@ def measured_choice(args, argv: list[str]) -> dict:
     if untimed := "; ".join(f"{n} ({left[n]})" for n in names if n in left):
         timed += f"; not timed: {untimed}"
     logger.info(f"--preset {PRESET}: {took}; mean tok/s on {'/'.join(PROMPTS)}: {timed}; taking {name}: {why}")
-    return _overrides(args, strategy, depth, static=name == names[0], token_map=token_map)
+    static_choice = name == names[0]
+    drafts = depth  # what the chosen candidate's server ran with, which the engine checks it serves (engine._check_preset_calibrated)
+    if static_choice and token_map:
+        drafts = None  # the engine serves the map's depth, or 3 drafts where it refuses the map
+    elif static_choice and depth and (row.get("static") or {}).get("drafts") is None:
+        drafts = None  # a row that does not say what its server drafted (edited by hand): the depth is not checked
+    elif static_choice and depth and not row["static"]["drafts"]:
+        drafts = 0  # its server drafted nothing: the static preset drops the drafts at this cache size
+    # the row keeps the expert cache of the static choice's server only
+    slots = row.get("cache_slots") if static_choice else None
+    logger.info(
+        f"--preset {PRESET} serves {name} ({'timed on this start' if took.startswith('calibration took') else 'the stored calibration'}): "
+        f"strategy {strategy}, {'the depth the engine settles' if drafts is None else drafts} draft tokens, KV reserve {args.kv_reserve_tokens} "
+        f"tokens, expert cache {f'{slots} slots as timed' if slots else 'as the engine plans it (not stored for this candidate)'}"
+    )
+    return {**_overrides(args, strategy, depth, static=static_choice, token_map=token_map), "preset_calibrated": (name, strategy, drafts, slots)}

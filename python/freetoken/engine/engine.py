@@ -1050,6 +1050,7 @@ class Engine:
         )
         if config.preset is not None:
             self._log_preset_plan(config, num_tokens)
+            _check_preset_calibrated(config, config.moe_cache_size if self.moe_offload_cache is not None else None)
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -2945,7 +2946,7 @@ def _decode_target(config: EngineConfig) -> str:
 _DECODE_KEY_OWN = frozenset((
     "model_path", "tp_info", "moe_strategy", "moe_backend", "moe_cache_size", "moe_cache_rate", "moe_cache_auto", "moe_cache_mem",
     "memory_ratio", "moe_cpu_threads", "max_running_req", "speculative_algorithm", "speculative_num_steps", "spec_slot_states",
-    "moe_decode_key", "moe_decode_row", "preset", "preset_fields",
+    "moe_decode_key", "moe_decode_row", "preset", "preset_fields", "preset_calibrated",
 ))
 # settings that change a prefill and never a decode step: a row measured with another value still describes the decode
 _DECODE_KEY_PREFILL_ONLY = frozenset(("moe_prefill_demand_tokens",))
@@ -3048,6 +3049,32 @@ def _cpu_pool_threads(config) -> int:
     from freetoken.moe.cpu_executor import pool_threads
 
     return pool_threads(config.moe_cpu_threads)
+
+
+def _check_preset_calibrated(config, slots: int | None) -> None:
+    """Stop a --preset single-measured server that resolved another strategy, draft depth or expert cache than the
+    calibration's choice (``config.preset_calibrated``, moe/calibrate.py) was timed with: it would serve a setting
+    nobody measured under the name of one that was. ``slots``: the expert slots planned, None without an expert cache.
+    The cache may differ by as much as a stored calibration still answers for (decode_profile.SLOT_GROWTH)."""
+    from freetoken.moe import decode_profile
+
+    if getattr(config, "preset_calibrated", None) is None:  # duck-typed test configs omit it
+        return
+    name, strategy, drafts, timed_slots = config.preset_calibrated
+    served = config.speculative_num_steps if config.speculative_algorithm is not None else 0
+    wrong = []
+    if config.moe_strategy != strategy:
+        wrong.append(f"strategy {strategy} was timed, {config.moe_strategy} resolved")
+    if drafts is not None and served != drafts:
+        wrong.append(f"{drafts} draft tokens were timed, {served} resolved")
+    if timed_slots and slots is not None and abs(slots - timed_slots) > decode_profile.SLOT_GROWTH * timed_slots:
+        wrong.append(f"{timed_slots} expert slots were timed, {slots} planned")
+    if wrong:
+        raise RuntimeError(
+            f"--preset {config.preset} chose {name}, and this server would serve another setting: {'; '.join(wrong)} "
+            f"(KV reserve {config.kv_reserve_tokens} tokens). --calibrate-again times the candidates again; "
+            "--moe-strategy offload serves offload"
+        )
 
 
 def _preset_without_row(config, reason: str) -> tuple[str, None] | None:

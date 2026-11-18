@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import dataclasses
 import json
 import os
 import time
@@ -1563,10 +1564,10 @@ def test_what_single_serves_and_single_measured_times_at_each_memory_level(decod
         json.dump({"map_sha256": hashlib.sha256(open(path, "rb").read()).hexdigest()}, f)
     fields = ("moe_strategy", "max_running_req", "speculative_algorithm", "speculative_num_steps", "kv_reserve_tokens")
 
-    def single(threads):
+    def single(threads, **replay):
         monkeypatch.setattr(engine, "_cpu_pool_threads", lambda config: threads)
-        config = _resolved(decode_rows, preset="single", preset_fields=fields, max_running_req=1, speculative_algorithm="mtp",
-                           speculative_num_steps=3, kv_reserve_tokens=36864, max_seq_len_override=40960, **flags)
+        config = _resolved(decode_rows, **{"preset": "single", "preset_fields": fields, "max_running_req": 1, "speculative_algorithm": "mtp",
+                                           "speculative_num_steps": 3, "kv_reserve_tokens": 36864, "max_seq_len_override": 40960, **flags, **replay})
         served = (config.moe_strategy, config.speculative_num_steps, "map" if config.speculative_token_map == path else config.speculative_token_map)
         return served, config
 
@@ -1577,6 +1578,8 @@ def test_what_single_serves_and_single_measured_times_at_each_memory_level(decod
     args = SimpleNamespace(preset_fields=fields, moe_strategy="auto")
     static = (served[0], served[1], path if served[2] == "map" else None)
     assert [c[0] for c in calibrate.candidates(args, static, path)] == candidates8
+    # single-measured taking the static choice serves what --preset single serves
+    assert single(8, **calibrate._overrides(args, static[0], static[1], static=True, token_map=static[2]))[0] == served
     if not resident:
         assert [c[0] for c in calibrate.candidates(args, (fewer[0], fewer[1], None), path)] == ["offload@3", "hybrid@3", "hybrid@0", "offload@0"]
         # nor on an automatic plan under a fifth of the experts (engine._preset_hybrid_share_ok): only offload is timed
@@ -1829,9 +1832,14 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
         return {"tok_s": [[v, v] for v in speeds[strategy, depth]], "drafts": 100 if depth else 0, "early": speeds[strategy, depth], "cache_slots": 40,
                 "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": _ROW_FREE, "ready_s": 1.0}
 
+    calibrated = []  # what each start's server is to end up serving (engine._check_preset_calibrated)
+
     def starts(args, argv):
         before = len(started)
-        return calibrate.measured_choice(args, argv), len(started) - before
+        choice = calibrate.measured_choice(args, argv)
+        dataclasses.replace(args, **choice)  # as the launcher does (server/launch.py)
+        calibrated.append(choice.pop("preset_calibrated", None))
+        return choice, len(started) - before
 
     def free_now(free):
         monkeypatch.setattr(calibrate, "_probe_gpu", lambda args: (*_ROW_GPU, free))
@@ -1851,6 +1859,8 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     assert starts(args, argv) == ({"speculative_num_steps": 3}, 3)
     speeds["hybrid", 3] = hybrid
     assert starts(args, argv) == (hybrid_3, 3) and starts(args, argv) == (hybrid_3, 0)
+    # timed and read back alike, the server must serve the candidate's strategy and depth; the stored cache is the static choice's
+    assert calibrated[-2:] == [("hybrid@3", "hybrid", 3, None)] * 2
     assert started[-3:] == [("offload", 3), ("hybrid", 3), ("hybrid", 0)]  # offload kept its drafts: no offload@0
     # an automatic plan under a fifth of the experts (engine._preset_hybrid_share_ok, reported by the static choice's
     # process): no hybrid candidate is started, as its long prompts would run out of memory
@@ -1913,10 +1923,34 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     assert (choice["moe_strategy"], choice["speculative_num_steps"], choice["speculative_algorithm"]) == ("offload", 0, None)
     speeds["offload", 3] = [60.0, 90.0]
     assert starts(*parsed("--memory-ratio", "0.93")) == ({"speculative_num_steps": 3}, 3)  # hybrid with 3 drafts leads them all
+    assert calibrated[-1] == ("hybrid@3", "hybrid", 3, 40)  # the static choice: its server's expert cache is stored
     # an offload server that does not start leaves offload without drafts untimed too: it would be that same server
     kept_offload = speeds.pop(("offload", 3))
     assert starts(*parsed("--memory-ratio", "0.931")) == ({"speculative_num_steps": 3}, 3) and started[-1] == ("offload", 3)
     speeds["offload", 3] = kept_offload
+    # the static preset serves hybrid without its drafts (dropped before the load, for the size of the cache): taking it
+    # replays the static preset's own command line. Replayed as --speculative-algorithm off, the drafts would be typed,
+    # and a rule that keeps offload for typed drafts would serve offload under hybrid@0's timings
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: ("hybrid", 0, None, True))
+    choice, timed = starts(*parsed("--memory-ratio", "0.932"))
+    assert timed == 2 and started[-2:] == [("hybrid", 0), ("offload", 0)] and choice == {}
+    assert calibrated[-1] == ("hybrid@0", "hybrid", 0, 40)
+    assert starts(*parsed("--memory-ratio", "0.932")) == ({}, 0) and calibrated[-1] == ("hybrid@0", "hybrid", 0, 40)
+    # the server stops where it resolved another strategy, depth or cache than the one timed, and names both
+    from freetoken.engine.engine import _check_preset_calibrated
+
+    def check(slots=40, **served):
+        config = SimpleNamespace(**{"preset": "single-measured", "preset_calibrated": calibrated[-1], "moe_strategy": "hybrid",
+                                    "speculative_algorithm": None, "speculative_num_steps": 0, "kv_reserve_tokens": 36864, **served})
+        _check_preset_calibrated(config, slots)
+
+    check(), check(slots=42), check(slots=38)  # within the 5% a stored calibration answers for
+    for served, why in (({"moe_strategy": "offload"}, "strategy hybrid was timed, offload resolved"),
+                        ({"speculative_algorithm": "mtp", "speculative_num_steps": 3}, "0 draft tokens were timed, 3 resolved"),
+                        ({"slots": 43}, "40 expert slots were timed, 43 planned")):
+        with pytest.raises(RuntimeError, match=why) as stopped:
+            check(**served)
+        assert "chose hybrid@0" in str(stopped.value) and "--moe-strategy offload" in str(stopped.value)
     # where what the static preset serves cannot be read, a guess is not timed: the static preset runs
     monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: None)
     assert starts(*parsed("--memory-ratio", "0.94")) == ({}, 0)
@@ -1930,6 +1964,7 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     # left it (auto), so that auto still resolves it as it does for --preset single
     speeds["offload", 3] = [100.0, 200.0]
     assert third.moe_strategy == "auto" and starts(third, third_argv) == ({"speculative_num_steps": 3}, 3)
+    assert calibrated[-1] == ("offload@3", "offload", 3, 40)
     # the timings cannot be written (a full or read-only disk): their choice is served all the same, and the next start times again
     free_now(_ROW_FREE)
     fourth, fourth_argv = parsed("--memory-ratio", "0.7")
