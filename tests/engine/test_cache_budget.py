@@ -214,27 +214,58 @@ def test_preset_plan_leaves_a_prefill_chunk_of_working_memory_free_and_the_plain
 
 
 @pytest.mark.parametrize(
-    "reserve, slots, pages",
+    "reserve, soft, slots, pages",
     [
-        (0, 10, 100),  # every expert cached, KV holds 90 pages above its floor of 10
-        (300, 10, 70),  # the pages above the floor cover the reserve: the slots are untouched
-        (900, 10, 10),  # exactly the pages above the floor
-        (1200, 7, 10),  # 300 B more than those pages: three slots pay the rest
-        (5000, 4, 10),  # more than the plan can give: both caches at their floors, and the plan still stands
+        (0, 0, 10, 100),  # every expert cached, KV holds 90 pages above its floor of 10
+        (300, 0, 10, 70),  # the pages above the floor cover the reserve: the slots are untouched
+        (900, 0, 10, 10),  # exactly the pages above the floor
+        (1200, 0, 7, 10),  # 300 B more than those pages: three slots pay the rest
+        (5000, 0, 4, 10),  # more than the plan can give: both caches at their floors, and the plan still stands
+        # a soft KV floor of 30 pages
+        (300, 30, 10, 70),  # KV is above it after the reserve: the plan without it
+        (900, 30, 8, 30),  # the reserve would leave KV at 10: two slots pay for the 20 pages
+        (1400, 30, 4, 20),  # the slot floor leaves 20 pages: KV gets those and the plan still stands
+        (5000, 30, 4, 10),  # the reserve comes first: nothing is left for the soft floor
     ],
 )
-def test_reserve_comes_out_of_kv_above_its_floor_before_expert_slots(reserve, slots, pages):
+def test_reserve_comes_out_of_kv_above_its_floor_before_expert_slots(reserve, soft, slots, pages):
     plan = dict(
         budget_bytes=2000, per_expert_bytes=100, cache_per_page=10, num_experts=2, total_experts=10,
         prefill_overlap=True, kv_reserve_pages=10, max_slots=10,
     )
-    assert plan_cache_budget(**plan, reserve_bytes=reserve)[:2] == (slots, pages)
+    assert plan_cache_budget(**plan, reserve_bytes=reserve, kv_soft_pages=soft)[:2] == (slots, pages)
     # what is left out of the caches is the reserve, or all the floors (4 slots, 10 pages) leave of it
     assert 2000 - slots * 100 - pages * 10 >= min(reserve, 2000 - 4 * 100 - 10 * 10)
     # a budget the floors do not fit fails as it does without a reserve, the same bytes short
     with pytest.raises(CacheBudgetTooSmall) as short:
-        plan_cache_budget(**{**plan, "budget_bytes": 480}, reserve_bytes=reserve)
+        plan_cache_budget(**{**plan, "budget_bytes": 480}, reserve_bytes=reserve, kv_soft_pages=soft)
     assert short.value.short == 20
+
+
+def test_kv_soft_floor_costs_slots_only_where_kv_is_short_of_it():
+    # a slot is about 79 KV tokens, a page 16 tokens; the soft floor of 9219 tokens is 577 pages over a hard floor of 512
+    pe, pp, lo, soft_pages, reserve = 1264, 256, 512, 577, 800_000
+    plan = dict(
+        weights_bytes=0, memory_ratio=1.0, fixed_cache_size=0, per_expert_bytes=pe, cache_per_page=pp, num_experts=256,
+        total_experts=10240, prefill_overlap=True, kv_reserve_tokens=8192, page_size=16, reserve_bytes=reserve,
+    )
+    floors = lo * pe + 512 * pp
+    equal = 0
+    # from both caches at their floors to every expert cached with KV to spare
+    for budget in range(floors, 10240 * pe + 700 * pp + reserve, 997):
+        old = resolve_moe_cache_auto(baseline_free=budget, **plan)
+        new = resolve_moe_cache_auto(baseline_free=budget, **plan, kv_soft_tokens=9219)
+        # the soft floor never comes out of the reserve
+        assert budget - new[0] * pe - new[1] * pp >= min(reserve, budget - floors)
+        if old[1] >= soft_pages:
+            assert new == old
+            equal += 1
+            continue
+        # KV reaches the soft floor, or gets every page the slots above their floor can pay for
+        assert new[1] >= min(soft_pages, old[1] + (old[0] - lo) * pe // pp)
+        # and no more slots go than the missing pages cost
+        assert 0 <= (old[0] - new[0]) * pe < (soft_pages - old[1]) * pp + pe
+    assert equal
 
 
 def test_prefill_overlap_false_is_honored():
@@ -452,6 +483,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
         has_swa_attention = False
         num_experts = 4
         num_moe_layers = 2  # total_experts = 8
+        hidden_size = 64
 
         def kv_cache_group_specs(self):
             return [KVCacheGroupSpec(
@@ -465,6 +497,9 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
         dtype = torch.float16
         page_size = 16
         max_running_req = 4
+        max_seq_len, max_forward_len = 1 << 20, 256
+        num_page_override = None
+        decode_rows_per_req = 1
         hybrid_swa_cache_mode = "auto"
         memory_ratio = 0.9
         moe_prefill_overlap = True
@@ -544,11 +579,11 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
         engine._settle_preset_kv_reserve(config, StubBanks(), None, None)
         size, pages, _ = engine._resolve_auto_moe_cache_size(config, StubBanks())
         if kept is None:
-            # 16384 tokens do not fit in 70 MiB: the largest reserve that keeps the slots of a server without the preset
+            # 16384 tokens do not fit in 70 MiB: the largest reserve that keeps the slots of a server without the preset.
+            # Both leave the prefill chunk's working memory free, so one page more costs slots: here down to their floor
             assert default < config.kv_reserve_tokens < 16384 and size >= plain[0]
             config.kv_reserve_tokens += 16
-            with pytest.raises(ValueError, match="budget too small"):
-                engine._resolve_auto_moe_cache_size(config, StubBanks())
+            assert engine._resolve_auto_moe_cache_size(config, StubBanks())[0] == 4 < plain[0]
             config.kv_reserve_tokens -= 16
         else:
             assert config.kv_reserve_tokens == kept  # never more than the model's context, never less than the default
@@ -561,24 +596,26 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
     assert stages[-1][1] == engine._auto_cache_terms(config, StubBanks())
     assert stages[0][1]["kv_reserve_tokens"] == stages[1][1]["kv_reserve_tokens"] == default
     assert stages[0][1]["fixed_cache_size"] > stages[1][1]["fixed_cache_size"]  # the linear states of 4 requests, then of 1
-    # a preset's memory ratio comes with the working memory of one prefill chunk left free, as a step of its own in the account;
-    # a typed ratio gets no reserve, and a model whose prefill is not accounted for keeps the default ratio
+    # every automatic plan leaves the working memory of one prefill chunk free, under a typed ratio as under a preset's, and
+    # counts it once: the preset's own reserve is for the KV pools no plan sizes. A model whose prefill is not accounted
+    # for keeps the default ratio
     from freetoken.engine.cache_budget import prefill_working_bytes
 
     config.dtype, config.max_forward_len, config.model_config.hidden_size, config.memory_ratio = torch.bfloat16, 256, 64, 0.95
     need = prefill_working_bytes(256, hidden=64, key_dim=32, value_dim=64, value_heads=4, head_dim=16, chunk=64, itemsize=2)
     typed = engine._auto_cache_terms(config, StubBanks())
-    assert engine._preset_prefill_reserve(config) == 0 == typed["reserve_bytes"]
+    assert engine._preset_prefill_reserve(config) == 0 and typed["reserve_bytes"] == need > 0
     config.preset_fields = ("max_running_req", "memory_ratio", "kv_reserve_tokens")
-    assert engine._preset_prefill_reserve(config) == need > 0
-    # the planner gets it as bytes neither cache takes, not as a fixed cost: KV pages above the reserve pay first
-    assert engine._auto_cache_terms(config, StubBanks()) == {**typed, "reserve_bytes": need}
+    assert engine._preset_prefill_reserve(config) == need
+    # the planner gets it as bytes neither cache takes, not as a fixed cost, and the preset's ratio adds no second reserve
+    assert engine._auto_cache_terms(config, StubBanks()) == typed
     stages = engine._preset_stages(config, StubBanks(), None, None)
-    assert [label.split(" left free")[0] for label, _ in stages[2:4]] == ["--memory-ratio 0.95", f"{need / 2**30:.2f} GiB"]
-    assert (stages[2][1]["reserve_bytes"], stages[3][1]["reserve_bytes"]) == (0, need) and stages[0][1]["memory_ratio"] == 0.9
+    # the plan without the preset's settings leaves the chunk free too, so it is no step of the account
+    assert [label for label, _ in stages] == ["", "--max-running-requests 1", "--memory-ratio 0.95", "--kv-reserve-tokens 16384"]
+    assert [t["reserve_bytes"] for _, t in stages] == [need] * 4 and stages[0][1]["memory_ratio"] == 0.9
     # every expert has a slot here, so the chunk costs KV tokens and no slot
-    with_chunk, without = resolve_moe_cache_auto(**stages[3][1]), resolve_moe_cache_auto(**stages[2][1])
-    assert with_chunk[0] == without[0] == 8 and 0 < (without[1] - with_chunk[1]) * stages[3][1]["cache_per_page"] - need < stages[3][1]["cache_per_page"]
+    with_chunk, without = resolve_moe_cache_auto(**stages[2][1]), resolve_moe_cache_auto(**{**stages[2][1], "reserve_bytes": 0})
+    assert with_chunk[0] == without[0] == 8 and 0 < (without[1] - with_chunk[1]) * stages[2][1]["cache_per_page"] - need < stages[2][1]["cache_per_page"]
     assert stages[-1][1] == engine._auto_cache_terms(config, StubBanks())
     engine._settle_preset_memory_ratio(config)
     assert config.memory_ratio == 0.95
@@ -639,12 +676,39 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
     # a typed --kv-reserve-tokens is not the preset's to lower: the chunk is shorted and the warning says so
     reserve, kept, warned = settled(1024, need // 2, preset=("max_running_req", "memory_ratio"))
     assert reserve == 16384 and kept < need and len(warned) == 1
-    assert settled(1024, 0, preset=()) == (16384, 0, [])  # without the preset: no reserve, nothing lowered, nothing said
+    # without the preset the plan keeps the chunk free as well, and nothing is lowered: a plan at its floors says what it holds
+    config.preset = None
+    reserve, kept, warned = settled(1024, 0, preset=())
+    assert (reserve, len(warned)) == (16384, 1) and kept < prefill_working_bytes(1, **cut)
+    assert warned[0].startswith("--moe-cache-auto: the plan leaves") and "no prefill chunk fits" in warned[0]
+    config.preset = "single"
     config.preset_fields, config.max_forward_len = fields, 256
     del engine._preset_reserve_kept
     config.model_config.linear_attention_group = lambda: None
     engine._settle_preset_memory_ratio(config)
     assert config.memory_ratio == 0.9 and "memory_ratio" not in config.preset_fields and engine._preset_prefill_reserve(config) == 0
+
+
+@pytest.mark.parametrize("rows", [1, 4])  # no drafts, and MTP with 3 draft tokens
+def test_prefill_kv_hold_leaves_a_prompt_of_one_chunk_its_reply(rows):
+    from freetoken.engine.config import EngineConfig
+    from freetoken.engine.engine import _prefill_kv_tokens, _seq_limits
+
+    def config(**over):
+        fields = dict(
+            kv_reserve_tokens=EngineConfig.kv_reserve_tokens, num_page_override=None, decode_rows_per_req=rows,
+            max_seq_len=262144, page_size=1,
+        )
+        return SimpleNamespace(**{**fields, **over})
+
+    # the scheduler refuses a prompt that is not under the longest request, and caps the reply at the difference:
+    # a pool of the default floor refuses a prompt of the default chunk, the held pool gives it 1024 tokens
+    assert _seq_limits(config(), EngineConfig.kv_reserve_tokens)[0] - 8192 <= 0
+    assert _seq_limits(config(), _prefill_kv_tokens(config(), 8192))[0] - 8192 == 1024
+    # a floor or a KV size the user typed is left as typed
+    assert _prefill_kv_tokens(config(kv_reserve_tokens=2048), 8192) == 0
+    assert _prefill_kv_tokens(config(kv_reserve_tokens=36864), 8192) == 0
+    assert _prefill_kv_tokens(config(num_page_override=8192), 8192) == 0
 
 
 def test_prefill_working_bytes_counts_gdn_models_only():

@@ -108,6 +108,7 @@ def plan_cache_budget(
     kv_reserve_pages: int,
     max_slots: int,
     reserve_bytes: int = 0,
+    kv_soft_pages: int = 0,
 ) -> tuple[int, int, bool]:
     """Split ``budget_bytes`` MoE-first into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -121,6 +122,10 @@ def plan_cache_budget(
     KV pages above ``kv_reserve_pages`` pay for them first and expert slots pay the rest;
     neither goes under its floor, so a budget that cannot afford the whole reserve keeps
     less of it rather than failing.
+
+    ``kv_soft_pages`` is a KV floor that cannot fail a plan: KV gets that many pages ahead
+    of the expert slots above their floor when the budget has them after the reserve, and
+    what it has otherwise, never under ``kv_reserve_pages``.
     """
     assert per_expert_bytes > 0, "per_expert_bytes must be positive"
     assert cache_per_page > 0, "cache_per_page must be positive (owned-KV models unsupported here)"
@@ -138,8 +143,9 @@ def plan_cache_budget(
     # the slot floor and the KV reserve, or the two pages the plan needs at least.
     floors = lo * per_expert_bytes + max(kv_reserve_pages, 2) * cache_per_page
     budget_bytes -= max(0, min(reserve_bytes, budget_bytes - floors))
-    # MoE-priority: reserve KV first, then experts greedily take the remaining budget.
-    raw = (budget_bytes - kv_reserve_bytes) // per_expert_bytes
+    # MoE-priority: reserve KV first, then experts greedily take the remaining budget. A soft
+    # floor the budget cannot pay puts the slots at their floor (the clamp below), no lower.
+    raw = (budget_bytes - max(kv_reserve_bytes, kv_soft_pages * cache_per_page)) // per_expert_bytes
     moe_cache_size = max(lo, min(raw, hi))
     # A tiny budget may have forced moe_cache_size below 2*num_experts even with overlap on.
     overlap = overlap and moe_cache_size >= 2 * num_experts
@@ -176,11 +182,13 @@ def resolve_moe_cache_auto(
     page_size: int,
     max_slots: int | None = None,
     reserve_bytes: int = 0,
+    kv_soft_tokens: int = 0,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
     ``max_slots`` is the expert kernel's addressable slot limit; the plan never exceeds it.
-    ``reserve_bytes`` is plan_cache_budget's: bytes neither cache may take.
+    ``reserve_bytes`` is plan_cache_budget's: bytes neither cache may take. ``kv_soft_tokens``
+    is its soft KV floor, in tokens.
 
     Applies memory_ratio to the persisted pre-model baseline exactly once, then defers
     the MoE-vs-KV split to plan_cache_budget. The (1-memory_ratio) remainder is the
@@ -199,6 +207,7 @@ def resolve_moe_cache_auto(
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
         reserve_bytes=reserve_bytes,
+        kv_soft_pages=div_ceil(kv_soft_tokens, page_size),
     )
 
 
@@ -329,14 +338,15 @@ def budget_advice(stages: list[tuple[str, dict]], min_reserve_tokens: int) -> st
 
 def plan_resident_staging(plan: tuple[int, int, bool], terms: dict, staging_slots: int, slot_limit: int | None = None) -> tuple[int, int, bool]:
     """``plan`` (resolve_moe_cache_auto's for ``terms``) with ``staging_slots`` more expert slots, paid for in KV pages;
-    ``plan`` itself where it does not hold every expert, or the KV reserve or the kernel's ``slot_limit`` would not hold.
+    ``plan`` itself where it does not hold every expert, or the KV reserve, its soft floor or the kernel's ``slot_limit``
+    would not hold.
 
     A prefill reads the slots as decode does once every expert has one outside the prefill staging buffers
     (OffloadMoeCache.all_resident), which a cache of one slot an expert never reaches: the buffers lie over its first slots.
     """
     slots, pages, overlap = plan
     cost = div_ceil(staging_slots * terms["per_expert_bytes"], terms["cache_per_page"])
-    reserve = div_ceil(terms["kv_reserve_tokens"], terms["page_size"])
+    reserve = div_ceil(max(terms["kv_reserve_tokens"], terms.get("kv_soft_tokens", 0)), terms["page_size"])
     if staging_slots <= 0 or not overlap or slots < terms["total_experts"] or pages - cost < max(reserve, 2):
         return plan
     if slot_limit is not None and slots + staging_slots > slot_limit:
