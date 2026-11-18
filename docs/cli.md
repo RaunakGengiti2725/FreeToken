@@ -228,7 +228,11 @@ resident: `fused` with 5 draft tokens and the store's draft token map (below), w
 preset serves it, and with 3 draft tokens; with only one of the two, nothing is timed. With an
 expert cache that holds part of the experts: `hybrid` and `offload` with 3 draft tokens and `hybrid`
 with none; `offload` with none is the `offload` server where that one drops its drafts for the size
-of the cache (above), and is not timed where it keeps them. 4 and 5 draft tokens without the map are
+of the cache (above), and is not timed where it keeps them. Where an automatic expert cache holds
+under 20% of the experts, `--preset single` serves `offload`, and the `hybrid` candidates are timed
+too, `hybrid` with no drafts before `hybrid` with 3, but not chosen where their server's plan leaves
+less than a prefill chunk's working memory free or lowers the KV reserve the preset asks for: their
+short windows do not show the long prompts, which ran out of memory with less than that free. 4 and 5 draft tokens without the map are
 not candidates. Each candidate is one server start that decodes two built-in prompts (a math
 problem and a coding task) twice over, with the checkpoint's sampling: N timed tokens after 1024
 warm-up tokens that fill the expert cache, then N timed tokens after 256 warm-up tokens on the

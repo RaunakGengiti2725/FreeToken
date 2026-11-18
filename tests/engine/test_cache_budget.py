@@ -473,7 +473,7 @@ def test_mha_kv_cost_simple_full_attention():
     assert fixed == 0
 
 
-def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
+def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch, tmp_path):
     import torch
 
     from freetoken.engine.engine import Engine
@@ -571,12 +571,23 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
     # where not, the default reserve is back and the field is no longer the preset's
     from freetoken.engine.config import EngineConfig
 
+    from freetoken.engine import engine as eng
+    from freetoken.moe import calibrate
+
     default = EngineConfig.kv_reserve_tokens
+    log = tmp_path / "server.log"
     for free, context, kept in ((200 << 20, 1 << 20, 16384), (200 << 20, 12288, 12288), (200 << 20, 4096, default), (70 << 20, 1 << 20, None)):
         engine._baseline_free, engine._weights_bytes, config.max_seq_len = free, 0, context
         config.preset, config.preset_fields, config.kv_reserve_tokens = "single", ("max_running_req", "kv_reserve_tokens"), 16384
         plain = resolve_moe_cache_auto(**engine._preset_stages(config, StubBanks(), None, None)[0][1])  # a server without the preset
-        engine._settle_preset_kv_reserve(config, StubBanks(), None, None)
+        lines = []
+        with monkeypatch.context() as m:
+            m.setattr(eng.logger, "info_rank0", lines.append)
+            m.setattr(eng.logger, "warning_rank0", lines.append)
+            engine._settle_preset_kv_reserve(config, StubBanks(), None, None)
+        # what --preset single-measured reads off a hybrid candidate's log: a reserve the context caps is not short of it
+        log.write_text("\n".join(lines))
+        assert calibrate._plan_short(str(log)) == (None if kept else "the preset's KV reserve"), context
         size, pages, _ = engine._resolve_auto_moe_cache_size(config, StubBanks())
         if kept is None:
             # 16384 tokens do not fit in 70 MiB: the largest reserve that keeps the slots of a server without the preset.
@@ -656,17 +667,24 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
         config.kv_reserve_tokens, config.preset_fields = 16384, preset
         budget = t["fixed_cache_size"] + 4 * t["per_expert_bytes"] + kv_pages * page_bytes + more
         engine._baseline_free = -(-budget * 20 // 19) + 1  # the ratio is 0.95
-        warned = []
-        with patch.object(eng.logger, "warning_rank0", warned.append), patch.object(eng.logger, "info_rank0", lambda line: None):
+        warned, said = [], []
+        with patch.object(eng.logger, "warning_rank0", warned.append), patch.object(eng.logger, "info_rank0", said.append):
             engine._settle_preset_chunk_reserve(config, StubBanks(), None, None)
         kept = reserve_kept(engine._auto_cache_terms(config, StubBanks()))
         assert engine._resolve_auto_moe_cache_size(config, StubBanks())[1] * 16 >= config.kv_reserve_tokens  # the plan stands
+        log.write_text("\n".join(said + warned))
+        shorts.append(calibrate._plan_short(str(log)))
         return config.kv_reserve_tokens, kept, warned
 
-    assert settled(1024, need) == (16384, need, [])  # room for both
+    # what --preset single-measured reads off a hybrid candidate's server log, from the lines this server writes
+    shorts = []
+
+    assert settled(1024, need) == (16384, need, []) and shorts[-1] is None  # room for both
     assert settled(1024, need - 3 * page_bytes) == (16384 - 3 * 16, need, [])  # three pages short: three pages of reserve go
-    assert settled(576, need) == (9216, need, [])
+    assert shorts[-1] == "the preset's KV reserve"
+    assert settled(576, need) == (9216, need, []) and shorts[-1] == "the preset's KV reserve"
     reserve, kept, warned = settled(576, need // 2)  # not even at 8192 + 1024 tokens: the reserve stops there, and the log says what is kept
+    assert shorts[-1] == "a prefill chunk's working memory free or the preset's KV reserve"
     assert reserve == 9216 and need // 2 <= kept < need // 2 + page_bytes and len(warned) == 1
     longest = int(warned[0].split("a prompt longer than ")[1].split(" tokens")[0])
     assert prefill_working_bytes(longest, **cut) <= kept < prefill_working_bytes(longest + 1, **cut) and 2048 < longest < 8192
@@ -676,7 +694,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
     assert reserve == 9216 and kept < prefill_working_bytes(1, **cut) and "no prefill chunk fits" in warned[0] and "length 0" not in warned[0]
     # a typed --kv-reserve-tokens is not the preset's to lower: the chunk is shorted and the warning says so
     reserve, kept, warned = settled(1024, need // 2, preset=("max_running_req", "memory_ratio"))
-    assert reserve == 16384 and kept < need and len(warned) == 1
+    assert reserve == 16384 and kept < need and len(warned) == 1 and shorts[-1] == "a prefill chunk's working memory free"
     # without the preset the plan keeps the chunk free as well, and nothing is lowered: a plan at its floors says what it holds
     config.preset = None
     reserve, kept, warned = settled(1024, 0, preset=())
@@ -1581,9 +1599,7 @@ def test_what_single_serves_and_single_measured_times_at_each_memory_level(decod
     assert single(8, **calibrate._overrides(args, static[0], static[1], static=True, token_map=static[2]))[0] == served
     if not resident:
         assert [c[0] for c in calibrate.candidates(args, (fewer[0], fewer[1], None), path)] == ["offload@3", "hybrid@3", "hybrid@0", "offload@0"]
-        # nor on an automatic plan under a fifth of the experts (engine._preset_hybrid_share_ok): only offload is timed
-        assert [c[0] for c in calibrate.candidates(args, ("offload", 3, None), path, hybrid=False)] == ["offload@3", "offload@0"]
-        # nor is hybrid a candidate where its server would not start
+        # hybrid is not a candidate where its server would not start
         for typed in ({"reproducible_seeds": True}, {"moe_prefill_demand_tokens": 256}):
             assert [c[0] for c in calibrate.candidates(SimpleNamespace(**vars(args), **typed), ("offload", 3, None), path)] == ["offload@3", "offload@0"]
 
@@ -1745,7 +1761,7 @@ def test_preset_loads_short_prefill_chunks_on_demand_only_into_a_gpu_decoded_cac
 # ---- --preset single-measured (moe/calibrate.py): its rule, the timings it keeps in the decode profile, its fallback ----
 
 
-def test_calibration_takes_the_largest_worst_lead_above_the_margin_and_times_two_passes_on_a_filled_cache(monkeypatch):
+def test_calibration_takes_the_largest_worst_lead_above_the_margin_and_times_two_passes_on_a_filled_cache(monkeypatch, tmp_path):
     from freetoken.moe import benchdecode, calibrate
     from freetoken.moe.calibrate import MARGIN, choose
 
@@ -1783,13 +1799,24 @@ def test_calibration_takes_the_largest_worst_lead_above_the_margin_and_times_two
         seen.update(passes=ns.seeds, warm=ns.warm, decode=ns.decode, warm_after=warm_after, timeout=ns.server_timeout, extra=extra,
                     prompts=[name for name, _ in single], together=together, env=benchdecode.serve_cmd(ns, extra, arm, rate, 1)[1])
         cols = [{"tok_s": (a + b) / 2, "seeds": [{"tok_s": a}, {"tok_s": b}], "draft_n": 4, "early": a, "gave_up": False} for a, b in ((90.0, 110.0), (180.0, 220.0))]
-        return {"tok_s": [c["tok_s"] for c in cols], "results": cols, "cache_slots": 40, "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": None, "ready_s": 1.0}
+        return {"tok_s": [c["tok_s"] for c in cols], "results": cols, "cache_slots": 40, "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": None, "ready_s": 1.0,
+                "log": str(server_log)}
+
+    # the server's own line where its plan keeps less than a prefill chunk's working memory free
+    server_log = tmp_path / "server.log"
+    server_log.write_text("--preset single: the plan leaves 0.31 GiB free for a prefill, and a chunk of 8192 tokens works in about 0.65 GiB: ...\n")
 
     monkeypatch.setattr(benchdecode, "run_arm", run_arm)
     monkeypatch.setattr(benchdecode, "eos_strings", lambda model: ())
     argv = ["--preset", "single-measured", "--calibrate-again", "--memory-ratio", "0.8"]
     timed = calibrate._time_candidate(SimpleNamespace(model_path="/models/anon"), argv, "offload", 3, ready_s=123.9)
     assert timed["tok_s"] == [[90.0, 110.0], [180.0, 220.0]] and timed["drafts"] == 8
+    assert timed["short"] == "a prefill chunk's working memory free" and not timed["no_drafts"]
+    # a log that cannot be read does not say the plan kept the reserves
+    server_log.unlink()
+    timed = calibrate._time_candidate(SimpleNamespace(model_path="/models/anon"), argv, "offload", 3, ready_s=123.9)
+    assert "could not be read" in timed["short"] and not timed["no_drafts"]
+    server_log.write_text("")
     assert seen["passes"] == calibrate.PASSES >= 2 and seen["warm"] == calibrate.WARM >= 1024
     # 512 timed tokens with every expert resident, where 256 misranked the map's depth; 256 on an expert cache, so that
     # the budget holds a second load
@@ -1822,6 +1849,7 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
               ("hybrid", 0): [70.0, 120.0], ("offload", 5): [105.0, 190.0], ("hybrid", 5): [110.0, 195.0],
               ("offload", 4): [102.0, 195.0], ("hybrid", 4): [100.0, 190.0]}
     started = []
+    kept_less = {}  # (strategy, depth): what its server's plan did not keep (calibrate._plan_short)
 
     def time_candidate(args, argv, strategy, depth, floors=None, ready_s=None, token_map=None, left_s=None):
         depth = f"{depth}map" if token_map else depth
@@ -1829,7 +1857,7 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
         if (strategy, depth) not in speeds:
             raise RuntimeError("server exited with code 1 during startup")
         return {"tok_s": [[v, v] for v in speeds[strategy, depth]], "drafts": 100 if depth else 0, "early": speeds[strategy, depth], "cache_slots": 40,
-                "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": _ROW_FREE, "ready_s": 1.0}
+                "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": _ROW_FREE, "ready_s": 1.0, "short": kept_less.get((strategy, depth))}
 
     calibrated = []  # what each start tells its server of the choice and of the static choice (engine._serve_as_timed)
 
@@ -1844,17 +1872,17 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
 
     engine = decode_rows.engine
 
-    def serve(choice, entry, drafts_ok=True, whole=False, **flags):
-        """What a server started with ``choice`` and ``entry`` serves at 12 GiB free with a CPU pool of 4 threads: the
-        command line as parsed (``flags`` on top of the preset's fields), replaced as the launcher replaces it and resolved
-        by the engine's own _adjust_config. Without ``drafts_ok`` the draft's checks fail on this start, and the preset
-        serves without its drafts (engine._adjust_preset_spec_config)."""
+    def serve(choice, entry, drafts_ok=True, whole=False, level="12 GiB", threads=4, **flags):
+        """What a server started with ``choice`` and ``entry`` serves at ``level`` free (12 GiB) with a CPU pool of
+        ``threads`` (4): the command line as parsed (``flags`` on top of the preset's fields), replaced as the launcher
+        replaces it and resolved by the engine's own _adjust_config. Without ``drafts_ok`` the draft's checks fail on
+        this start, and the preset serves without its drafts (engine._adjust_preset_spec_config)."""
         with monkeypatch.context() as m:
             m.setattr(engine, "_adjust_spec_config", (lambda config, override, windowed_kv: None) if drafts_ok else no_drafts_on_this_start)
-            m.setattr(engine, "_cpu_pool_threads", lambda config: 4)
+            m.setattr(engine, "_cpu_pool_threads", lambda config: threads)
             m.setattr(engine, "_preset_takes_fused", lambda config: False)
             m.setattr(engine, "_preset_every_expert_fits", lambda config: False)
-            m.setattr(engine, "_preset_expert_share", lambda config: _LEVEL_SHARE["12 GiB"])
+            m.setattr(engine, "_preset_expert_share", lambda config: _LEVEL_SHARE[level])
             config = _resolved(decode_rows, **{"preset": "single-measured", "preset_fields": parsed()[0].preset_fields, "max_running_req": 1,
                                            "speculative_algorithm": "mtp", "speculative_num_steps": 3, "kv_reserve_tokens": 36864,
                                            "max_seq_len_override": 40960, **flags, **choice, "preset_calibrated": entry})
@@ -1924,12 +1952,48 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
         engine._log_preset_calibrated(serve({}, dict(chosen["static"], drafts=0), whole=True), 40)
         assert lines[-1][0] == "warning" and "3 draft tokens" in lines[-1][1] and "ran with strategy offload, 0 draft tokens" in lines[-1][1]
     # an automatic plan under a fifth of the experts (engine._preset_hybrid_share_ok, reported by the static choice's
-    # process): no hybrid candidate is started, as its long prompts would run out of memory
+    # process). With a pool of 16 threads the static preset serves hybrid at 12 GiB's share and offload at 8 GiB's,
+    # and it still does: the static choice is not changed
+    assert serve({}, None, threads=16)[:3] == ("hybrid", "mtp", 3) and serve({}, None, level="8 GiB", threads=16)[:3] == ("offload", "mtp", 3)
+    # the hybrid candidates are timed beside it, under a key of their own, hybrid without drafts first: where their
+    # servers' plans kept a prefill chunk's working memory free and the preset's KV reserve, the fastest is chosen, and
+    # served as timed
     monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: ("offload", 3, None, False))
     small, small_argv = parsed("--memory-ratio", "0.55")
-    choice, timed = starts(small, small_argv)
-    assert timed == 1 and started[-1] == ("offload", 3) and choice == {"speculative_num_steps": 3}
+    assert starts(small, small_argv) == (hybrid_3, 3) and started[-3:] == [("offload", 3), ("hybrid", 0), ("hybrid", 3)]
+    assert calibrated[-1]["key"].endswith(":offload@3,hybrid@0,hybrid@3,offload@0|hybrid=reserved")
+    assert ran_with(calibrated[-1]) == ("hybrid@3", "hybrid", 3, 3, 40) and ran_with(calibrated[-1]["static"])[:2] == ("offload@3", "offload")
+    assert serve(hybrid_3, calibrated[-1], level="8 GiB", threads=16)[:3] == ("hybrid", "mtp", 3)
+    # where they kept less, they are timed and not chosen: the static choice is served, and the stored row says why, so
+    # the next start times nothing
+    said = []
+    kept_less["hybrid", 0] = kept_less["hybrid", 3] = "a prefill chunk's working memory free"
+    small, small_argv = parsed("--memory-ratio", "0.56")
+    with monkeypatch.context() as m:
+        m.setattr(calibrate.logger, "info", said.append)
+        assert starts(small, small_argv) == ({"speculative_num_steps": 3}, 3) and started[-2:] == [("hybrid", 0), ("hybrid", 3)]
+        assert "not timed: hybrid@0 (under a fifth of the experts its plan kept less than a prefill chunk's working memory free)" in said[-2]
+        assert "hybrid@3 (under a fifth of the experts its plan kept less than a prefill chunk's working memory free)" in said[-2]
+        assert starts(small, small_argv) == ({"speculative_num_steps": 3}, 0) and "taking offload@3" in said[-2]
+    # a plan of a fifth of the experts or more times and chooses hybrid as before, whatever its plan kept
     monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: (static_strategy[0], 3, None, True))
+    assert starts(*parsed("--memory-ratio", "0.57")) == (hybrid_3, 3)
+    # hybrid without drafts, where its plan kept the reserves and hybrid@3's did not, is served as timed: hybrid, drafts off
+    del kept_less["hybrid", 0]
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: ("offload", 3, None, False))
+    speeds["hybrid", 0] = [170.0, 240.0]
+    hybrid_0, _ = starts(*parsed("--memory-ratio", "0.58"))
+    assert (hybrid_0["moe_strategy"], hybrid_0["speculative_algorithm"], hybrid_0["speculative_num_steps"]) == ("hybrid", None, 0)
+    served = serve(hybrid_0, calibrated[-1], level="8 GiB", threads=16, whole=True)
+    assert (served.moe_strategy, served.speculative_algorithm, served.kv_reserve_tokens, served.moe_cache_auto) == ("hybrid", None, 36864, True)
+    speeds["hybrid", 0] = [70.0, 120.0]
+    del kept_less["hybrid", 3]
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: (static_strategy[0], 3, None, True))
+    # the rule on the 8 GiB timings of two boxes (GPU_LOG 799, 801): offload (its drafts dropped) against hybrid without
+    # drafts. B's lead of +8.2% / +4.6% is under the margin, F's +32.8% / +22.0% is over it
+    names8 = ["offload@3", "hybrid@0", "hybrid@3"]
+    assert calibrate.choose({"offload@3": [[111.0] * 2, [138.1] * 2], "hybrid@0": [[120.1] * 2, [144.5] * 2]}, names8) == ("offload@3", 0.0)
+    assert calibrate.choose({"offload@3": [[129.4] * 2, [158.5] * 2], "hybrid@0": [[171.8] * 2, [193.3] * 2]}, names8) == ("hybrid@0", pytest.approx(0.2196, abs=1e-3))
     # a candidate that fails on two starts in a row is left out from then on, not timed at every start
     del speeds["hybrid", 0]
     again, again_argv = parsed("--memory-ratio", "0.6")

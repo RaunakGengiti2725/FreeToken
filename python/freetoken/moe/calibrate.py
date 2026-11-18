@@ -153,7 +153,7 @@ def stored_token_map(args) -> tuple[str, str] | None:
     return path, sha
 
 
-def candidates(args, static: tuple[str, int, str | None], token_map: str | None = None, hybrid: bool = True) -> list[tuple[str, str, int | None, str | None]]:
+def candidates(args, static: tuple[str, int, str | None], token_map: str | None = None, reserved: bool = False) -> list[tuple[str, str, int | None, str | None]]:
     """(name, strategy, depth, token map) of every candidate, in the order they are timed, the static preset's choice
     first. ``static``: (strategy, draft tokens, draft token map) the static preset resolves to (_static_choice).
     ``token_map``: the store's map for this checkpoint (stored_token_map). A depth of None leaves speculative
@@ -165,8 +165,10 @@ def candidates(args, static: tuple[str, int, str | None], token_map: str | None 
     strategy first; hybrid without drafts comes second where the static choice is hybrid, since a load of each is
     about all the budget holds, and it was the fastest setting at 8 GiB free. offload with none is timed only where
     offload's server drops its drafts for the size of the cache (engine._settle_preset_drafts): that server is it.
-    Without ``hybrid`` (an automatic plan under a fifth of the experts, engine._preset_hybrid_share_ok) no hybrid
-    candidate is timed: on short windows it could be chosen, and long prompts then run out of memory."""
+    On an automatic plan under a fifth of the experts (``reserved``, engine._preset_hybrid_share_ok) the hybrid
+    candidates are timed too, hybrid without drafts before hybrid at the preset's depth: on such a plan it is the one
+    that answered long prompts, and the budget may not hold both. Either is chosen only where its own plan kept the
+    reserves (_measure)."""
     left = args.preset_fields
     drafts = "speculative_algorithm" in left and "speculative_num_steps" in left
     strategy, depth, served = static
@@ -195,10 +197,10 @@ def candidates(args, static: tuple[str, int, str | None], token_map: str | None 
         out.append(cand("hybrid", 0))
     out += [cand(s, depth) for s in others]
     if strategy != "hybrid" and "hybrid" in others:
-        out.append(cand("hybrid", 0))
+        out.insert(out.index(cand("hybrid", depth)) if reserved else len(out), cand("hybrid", 0))
     if "offload" in (strategy, *others):
         out.append(cand("offload", 0))
-    return out if hybrid else [c for c in out if c[1] != "hybrid"]
+    return out
 
 
 def choose(tok_s: dict, names: list[str], margin: float = MARGIN) -> tuple[str, float]:
@@ -314,15 +316,33 @@ def child_flags(argv: list[str], depth: int | None, token_map: str | None = None
     return out
 
 
+def _logged(log_path: str | None, *phrases: str) -> set[str] | None:
+    """Which of ``phrases`` a candidate's server log has; None where it cannot be read."""
+    try:
+        with open(log_path, errors="replace") as f:
+            return {p for line in f for p in phrases if p in line}
+    except (OSError, TypeError):
+        return None
+
+
 def _dropped_drafts(log_path: str | None) -> bool:
     """Whether a candidate's server dropped the preset's drafts for the size of its expert cache (engine.PRESET_NO_DRAFTS in its log)."""
     from freetoken.engine.engine import PRESET_NO_DRAFTS
 
-    try:
-        with open(log_path, errors="replace") as f:
-            return any(PRESET_NO_DRAFTS in line for line in f)
-    except (OSError, TypeError):
-        return False
+    return bool(_logged(log_path, PRESET_NO_DRAFTS))
+
+
+def _plan_short(log_path: str | None) -> str | None:
+    """What a candidate's plan did not keep, from its server's log, or None: a prefill chunk's working memory free
+    (engine.PREFILL_SHORT), or the KV reserve the preset asked for (engine.PRESET_KV_SHORT). A log that cannot be
+    read does not say the plan kept them."""
+    from freetoken.engine.engine import PREFILL_SHORT, PRESET_KV_SHORT
+
+    seen = _logged(log_path, PREFILL_SHORT, PRESET_KV_SHORT)
+    if seen is None:
+        return "what its server's log would show (the log could not be read)"
+    short = [what for phrase, what in ((PREFILL_SHORT, "a prefill chunk's working memory free"), (PRESET_KV_SHORT, "the preset's KV reserve")) if phrase in seen]
+    return " or ".join(short) or None
 
 
 class _Slower(RuntimeError):
@@ -367,6 +387,7 @@ def _time_candidate(args, argv: list[str], strategy: str, depth: int | None, flo
         "tok_s": [[float(run["tok_s"]) for run in benchdecode.runs_of(x)] for x in r["results"]],
         "drafts": sum(int(x.get("draft_n") or 0) for x in r["results"]),
         "no_drafts": _dropped_drafts(r.get("log")),
+        "short": _plan_short(r.get("log")),
         "early": [x.get("early") for x in r["results"]],
         "cache_slots": r["cache_slots"], "total_slots": r["total_slots"], "slot_bytes": r["slot_bytes"],
         "gpu_free_bytes": r["gpu_free_bytes"], "ready_s": r["ready_s"],
@@ -438,14 +459,16 @@ def _await_memory(args, before: int | None, name: str, final: bool) -> None:
 
 
 def measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str | None]], known: dict | None = None,
-            free: int | None = None) -> dict:
+            free: int | None = None, reserved: bool = False) -> dict:
     """Time ``todo`` (the static choice first) and return the row. ``known``: a stored row whose timings are kept, so
     that only the candidates it had no time for are timed. ``free``: the GPU's free bytes before any candidate, which
-    every stopped server is waited for to give back. Raises RuntimeError when the static choice cannot be timed."""
+    every stopped server is waited for to give back. ``reserved``: a hybrid candidate other than the static choice
+    counts only where its server's plan kept a prefill chunk's working memory free and the preset's KV reserve
+    (_plan_short); one that did not is stored as skipped. Raises RuntimeError when the static choice cannot be timed."""
     stopped: list[str] = []  # the candidate whose server was stopped last and has not been waited for
     with _stopping_on_signals():
         try:
-            return _measure(args, argv, todo, known, free, stopped)
+            return _measure(args, argv, todo, known, free, stopped, reserved)
         finally:
             # also where the static choice was cut: the server that starts next must not find the memory still held
             if stopped and not _signalled:
@@ -453,7 +476,7 @@ def measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str | 
 
 
 def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str | None]], known: dict | None, free: int | None,
-             stopped: list[str]) -> dict:
+             stopped: list[str], reserved: bool = False) -> dict:
     t0 = _now()
     static, names = todo[0], [c[0] for c in todo]
     # failed: did not start or answer, timed again on the next start. skipped: left out for a reason that holds then too
@@ -516,6 +539,11 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
             continue
         wall[name] = _now() - began
         tail = max(tail, wall[name] - float(r.get("ready_s") or 0.0))
+        if reserved and strategy == "hybrid" and first is not None and r.get("short"):
+            # under a fifth of the experts hybrid's long prompts ran out of memory where its plan had less than that
+            # free: its short windows would choose it all the same
+            skipped[name] = f"under a fifth of the experts its plan kept less than {r['short']}"
+            continue
         if strategy == "offload" and depth == DEPTHS[0] and not token_map and offload_none and offload_none not in tok_s:
             # offload at the preset's depth keeps its drafts or drops them for the size of the cache, as a server of
             # the static preset would (engine._settle_preset_drafts): offload without drafts is that server or loses
@@ -632,16 +660,19 @@ def measured_choice(args, argv: list[str]) -> dict:
         if resolved is None:
             # timing a guess at it would judge the candidates against a server that does not run
             return static("what the static preset serves on this GPU could not be read")
-        hybrid = resolved[3] if len(resolved) > 3 else True
-        if not hybrid:
-            logger.info(f"--preset {PRESET}: hybrid is not a candidate: the automatic expert cache holds under a fifth of the experts")
-        todo = candidates(args, resolved[:3], token_map, hybrid=hybrid)
+        reserved = not (resolved[3] if len(resolved) > 3 else True)
+        if reserved:
+            logger.info(
+                f"--preset {PRESET}: the automatic expert cache holds under a fifth of the experts: a hybrid candidate is chosen "
+                "only where its plan keeps a prefill chunk's working memory free and the preset's KV reserve"
+            )
+        todo = candidates(args, resolved[:3], token_map, reserved=reserved)
         names = [c[0] for c in todo]
         if len(todo) == 1:
             where = "every expert fits on the GPU, the store holds no other draft token map to time, and " if resolved[0] == "fused" else ""
             return static(f"{where}{todo[0][0]} is the only candidate: nothing to measure")
         # the candidates are part of the setup: a command line that fixes one of them is timed for itself
-        key = f"{_decode_decision_key(args)}|calibration={_VERSION}:{','.join(names)}"
+        key = f"{_decode_decision_key(args)}|calibration={_VERSION}:{','.join(names)}" + ("|hybrid=reserved" if reserved else "")
         if any(c[3] for c in todo):
             key += f"|map={map_sha[:12]}"  # another map is another candidate
             logger.info(f"--preset {PRESET}: {MAP_DEPTH} draft tokens with the draft token map {token_map} (sha256 {map_sha[:12]}) are a candidate")
@@ -664,7 +695,7 @@ def measured_choice(args, argv: list[str]) -> dict:
                 f"{len(PROMPTS)} prompts of {_decode_window(todo[0][1])} timed tokens after {WARM} warm-up tokens, {WARM_AGAIN} from the second pass on ({reason})"
             )
             # the launcher's own reading of the free memory: a later start compares its reading with this one
-            row = {**measure(args, argv, todo, known, free), "stamp": stamp, "gpu_free_bytes": free}
+            row = {**measure(args, argv, todo, known, free, reserved), "stamp": stamp, "gpu_free_bytes": free}
             if any(c[3] for c in todo):
                 row["token_map"] = {"path": token_map, "sha256": map_sha}
             for again in failed_before & set(row["failed"]):

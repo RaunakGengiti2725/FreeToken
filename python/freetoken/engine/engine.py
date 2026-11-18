@@ -293,6 +293,11 @@ PRESET_CHUNK_ANSWER_TOKENS = 1024
 PRESET_DRAFT_SHARE = 0.20
 # the log line of a start that drops them; moe/calibrate.py reads it from the server of its static candidate
 PRESET_NO_DRAFTS = "serving without the preset's draft tokens"
+# the log lines of a plan that keeps less than a prefill chunk's working memory free, and of one that lowers the KV
+# reserve a preset asked for: moe/calibrate.py reads them from the server of a hybrid candidate it times on a cache of
+# under PRESET_DRAFT_SHARE of the experts
+PREFILL_SHORT = "free for a prefill, and a chunk of"
+PRESET_KV_SHORT = "short of the KV reserve the preset asks for"
 
 
 def _drop_preset_demand(config, reason: str) -> None:
@@ -468,8 +473,9 @@ def _preset_every_expert_fits(config) -> bool | None:
 
 def _preset_hybrid_share_ok(config) -> tuple[bool, float | None]:
     """(whether a preset may serve hybrid on this expert cache, the share counted): any cache the command line sized
-    (size, rate or memory), and an automatic plan that holds PRESET_DRAFT_SHARE of the experts or more. Also what
-    --preset single-measured times hybrid on (moe/calibrate.py)."""
+    (size, rate or memory), and an automatic plan that holds PRESET_DRAFT_SHARE of the experts or more. Under it
+    --preset single-measured chooses a hybrid candidate only where that server's plan kept a prefill chunk's working
+    memory free and the preset's KV reserve (moe/calibrate.py)."""
     if config.moe_cache_size > 0 or config.moe_cache_rate or config.moe_cache_mem is not None:
         return True, None
     share = _preset_expert_share(config)
@@ -1477,7 +1483,7 @@ class Engine:
             what = f"--preset {config.preset}: the KV reserve is {reserve} tokens, not {asked}" + (f", at {plan[0]} expert slots" if plan is not None else "")
             if reserve < target:
                 logger.warning_rank0(
-                    f"{what}: a larger one leaves fewer expert slots than the {plain[0]} a server without the preset plans. "
+                    f"{what}, {PRESET_KV_SHORT}: a larger one leaves fewer expert slots than the {plain[0]} a server without the preset plans. "
                     "A longer prompt is refused (context_length_exceeded) and a longer answer is cut (finish_reason length)"
                 )
             elif reserve < asked:
@@ -1499,7 +1505,7 @@ class Engine:
             more = "no larger --kv-reserve-tokens fits: the expert cache is at its minimum"
         logger.warning_rank0(
             f"--preset {config.preset}: a KV reserve of {target} tokens ({_preset_kv_words(config)}) does not fit "
-            f"beside the expert cache's minimum; keeping the default plan of {kept[0]} expert slots and {kept[1] * page} KV tokens, "
+            f"beside the expert cache's minimum ({PRESET_KV_SHORT}); keeping the default plan of {kept[0]} expert slots and {kept[1] * page} KV tokens, "
             f"where a longer prompt is refused (context_length_exceeded) and a longer answer is cut (finish_reason length). {more}"
         )
 
@@ -1537,8 +1543,8 @@ class Engine:
             lowered = max(floor, min(config.kv_reserve_tokens, kv_reserve_keeping(terms)))
             if lowered < config.kv_reserve_tokens:
                 logger.info_rank0(
-                    f"--preset {config.preset}: the KV reserve is {lowered} tokens, not {config.kv_reserve_tokens}: the working "
-                    f"memory of a prefill chunk of {chunk} tokens comes before it"
+                    f"--preset {config.preset}: the KV reserve is {lowered} tokens, not {config.kv_reserve_tokens}, {PRESET_KV_SHORT}: "
+                    f"the working memory of a prefill chunk of {chunk} tokens comes before it"
                 )
                 object.__setattr__(config, "kv_reserve_tokens", lowered)
                 if lowered <= default:
@@ -1558,7 +1564,7 @@ class Engine:
                     "error. Both caches are at their minimum: only more free GPU memory helps"
                 )
             logger.warning_rank0(
-                f"{who}: the plan leaves {mem_GB(kept)} free for a prefill, and a chunk of {chunk} tokens works in "
+                f"{who}: the plan leaves {mem_GB(kept)} {PREFILL_SHORT} {chunk} tokens works in "
                 f"about {mem_GB(need)}: {risk}"
             )
 
