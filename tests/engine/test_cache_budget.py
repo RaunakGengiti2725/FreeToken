@@ -1955,43 +1955,52 @@ def test_measured_preset_times_its_candidates_once_and_falls_back_to_the_static_
     # process). With a pool of 16 threads the static preset serves hybrid at 12 GiB's share and offload at 8 GiB's,
     # and it still does: the static choice is not changed
     assert serve({}, None, threads=16)[:3] == ("hybrid", "mtp", 3) and serve({}, None, level="8 GiB", threads=16)[:3] == ("offload", "mtp", 3)
-    # the hybrid candidates are timed beside it, under a key of their own, hybrid without drafts first: where their
-    # servers' plans kept a prefill chunk's working memory free and the preset's KV reserve, the fastest is chosen, and
-    # served as timed
+    # hybrid without drafts is timed beside it, under a key of their own: where its server's plan kept a prefill chunk's
+    # working memory free and the preset's KV reserve, it is chosen where it leads, and served as timed. Hybrid at the
+    # preset's depth is not a candidate there: on one box it ran out of memory on long prompts with both reserves kept
     monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: ("offload", 3, None, False))
     small, small_argv = parsed("--memory-ratio", "0.55")
-    assert starts(small, small_argv) == (hybrid_3, 3) and started[-3:] == [("offload", 3), ("hybrid", 0), ("hybrid", 3)]
-    assert calibrated[-1]["key"].endswith(":offload@3,hybrid@0,hybrid@3,offload@0|hybrid=reserved")
-    assert ran_with(calibrated[-1]) == ("hybrid@3", "hybrid", 3, 3, 40) and ran_with(calibrated[-1]["static"])[:2] == ("offload@3", "offload")
-    assert serve(hybrid_3, calibrated[-1], level="8 GiB", threads=16)[:3] == ("hybrid", "mtp", 3)
-    # where they kept less, they are timed and not chosen: the static choice is served, and the stored row says why, so
-    # the next start times nothing
+    assert starts(small, small_argv) == ({"speculative_num_steps": 3}, 2) and started[-2:] == [("offload", 3), ("hybrid", 0)]
+    assert calibrated[-1]["key"].endswith(":offload@3,hybrid@0,offload@0|hybrid=reserved")
+    speeds["hybrid", 0] = [170.0, 240.0]
+    hybrid_0, timed = starts(*parsed("--memory-ratio", "0.551"))
+    assert timed == 2 and (hybrid_0["moe_strategy"], hybrid_0["speculative_algorithm"], hybrid_0["speculative_num_steps"]) == ("hybrid", None, 0)
+    served = serve(hybrid_0, calibrated[-1], level="8 GiB", threads=16, whole=True)
+    assert (served.moe_strategy, served.speculative_algorithm, served.kv_reserve_tokens, served.moe_cache_auto) == ("hybrid", None, 36864, True)
+    # where it kept less, it is timed and not chosen: the static choice is served, and the stored row says why, so the
+    # next start times nothing
     said = []
-    kept_less["hybrid", 0] = kept_less["hybrid", 3] = "a prefill chunk's working memory free"
+    kept_less["hybrid", 0] = "a prefill chunk's working memory free"
     small, small_argv = parsed("--memory-ratio", "0.56")
     with monkeypatch.context() as m:
         m.setattr(calibrate.logger, "info", said.append)
-        assert starts(small, small_argv) == ({"speculative_num_steps": 3}, 3) and started[-2:] == [("hybrid", 0), ("hybrid", 3)]
+        assert starts(small, small_argv) == ({"speculative_num_steps": 3}, 2) and started[-1] == ("hybrid", 0)
         assert "not timed: hybrid@0 (under a fifth of the experts its plan kept less than a prefill chunk's working memory free)" in said[-2]
-        assert "hybrid@3 (under a fifth of the experts its plan kept less than a prefill chunk's working memory free)" in said[-2]
         assert starts(small, small_argv) == ({"speculative_num_steps": 3}, 0) and "taking offload@3" in said[-2]
-    # a plan of a fifth of the experts or more times and chooses hybrid as before, whatever its plan kept
+    # a typed offload has no hybrid candidate to gate: its key is the one it had before the gate
+    assert starts(*parsed("--moe-strategy", "offload", "--memory-ratio", "0.56"))[1] == 1
+    assert calibrated[-1]["key"].endswith(":offload@3,offload@0")
+    # a typed hybrid on such a plan is served as typed, untimed, as before
+    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: ("hybrid", 3, None, False))
+    assert starts(*parsed("--moe-strategy", "hybrid", "--memory-ratio", "0.56")) == ({}, 0)
+    # a static hybrid (from a filed decode row) is the static choice: it is timed whatever its plan kept, and offload,
+    # which the gate does not read, is timed and taken where it leads
+    kept_less["hybrid", 3] = kept_less["offload", 3] = "a prefill chunk's working memory free"
+    speeds["offload", 3] = [200.0, 400.0]
+    choice, timed = starts(*parsed("--memory-ratio", "0.57"))
+    assert started[-3:] == [("hybrid", 3), ("hybrid", 0), ("offload", 3)] and timed == 3
+    assert choice == {"moe_strategy": "offload", "moe_cache_auto": True, "speculative_num_steps": 3}
+    speeds["offload", 3], speeds["hybrid", 0] = [100.0, 200.0], [70.0, 120.0]
+    # a plan of a fifth of the experts or more times hybrid at both depths and chooses it as before, whatever its plan
+    # kept, under the key it had before the gate
     monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: (static_strategy[0], 3, None, True))
-    assert starts(*parsed("--memory-ratio", "0.57")) == (hybrid_3, 3)
-    # hybrid without drafts, where its plan kept the reserves and hybrid@3's did not, is served as timed: hybrid, drafts off
-    del kept_less["hybrid", 0]
-    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: ("offload", 3, None, False))
-    speeds["hybrid", 0] = [170.0, 240.0]
-    hybrid_0, _ = starts(*parsed("--memory-ratio", "0.58"))
-    assert (hybrid_0["moe_strategy"], hybrid_0["speculative_algorithm"], hybrid_0["speculative_num_steps"]) == ("hybrid", None, 0)
-    served = serve(hybrid_0, calibrated[-1], level="8 GiB", threads=16, whole=True)
-    assert (served.moe_strategy, served.speculative_algorithm, served.kv_reserve_tokens, served.moe_cache_auto) == ("hybrid", None, 36864, True)
-    speeds["hybrid", 0] = [70.0, 120.0]
-    del kept_less["hybrid", 3]
-    monkeypatch.setattr(calibrate, "_static_choice", lambda args, argv: (static_strategy[0], 3, None, True))
+    assert starts(*parsed("--memory-ratio", "0.58")) == (hybrid_3, 3)
+    assert calibrated[-1]["key"].endswith(":offload@3,hybrid@3,hybrid@0,offload@0")
+    for key in list(kept_less):
+        del kept_less[key]
     # the rule on the 8 GiB timings of two boxes (GPU_LOG 799, 801): offload (its drafts dropped) against hybrid without
     # drafts. B's lead of +8.2% / +4.6% is under the margin, F's +32.8% / +22.0% is over it
-    names8 = ["offload@3", "hybrid@0", "hybrid@3"]
+    names8 = ["offload@3", "hybrid@0"]
     assert calibrate.choose({"offload@3": [[111.0] * 2, [138.1] * 2], "hybrid@0": [[120.1] * 2, [144.5] * 2]}, names8) == ("offload@3", 0.0)
     assert calibrate.choose({"offload@3": [[129.4] * 2, [158.5] * 2], "hybrid@0": [[171.8] * 2, [193.3] * 2]}, names8) == ("hybrid@0", pytest.approx(0.2196, abs=1e-3))
     # a candidate that fails on two starts in a row is left out from then on, not timed at every start

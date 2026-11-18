@@ -165,10 +165,10 @@ def candidates(args, static: tuple[str, int, str | None], token_map: str | None 
     strategy first; hybrid without drafts comes second where the static choice is hybrid, since a load of each is
     about all the budget holds, and it was the fastest setting at 8 GiB free. offload with none is timed only where
     offload's server drops its drafts for the size of the cache (engine._settle_preset_drafts): that server is it.
-    On an automatic plan under a fifth of the experts (``reserved``, engine._preset_hybrid_share_ok) the hybrid
-    candidates are timed too, hybrid without drafts before hybrid at the preset's depth: on such a plan it is the one
-    that answered long prompts, and the budget may not hold both. Either is chosen only where its own plan kept the
-    reserves (_measure)."""
+    On an automatic plan under a fifth of the experts (``reserved``, engine._preset_hybrid_share_ok) hybrid without
+    drafts is timed beside the static choice, and chosen only where its own plan kept the reserves (_measure). Hybrid
+    at the preset's depth is not a candidate there: on one box its long prompts ran out of memory with both reserves
+    kept, and it comes back only with a box run that shows it answering them."""
     left = args.preset_fields
     drafts = "speculative_algorithm" in left and "speculative_num_steps" in left
     strategy, depth, served = static
@@ -195,9 +195,10 @@ def candidates(args, static: tuple[str, int, str | None], token_map: str | None 
         return out + [cand(s, depth) for s in others]
     if strategy == "hybrid":
         out.append(cand("hybrid", 0))
-    out += [cand(s, depth) for s in others]
+    # under a fifth, hybrid with drafts died on long prompts with the reserves kept (box record): not until a box run
+    out += [cand(s, depth) for s in others if not (reserved and s == "hybrid")]
     if strategy != "hybrid" and "hybrid" in others:
-        out.insert(out.index(cand("hybrid", depth)) if reserved else len(out), cand("hybrid", 0))
+        out.append(cand("hybrid", 0))
     if "offload" in (strategy, *others):
         out.append(cand("offload", 0))
     return out
@@ -340,7 +341,7 @@ def _plan_short(log_path: str | None) -> str | None:
 
     seen = _logged(log_path, PREFILL_SHORT, PRESET_KV_SHORT)
     if seen is None:
-        return "what its server's log would show (the log could not be read)"
+        return "its server's log shows (the log could not be read)"
     short = [what for phrase, what in ((PREFILL_SHORT, "a prefill chunk's working memory free"), (PRESET_KV_SHORT, "the preset's KV reserve")) if phrase in seen]
     return " or ".join(short) or None
 
@@ -540,8 +541,8 @@ def _measure(args, argv: list[str], todo: list[tuple[str, str, int | None, str |
         wall[name] = _now() - began
         tail = max(tail, wall[name] - float(r.get("ready_s") or 0.0))
         if reserved and strategy == "hybrid" and first is not None and r.get("short"):
-            # under a fifth of the experts hybrid's long prompts ran out of memory where its plan had less than that
-            # free: its short windows would choose it all the same
+            # keeping both reserves is needed, and not shown to be enough: hybrid with drafts ran out of memory on long
+            # prompts with both kept. Its short windows would choose it all the same
             skipped[name] = f"under a fifth of the experts its plan kept less than {r['short']}"
             continue
         if strategy == "offload" and depth == DEPTHS[0] and not token_map and offload_none and offload_none not in tok_s:
@@ -661,13 +662,18 @@ def measured_choice(args, argv: list[str]) -> dict:
             # timing a guess at it would judge the candidates against a server that does not run
             return static("what the static preset serves on this GPU could not be read")
         reserved = not (resolved[3] if len(resolved) > 3 else True)
-        if reserved:
-            logger.info(
-                f"--preset {PRESET}: the automatic expert cache holds under a fifth of the experts: a hybrid candidate is chosen "
-                "only where its plan keeps a prefill chunk's working memory free and the preset's KV reserve"
-            )
+        if reserved and resolved[0] == "hybrid" and "moe_strategy" not in args.preset_fields:
+            # a typed hybrid on such a plan is served as typed, untimed, as before its candidates were timed here
+            return static("--moe-strategy hybrid on an automatic expert cache under a fifth of the experts is served as typed")
         todo = candidates(args, resolved[:3], token_map, reserved=reserved)
         names = [c[0] for c in todo]
+        # the key and the log line mark the gate only where it has a hybrid candidate to gate
+        reserved = reserved and any(c[1] == "hybrid" for c in todo[1:])
+        if reserved:
+            logger.info(
+                f"--preset {PRESET}: the automatic expert cache holds under a fifth of the experts: hybrid without drafts is "
+                "chosen only where its plan keeps a prefill chunk's working memory free and the preset's KV reserve"
+            )
         if len(todo) == 1:
             where = "every expert fits on the GPU, the store holds no other draft token map to time, and " if resolved[0] == "fused" else ""
             return static(f"{where}{todo[0][0]} is the only candidate: nothing to measure")
