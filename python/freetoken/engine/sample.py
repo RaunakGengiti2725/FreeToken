@@ -48,6 +48,8 @@ class BatchSamplingArgs:
     forced: ForcedTokens | None = None
     # draw_key per row for the rows of a sampled request with a seed, None for the other rows; None when no row has one
     keys: list[int | None] | None = None
+    # per row of keys: whether the request's own top-k, top-p and min-p are on; None where keys is
+    filters: list[tuple[bool, bool, bool] | None] | None = None
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -157,9 +159,9 @@ def keyed_draw(probs: torch.Tensor, uniforms: torch.Tensor) -> torch.Tensor:
 # A/B switch: FREETOKEN_SEEDED_DRAW=batched draws every seeded row of a step in one pass (keyed_probs, keyed_draw), for
 # its speed. It is not batch-independent on CUDA: a row's top-k / top-p probabilities in a batch of keyed rows are not
 # the bits it gets alone, so a seeded request's text can follow the requests beside it. The default draws each seeded
-# row in a call of its own. Its tokens are batch-independent only when every keyed row of the step has the same
-# filters: on an RTX 5090, a request with top-k 20 and top-p 0.95 among requests with other temperatures and top-p drew
-# other tokens than alone (box B, 1c946ea). One running request is unaffected.
+# row in a call of its own, with only the filters its own request turns on: the kernel sample_impl picks follows which
+# filters it is given, and a filter at its neutral value (top-k at the vocabulary, top-p 1, min-p 0) still picks
+# another kernel than no filter.
 _SEEDED_DRAW_PER_ROW = os.getenv("FREETOKEN_SEEDED_DRAW", "per-row") != "batched"
 
 
@@ -203,11 +205,13 @@ def sample_rows(
     top_p: torch.Tensor | None,
     min_p: torch.Tensor | None,
     keys: list[int | None] | None,
+    filters: list[tuple[bool, bool, bool] | None] | None = None,
 ) -> torch.Tensor:
-    """sample_impl over the batch; a row with a key is then drawn again from that key, in a call of its own. Under
-    FREETOKEN_SEEDED_DRAW=batched the keyed rows are drawn in one pass instead (keyed_draw), each from the uniform its
-    own key gives; not batch-independent on CUDA (_SEEDED_DRAW_PER_ROW). Either way a seeded row's token is the one it
-    draws alone only where every keyed row of the step has the same filters."""
+    """sample_impl over the batch; a row with a key is then drawn again from that key, in a call of its own, with the
+    filters ``filters[row]`` turns on (top-k, top-p, min-p), so it takes the kernel it takes alone; None gives every
+    keyed row each filter passed. Under FREETOKEN_SEEDED_DRAW=batched the keyed rows are drawn in one pass instead
+    (keyed_draw), each from the uniform its own key gives, with a filter that some keyed row turns on; not
+    batch-independent on CUDA (_SEEDED_DRAW_PER_ROW)."""
     tokens = sample_impl(logits, temperatures, top_k, top_p, min_p)
     if not keys:
         return tokens
@@ -215,24 +219,25 @@ def sample_rows(
         for row, key in enumerate(keys):
             if key is None:
                 continue
+            on = (True, True, True) if filters is None else filters[row]
             # One row per call: a batched call takes one seed, and flashinfer mixes the row index into it. Alone, a row's
             # softmax and draw also run the same arithmetic whatever else the step holds.
             one = slice(row, row + 1)
-            tokens[one] = sample_impl(
-                logits[one], temperatures[one], None if top_k is None else top_k[one], None if top_p is None else top_p[one],
-                None if min_p is None else min_p[one], key,
-            )
+            k, p, m = (None if t is None or not o else t[one] for t, o in zip((top_k, top_p, min_p), on))
+            tokens[one] = sample_impl(logits[one], temperatures[one], k, p, m, key)
         return tokens
     rows = [row for row, key in enumerate(keys) if key is not None]
     if not rows:
         return tokens
     at = make_device_tensor(rows, torch.int64, logits.device)
     uniforms = make_device_tensor([key_uniform(keys[row]) for row in rows], torch.float32, logits.device)
+    used = (True, True, True) if filters is None else tuple(any(filters[row][i] for row in rows) for i in range(3))
 
-    def pick(t: torch.Tensor | None) -> torch.Tensor | None:
-        return None if t is None else t.index_select(0, at)
+    def pick(t: torch.Tensor | None, on: bool = True) -> torch.Tensor | None:
+        return None if t is None or not on else t.index_select(0, at)
 
-    probs = keyed_probs(logits.index_select(0, at), pick(temperatures), pick(top_k), pick(top_p), pick(min_p))
+    k, p, m = (pick(t, o) for t, o in zip((top_k, top_p, min_p), used))
+    probs = keyed_probs(logits.index_select(0, at), pick(temperatures), k, p, m)
     tokens[at] = keyed_draw(probs, uniforms).to(tokens.dtype)
     return tokens
 
@@ -306,10 +311,18 @@ class Sampler:
             )
             self._sent = (values, (temperatures, top_k, top_p, min_p, greedy_mask))
         temperatures, top_k, top_p, min_p, greedy_mask = self._sent[1]
+        if not any(k is not None for k in keys):
+            return BatchSamplingArgs(
+                temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, penalties=penalties,
+                min_p=min_p, repetition=repetition,
+            )
+        # the batch's tensors hold a filter when any request turns it on; a keyed row is drawn with its own request's
+        # filters only, the ones it gets alone; tiled as keys, so not cached with the values
+        on = [(k != self.vocab_size, p < 1.0, m > 0.0) for k, p, m in zip(top_ks, top_ps, min_ps)]
+        filters = [None if keys[i * width] is None else on[i] for i in range(len(on)) for _ in range(width)]
         return BatchSamplingArgs(
             temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, penalties=penalties,
-            min_p=min_p, repetition=repetition,
-            keys=keys if any(k is not None for k in keys) else None,
+            min_p=min_p, repetition=repetition, keys=keys, filters=filters,
         )
 
     @nvtx_annotate("Sampler")
@@ -325,7 +338,9 @@ class Sampler:
             if args.temperatures is None:  # greedy sampling
                 tokens = torch.argmax(logits, dim=-1)
             else:
-                tokens = sample_rows(logits.float(), args.temperatures, args.top_k, args.top_p, args.min_p, args.keys)
+                tokens = sample_rows(
+                    logits.float(), args.temperatures, args.top_k, args.top_p, args.min_p, args.keys, args.filters,
+                )
                 if args.greedy_mask is not None:
                     # Mixed batches still run probability sampling for all rows, but
                     # greedy rows must follow argmax's deterministic tie-breaking.
@@ -358,7 +373,10 @@ class Sampler:
         def rows(t: torch.Tensor | None) -> torch.Tensor | None:
             return None if t is None else t.repeat_interleave(width)
 
-        tokens = sample_rows(logits.float(), rows(args.temperatures), rows(args.top_k), rows(args.top_p), rows(args.min_p), args.keys)
+        tokens = sample_rows(
+            logits.float(), rows(args.temperatures), rows(args.top_k), rows(args.top_p), rows(args.min_p), args.keys,
+            args.filters,
+        )
         if args.greedy_mask is not None:
             greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
             tokens = torch.where(rows(args.greedy_mask), greedy_tokens, tokens)

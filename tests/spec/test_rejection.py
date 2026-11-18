@@ -333,51 +333,88 @@ def test_the_keyed_draw_samples_the_rows_distribution_and_never_a_token_it_cut()
     assert keyed_draw(probs[1:2], torch.tensor([0.0])).tolist() == [5]
 
 
-@pytest.mark.parametrize("per_row", [True, False], ids=["per-row", "batched"])
-def test_a_seeded_row_draws_alone_what_it_draws_in_a_batch_and_leaves_the_unseeded_rows_alone(monkeypatch, per_row):
-    """One seeded row alone and as row 0, a middle row and the last of 2, 8 and 16, beside seeded and unseeded rows:
-    the same token, by the default per-row draw and by FREETOKEN_SEEDED_DRAW=batched. The unseeded rows draw from the
-    shared stream exactly as in the same step without a seed, and the stream stands where it would. Stand-in kernels as
-    above, which run a row alone as in a batch; the CUDA test checks the arithmetic of the kernels."""
+@pytest.mark.parametrize("per_row,neighbors", [
+    (True, {}), (False, {}),
+    # the requests beside it turn a filter on that it leaves off
+    (True, {"top_k": 20}), (True, {"top_p": 0.9}), (True, {"min_p": 0.05}),
+    (True, {"top_k": 20, "top_p": 0.9, "min_p": 0.05}),
+], ids=["per-row", "batched", "per-row-top-k", "per-row-top-p", "per-row-min-p", "per-row-all"])
+def test_a_seeded_row_draws_alone_what_it_draws_in_a_batch_and_leaves_the_unseeded_rows_alone(monkeypatch, per_row, neighbors):
+    """One seeded request alone and as request 0, a middle one and the last of 2, 8 and 16, beside seeded and unseeded
+    requests, in a decode step and a verify step of 3 rows: the same tokens, by the default per-row draw and by
+    FREETOKEN_SEEDED_DRAW=batched, also when the requests beside it turn on filters it leaves off. The unseeded rows
+    draw from the shared stream exactly as in the same step without a seed, and the stream stands where it would.
+    Stand-in kernels as above, which run a row alone as in a batch; each draw entry point mixes its own salt into the
+    seed, as the real kernels run another algorithm per entry point. The CUDA test checks the arithmetic of the kernels."""
     from types import SimpleNamespace
 
+    from freetoken.core import Batch, Req, SamplingParams
     from freetoken.engine import sample
 
     assert sample._SEEDED_DRAW_PER_ROW  # the default
     monkeypatch.setattr(sample, "_SEEDED_DRAW_PER_ROW", per_row)
 
-    def sampling_from_probs(probs, seed=None, offset=None):
-        generator = None if seed is None else torch.Generator().manual_seed(seed + offset)
-        uniforms = torch.rand(probs.shape[0], 1, generator=generator)
-        return torch.searchsorted(probs.cumsum(-1), uniforms).squeeze(1).clamp_(max=probs.shape[1] - 1).to(torch.int32)
+    def renorm(probs, thr):
+        kept = torch.where(probs >= thr, probs, 0.0)
+        return kept / kept.sum(dim=1, keepdim=True)
+
+    def top_k_renorm_probs(probs, top_k):
+        return renorm(probs, probs.sort(dim=1, descending=True).values.gather(1, top_k.long().unsqueeze(1) - 1))
+
+    def top_p_renorm_probs(probs, top_p):
+        ranked = probs.sort(dim=1, descending=True).values
+        inside = ranked.cumsum(dim=1) - ranked < top_p.unsqueeze(1)
+        return renorm(probs, torch.where(inside, ranked, 2.0).amin(dim=1, keepdim=True))
+
+    def draw(salt):
+        def sampling(probs, seed=None, offset=None):
+            generator = None if seed is None else torch.Generator().manual_seed(seed + offset + salt)
+            uniforms = torch.rand(probs.shape[0], 1, generator=generator)
+            return torch.searchsorted(probs.cumsum(-1), uniforms).squeeze(1).clamp_(max=probs.shape[1] - 1).to(torch.int32)
+        return sampling
 
     kernels = SimpleNamespace(
         softmax=lambda logits, temperatures, enable_pdl=False: torch.softmax(logits / temperatures.unsqueeze(1), dim=-1),
-        sampling_from_probs=sampling_from_probs,
+        top_k_renorm_probs=top_k_renorm_probs,
+        top_p_renorm_probs=top_p_renorm_probs,
+        sampling_from_probs=draw(0),
+        top_k_sampling_from_probs=lambda probs, k, **rng: draw(1)(top_k_renorm_probs(probs, k), **rng),
+        top_p_sampling_from_probs=lambda probs, p, **rng: draw(2)(top_p_renorm_probs(probs, p), **rng),
+        top_k_top_p_sampling_from_probs=lambda probs, k, p, **rng: draw(3)(top_p_renorm_probs(top_k_renorm_probs(probs, k), p), **rng),
+        min_p_sampling_from_probs=lambda probs, m, **rng: draw(4)(renorm(probs, m.unsqueeze(1) * probs.amax(1, keepdim=True)), **rng),
     )
     monkeypatch.setattr(sample, "sampling_module", lambda: kernels)
     monkeypatch.setattr(sample, "is_sm90_supported", lambda: False)
     vocab = 512
+    sampler = sample.Sampler(device=torch.device("cpu"), vocab_size=vocab)
     g = torch.Generator().manual_seed(11)
-    mine, others = torch.randn(1, vocab, generator=g), torch.randn(15, vocab, generator=g)
-    key = sample.draw_key(7, 40)
+    mine, others = torch.randn(3, vocab, generator=g), torch.randn(15, 3, vocab, generator=g)
 
-    def step(batch, at, seeded=True):
-        logits = torch.cat([others[:at], mine, others[at : batch - 1]])
-        keys = [None if i % 2 else sample.draw_key(100 + i, 40) for i in range(batch - 1)]
-        keys = keys[:at] + [key] + keys[at:]
+    def req(seed, **params):
+        return Req(input_ids=torch.zeros(40, dtype=torch.int32), table_idx=0, cached_len=39, output_len=64, uid=0,
+                   sampling_params=SamplingParams(temperature=0.8, seed=seed, **params), cache_handle=None)
+
+    def step(batch, at, width, seeded=True):
+        reqs = [req(None if i % 2 or not seeded else 100 + i, **neighbors) for i in range(batch - 1)]
+        reqs = reqs[:at] + [req(7 if seeded else None)] + reqs[at:]
+        logits = torch.cat([*others[:at, :width], mine[:width], *others[at : batch - 1, :width]])
+        if width == 1:
+            args = sampler.prepare(Batch(reqs=reqs, phase="decode"))
+        else:
+            args = sampler.prepare(Batch(reqs=reqs, phase="verify", rows_per_req=width))
         torch.manual_seed(1)
-        tokens = sample.sample_rows(logits, torch.full((batch,), 0.8), None, None, None, keys if seeded else None)
-        return tokens, torch.rand(1), keys
+        # a decode step goes through sample_verify with no drafts: Sampler.sample opens an NVTX range, which a CPU build of torch lacks
+        tokens = sampler.sample_verify(logits, args, torch.zeros(batch, width - 1, dtype=torch.int64)).view(batch, width)
+        return tokens, torch.rand(1), [i for i, r in enumerate(reqs) if r.sampling_params.seed is None]
 
-    alone = int(step(1, 0)[0][0])
-    for batch in (2, 8, 16):
-        for at in sorted({0, batch // 2, batch - 1}):
-            tokens, after, keys = step(batch, at)
-            assert int(tokens[at]) == alone, (batch, at)
-            plain, plain_after, _ = step(batch, at, seeded=False)
-            unseeded = [i for i, k in enumerate(keys) if k is None]
-            assert torch.equal(tokens[unseeded], plain[unseeded]) and torch.equal(after, plain_after)
+    for width in (1, 3):
+        alone = step(1, 0, width)[0][0]
+        for batch in (2, 8, 16):
+            for at in sorted({0, batch // 2, batch - 1}):
+                tokens, after, unseeded = step(batch, at, width)
+                assert torch.equal(tokens[at], alone), (width, batch, at)
+                plain, plain_after, _ = step(batch, at, width, seeded=False)
+                assert torch.equal(tokens[unseeded], plain[unseeded]) and torch.equal(after, plain_after)
 
 
 @cuda
