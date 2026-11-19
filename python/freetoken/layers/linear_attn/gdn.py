@@ -233,11 +233,13 @@ class GatedDeltaNet(BaseOP):
     def _ba_weight_in_kernel(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         """The b|a projection's weight when a decode or verify step of ``hidden_states`` takes b and a inside the
         recurrence kernel (bf16 rows of unit inner stride, 1 to 64 of them), else None. b and a then differ from
-        F.linear's only in the summation order of each dot. The weight is decided once, at the first decode step,
-        when the weights are final; that step also logs, once a process, whether decode-sized steps fold and why not
-        (the step's own row count is left out, as CUDA-graph capture also runs steps past the cap)."""
+        F.linear's only in the summation order of each dot. The weight is decided at the first decode step, when the
+        weights are final, and again whenever in_proj_ba holds another weight tensor than the one decided on (a
+        captured CUDA graph keeps the pointer it captured either way). The first decision also logs, once a process,
+        whether decode-sized steps fold and why not (the step's own row count is left out, as CUDA-graph capture also
+        runs steps past the cap)."""
         global _BA_SAID
-        if self._ba_weight is False:
+        if self._ba_weight is False or (self._ba_weight is not None and self._ba_weight is not self.in_proj_ba.weight):
             self._ba_off = self._ba_weight_off(hidden_states.shape[1])
             self._ba_weight = self.in_proj_ba.weight if self._ba_off is None else None
         w = self._ba_weight

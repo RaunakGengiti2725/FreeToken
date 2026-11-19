@@ -338,3 +338,9 @@ def test_gdn_says_once_why_decode_does_not_take_b_and_a_in_the_kernel(monkeypatc
     assert layer(torch.zeros(8, 64))._ba_weight_off(64) == "the b|a weight is on cpu"
     monkeypatch.setattr(gdn, "_BA_IN_KERNEL", False)
     assert layer(torch.zeros(8, 64))._ba_weight_off(64) == "FREETOKEN_GDN_BA_IN_KERNEL=0"
+    # a layer that folds decides again once in_proj_ba holds another weight tensor
+    op = layer(torch.zeros(8, 64, dtype=torch.bfloat16))
+    monkeypatch.setattr(op, "_ba_weight_off", lambda hidden: None)
+    assert op._ba_weight_in_kernel(x) is op.in_proj_ba.weight
+    op.in_proj_ba.weight = swapped = torch.zeros(8, 64, dtype=torch.bfloat16)
+    assert op._ba_weight_in_kernel(x) is swapped
