@@ -437,15 +437,19 @@ def fp8_pertensor_linear(
     """``y = x @ (weight_fp8 * weight_scale)^T``. ``weight`` [N, K] fp8-e4m3, ``weight_scale``
     [N] fp32 (per output row). ``scale_segments``: the fused parts' row ranges, precomputed at
     load by the layer; derived here (with a sync) when omitted and needed. ``small_m``: W8A8
-    calls of up to SMALL_M_MAX rows take the split-K kernel; for a caller whose decode steps
-    never have more, so that they all sum in one order.
+    calls of up to SMALL_M_MAX rows take the split-K kernel and wider ones ``_scaled_mm``; for
+    a caller whose decode steps never have more, so that they all sum in one order. The choice
+    is made per call, so a prefill chunk of SMALL_M_MAX tokens or fewer (the uncached tail
+    after a prefix-cache hit, or a few short prompts batched together) takes the split-K kernel
+    too, and its outputs can round differently from the same tokens in a wider prefill.
 
     Whether the activation is quantized is a property of the *deployment*, never of the batch:
     with ``input_scale`` on sm_89+ every M runs W8A8, otherwise every M runs W8A16 (split-K
     GEMV at M=1, GEMM above it). Picking per-M would make a request's numerics depend on how
     many unrelated requests happened to be in flight, so a reply would not reproduce at bs=1 --
     and W8A16 at M=1 is worth only ~0.5% (5.53 ms vs 5.56 ms of per-step GEMM) anyway. vLLM and
-    SGLang likewise run one scheme across all M on any GPU with FP8 tensor cores."""
+    SGLang likewise run one scheme across all M on any GPU with FP8 tensor cores. ``small_m``
+    keeps that for decode steps only: a prefill's sums depend on its chunk length, as above."""
     *lead, K = x.shape
     N = weight.shape[0]
     w8a8 = input_scale is not None and e4m3_native()

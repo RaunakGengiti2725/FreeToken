@@ -64,7 +64,8 @@ class TorchFp8TensorLinearKernel(LinearKernel):
 
 
 class TritonW8A8Fp8TensorLinearKernel(TorchFp8TensorLinearKernel):
-    """Static W8A8 with every decode step in one Triton split-K launch; wider (prefill) calls through torch._scaled_mm."""
+    """Static W8A8 with every call of up to SMALL_M_MAX rows (each decode step, and a prefill chunk that short) in one
+    Triton split-K launch; wider calls through torch._scaled_mm."""
 
     name = "triton-w8a8"
 
