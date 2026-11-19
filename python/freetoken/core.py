@@ -238,6 +238,9 @@ class Batch:
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
     # per-row hidden states a draft model reads from this forward; None when nothing reads them
     features: "FeatureSink | None" = field(default=None, init=False)
+    # a captured prefill forward padded to its bucket: [rows, 1] bool on the device, True on the rows past the chunk's
+    # own, which the MoE routes to no expert (layers/moe.drop_pad_routes)
+    pad_rows: torch.Tensor | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.rows_per_req is None and self.phase == "decode":

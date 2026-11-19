@@ -77,6 +77,9 @@ class EngineConfig:
     prefill_graph_rows: int = 0
     # Token counts of the prefill forwards captured for those chunks, e.g. "1024,256,64,16"; "" = none.
     prefill_graph_chunks: str = ""
+    # A chunk past 64 tokens runs as one replay of the smallest captured multiple of 64 that holds it; the rows past it
+    # store no K/V, leave the linear state where its own tokens leave it and take no expert route.
+    prefill_graph_pad: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
     # --moe-expert-activation-scales: serve NVFP4 experts under the input_scale tensors the checkpoint stores for them even where its
     # config declares W4A16, so prefill takes the W4A4 expert kernel where the GPU has one. Changes the output.

@@ -51,6 +51,14 @@ def _mrope_rows(reqs) -> torch.Tensor:
     return torch.cat(cols, dim=1)
 
 
+def _layer_kv(kv_cache, layer: int, loc: torch.Tensor) -> list[torch.Tensor]:
+    """A layer's K and V rows at ``loc``; none for a layer without paged K/V (linear attention)."""
+    try:
+        return [kv_cache.k_cache(layer)[loc], kv_cache.v_cache(layer)[loc]]
+    except (KeyError, IndexError):
+        return []
+
+
 class _RowsSink:
     """Copies a verify forward's final hidden rows into a buffer the runner owns, so a captured graph writes it too."""
 
@@ -174,7 +182,9 @@ class SpecRunner:
     def prefill_plan(self, batch: Batch) -> List[tuple[str, int]] | None:
         """How a short prefill chunk of one request is cut into steps, or None when it must run as one eager forward.
 
-        ("chunk", b): a replay of the prefill graph of b tokens. ("eager", m): an eager prefill forward of m tokens (no
+        ("chunk", b): a replay of the prefill graph of b tokens. ("bucket", b): a replay of the prefill graph of b
+        tokens for the chunk's tokens left, at most b, whose rows past them are padding; the replay writes the chunk's
+        snapshot itself. ("eager", m): an eager prefill forward of m tokens (no
         plan made here has one; the self-test builds a prefix with it). ("verify", w): a verify step of w rows, whose rows past the chunk are padding. ("track", 0): the linear state
         as it is there is the chunk's snapshot.
 
@@ -200,6 +210,13 @@ class SpecRunner:
             # metadata already set.
             if left > engine.config.prefill_graph_tokens or not engine.chunk_graphs_usable():
                 return None
+            if getattr(engine, "chunk_pad", False) and left > CHUNK_SIZE:
+                # padded: one replay of the smallest captured multiple of 64 that holds the chunk
+                bucket = min((b for b in sizes if b % CHUNK_SIZE == 0 and b >= left), default=None)
+                if bucket is not None:
+                    if fla is not None and fla.track_dst is not None:
+                        batch.prefill_track_dst = fla.track_dst
+                    return [("bucket", bucket)]
             head = (left - 1) // CHUNK_SIZE * CHUNK_SIZE
             tail = left - head
             if tail not in engine.chunk_runners or (head and head not in engine.chunk_runners):
@@ -254,7 +271,9 @@ class SpecRunner:
                 state[:, slot].zero_()
 
         def make(kind: str, size: int, done: int, m: int):
-            rows = _PrefillRows(req.table_idx, start + done, start + done + size, req.linear_slot_idx, req.mrope_delta, req.mrope_positions_full)
+            # a padded replay's attention and linear metadata see the chunk's own rows only
+            end = start + done + (m if kind == "bucket" else size)
+            rows = _PrefillRows(req.table_idx, start + done, end, req.linear_slot_idx, req.mrope_delta, req.mrope_positions_full)
             step = _Batch(reqs=[rows], phase="verify" if kind == "verify" else "prefill", rows_per_req=size if kind != "eager" else None)
             ids, out_loc = batch.input_ids[done : done + m], batch.out_loc[done : done + m]
             if m < size:
@@ -269,10 +288,13 @@ class SpecRunner:
                 ids = torch.cat([ids, ids.new_zeros(pad)])
                 out_loc = torch.cat([out_loc, pad_loc.expand(pad).to(out_loc.dtype)])
             step.input_ids, step.out_loc = ids, out_loc
-            positions = [torch.arange(r.cached_len, r.device_len, dtype=torch.int32) for r in step.padded_reqs]
-            step.positions = torch.cat(positions).to(self.device, non_blocking=True)
+            positions = torch.cat([torch.arange(r.cached_len, r.device_len, dtype=torch.int32) for r in step.padded_reqs])
+            # the pad rows of a bucket repeat the last position, so that no rope row past the context is read
+            pad = ids.numel() - positions.numel()
+            step.positions = torch.cat([positions, positions[-1:].expand(pad)]).to(self.device, non_blocking=True)
             if mrope:
-                step.mrope_positions = _mrope_rows(step.padded_reqs).to(self.device, non_blocking=True)
+                cols = _mrope_rows(step.padded_reqs)
+                step.mrope_positions = torch.cat([cols, cols[:, -1:].expand(-1, pad)], dim=1).to(self.device, non_blocking=True)
 
         def eager(size: int, done: int) -> tuple[torch.Tensor, torch.Tensor]:
             """One eager prefill forward of the chunk's tokens [done, done + size): its last row's logits and its rows' hidden."""
@@ -287,13 +309,8 @@ class SpecRunner:
             return out, step.features.hidden
 
         def kv_rows(done: int, size: int) -> list[torch.Tensor]:
-            loc, rows = batch.out_loc[done : done + size].long(), []
-            for layer in range(engine.config.model_config.num_layers):
-                try:
-                    rows += [engine.kv_cache.k_cache(layer)[loc].clone(), engine.kv_cache.v_cache(layer)[loc].clone()]
-                except (KeyError, IndexError):  # a layer without paged K/V (linear attention)
-                    continue
-            return rows
+            loc = batch.out_loc[done : done + size].long()
+            return [t.clone() for layer in range(engine.config.model_config.num_layers) for t in _layer_kv(engine.kv_cache, layer, loc)]
 
         def kv_wipe(done: int, size: int) -> None:
             loc = batch.out_loc[done : done + size].long()
@@ -320,20 +337,29 @@ class SpecRunner:
                 hidden.append(rows_hidden.clone())
                 done += size
                 continue
-            chunk = kind == "chunk"
+            bucket = kind == "bucket"
+            chunk = kind == "chunk" or bucket
             runner = engine.chunk_runners[size] if chunk else (engine.prefill_runner if size != self.k + 1 else engine.graph_runner)
-            m = size if chunk else min(size, n - done)
+            m = size if kind == "chunk" else min(size, n - done)
             if chunk and check:
                 before = [state[:, slot].clone() for state in states]
-                want_logits, want_hidden = eager(size, done)
-                want = [want_logits.clone(), want_hidden.clone(), *kv_rows(done, size), *[state[:, slot].clone() for state in states]]
+                want_logits, want_hidden = eager(m, done)
+                want = [want_logits.clone(), want_hidden.clone(), *kv_rows(done, m), *[state[:, slot].clone() for state in states]]
                 for state, saved in zip(states, before):
                     state[:, slot] = saved
                 # the eager forward's K/V rows are wiped, so that a replay that stored nothing, or elsewhere, shows
-                kv_wipe(done, size)
+                kv_wipe(done, m)
+                # the pages past the chunk, which a pad row must not write
+                past = engine.page_table[req.table_idx, start + done + m : start + done + size].long()
+                past_kv = [t.clone() for layer in range(engine.config.model_config.num_layers) for t in _layer_kv(engine.kv_cache, layer, past)]
             step, ids, out_loc = make(kind, size, done, m)
             runner.pad_batch(step)
             place(step, ids, out_loc)
+            if bucket:
+                step.prefill_track_dst = getattr(batch, "prefill_track_dst", None)
+            if getattr(runner, "pad_rows", None) is not None:
+                runner.pad_rows[:m].fill_(False)
+                runner.pad_rows[m:].fill_(True)
             if runner.linear_backend is not None:
                 runner.linear_backend.prepare_metadata(step)
             runner.attn_backend.prepare_metadata(step)
@@ -348,23 +374,38 @@ class SpecRunner:
                     out = runner.replay(step)
                 if chunk:
                     logits = out[:1]
-                    hidden.append(self._chunk_hidden[size].clone())
+                    hidden.append(self._chunk_hidden[size][:m].clone())
                 else:
                     logits = out[m - 1 : m]
                     if runner.linear_backend is not None:
                         runner.linear_backend.scratch.commit(pool, [slot], [m])
                     hidden.append(self._wide_hidden[:m].clone())
             if chunk and check:
-                got = [logits, hidden[-1], *kv_rows(done, size), *[state[:, slot] for state in states]]
+                got = [logits, hidden[-1], *kv_rows(done, m), *[state[:, slot] for state in states]]
                 same = [torch.equal(a, b) for a, b in zip(got, want, strict=True)]
                 kv = same[2 : len(same) - len(states)]
                 far = float((got[0].float() - want[0].float()).abs().max())
-                print(
-                    f"PREFILL_SPLIT_CHECK size={size} start={start + done} logits_equal={same[0]} logits_max_abs_diff={far:.6g} "
+                line = (
+                    f"size={size} start={start + done} logits_equal={same[0]} logits_max_abs_diff={far:.6g} "
                     f"hidden_equal={same[1]} kv_equal={all(kv)} kv_tensors={len(kv)} kv_first_unequal={kv.index(False) if not all(kv) else -1} "
-                    f"state_equal={same[len(same) - len(states):]} argmax_equal={int(got[0].argmax()) == int(want[0].argmax())}",
-                    flush=True,
+                    f"state_equal={same[len(same) - len(states):]} argmax_equal={int(got[0].argmax()) == int(want[0].argmax())}"
                 )
+                if bucket:
+
+                    def rel(a: torch.Tensor, b: torch.Tensor) -> float:
+                        return float((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-30))
+
+                    untouched = all(torch.equal(a, b) for a, b in zip(
+                        past_kv, [t for layer in range(engine.config.model_config.num_layers) for t in _layer_kv(engine.kv_cache, layer, past)]))
+                    print(
+                        f"PREFILL_PAD_CHECK rows={m} {line} hidden_rel={rel(got[1], want[1]):.3g} "
+                        f"kv_rel_max={max((rel(a, b) for a, b in zip(got[2 : len(got) - len(states)], want[2 : len(want) - len(states)])), default=-1):.3g} "
+                        f"state_rel={[round(rel(a, b), 6) for a, b in zip(got[len(got) - len(states):], want[len(want) - len(states):])]} "
+                        f"pad_kv_untouched={untouched}",
+                        flush=True,
+                    )
+                else:
+                    print(f"PREFILL_SPLIT_CHECK {line}", flush=True)
             done += m
             if _STEP_SYNC:
                 torch.cuda.synchronize()

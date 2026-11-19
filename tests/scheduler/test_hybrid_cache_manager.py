@@ -245,6 +245,60 @@ def test_prefill_plan_is_one_or_two_replays_cut_at_the_forwards_own_snapshot():
     assert runner.prefill_plan(SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=None))) is None
 
 
+def test_padded_prefill_plan_is_one_replay_of_the_bucket_that_holds_the_chunk():
+    """With --prefill-graph-pad a chunk past 64 tokens is one replay of the smallest captured multiple of 64 that holds
+    it, the forward's own snapshot slot handed to it; 64 tokens or fewer stay one unpadded replay, past the limit eager."""
+    from freetoken.spec.runner import SpecRunner
+
+    sizes, limit, pair = {*range(1, 65), *range(128, 1025, 64)}, 1024, (7, 8)
+    runner = object.__new__(SpecRunner)
+    runner.k, runner.device = 3, torch.device("cpu")
+    runner.engine = SimpleNamespace(
+        chunk_runners=dict.fromkeys(sizes), chunk_graphs_usable=lambda: True, page_table=torch.zeros(1, 1 << 16), chunk_pad=True,
+        config=SimpleNamespace(prefill_graph_tokens=limit, prefill_graph_chunks="1-64,128-1024:64", page_size=1), prefill_runner=None,
+    )
+    for start in (0, 100):
+        for n in [*range(1, 1100), 8192]:
+            req = SimpleNamespace(cached_len=start, extend_len=n, mamba_ping_pong=pair)
+            dst = torch.tensor([pair[0]]) if n > 64 else None
+            batch = SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=dst))
+            steps = runner.prefill_plan(batch)
+            if n > limit:
+                assert steps is None, (n, steps)
+            elif n <= 64:
+                assert steps == [("chunk", n)]
+            else:
+                assert steps == [("bucket", -(-n // 64) * 64)] and batch.prefill_track_dst is dst, (n, steps)
+    # a bucket that was not captured hands the chunk to the next one up
+    del runner.engine.chunk_runners[640]
+    req = SimpleNamespace(cached_len=0, extend_len=600, mamba_ping_pong=None)
+    assert runner.prefill_plan(SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=None))) == [("bucket", 704)]
+
+
+def test_a_padded_capture_places_the_snapshot_where_the_eager_forward_does():
+    """The track rows a padded chunk capture writes before a replay of n real rows are the ones the eager forward of
+    those n rows builds (_build_track_metadata), and its cu_seqlens end at n; with no slot to track the snapshot
+    goes to the capture's own slot."""
+    from freetoken.attention.linear import ChunkCaptureLinearBackend, _build_track_metadata
+
+    pool = SimpleNamespace(conv_states=torch.zeros(1, 4, 8, 3))
+    backend = ChunkCaptureLinearBackend(torch.device("cpu"), pool, 1024, padded=True)
+    backend.spare_slot = 2  # the capture request's slot, which prepare_for_capture records
+    for start in (0, 100):
+        for n in (65, 127, 128, 129, 600, 1000, 1024):
+            for dst in (None, torch.tensor([5])):
+                req = SimpleNamespace(linear_slot_idx=1, table_idx=0, cached_len=start, extend_len=n,
+                                      mamba_ping_pong=(5, 6), mamba_next_track_idx=0, mamba_last_track_seqlen=None)
+                step = SimpleNamespace(padded_reqs=[req], prefill_track_dst=dst)
+                backend.prepare_metadata(step)
+                fla = step.fla_metadata
+                want = _build_track_metadata([req], torch.tensor([0, n]), "cpu", {"device": "cpu"}, 3)
+                assert fla.cu_seqlens.tolist() == [0, n]
+                assert fla.track_dst.tolist() == ([2] if dst is None else [5]) and fla.track_src.tolist() == [1]
+                for name in ("track_h_row", "track_seq", "track_conv_src", "track_boundary_row"):
+                    assert getattr(fla, name).tolist() == want[name].tolist(), (n, name)
+
+
 def test_prefill_plan_without_its_graphs_is_eager():
     from freetoken.spec.runner import SpecRunner
 

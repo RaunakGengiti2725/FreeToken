@@ -31,6 +31,13 @@ _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 _PREFILL_EXPERT_ALIGN = os.getenv("FREETOKEN_PREFILL_EXPERT_ALIGN", "1") != "0"
 
 
+def drop_pad_routes(topk_ids: torch.Tensor) -> torch.Tensor:
+    """``topk_ids`` with no expert (-1) on the rows that pad a captured prefill forward to its bucket (Batch.pad_rows),
+    so that the expert kernels skip their routes; unchanged on any other forward."""
+    pad = getattr(get_global_ctx().batch, "pad_rows", None)
+    return topk_ids if pad is None else topk_ids.masked_fill_(pad, -1)
+
+
 class MoELayer(BaseOP):
     """Resident routed experts.
 
@@ -150,6 +157,7 @@ class MoELayer(BaseOP):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        topk_ids = drop_pad_routes(topk_ids)
         # ranks reduce the summed output
         sum_routes = sum_routes or self.tp_size > 1
         out = self._resident_gemm(hidden_states, topk_weights, topk_ids, sum_routes)

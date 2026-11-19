@@ -49,6 +49,15 @@ def fused_topk(
 _SGL_ALIGN_MAX_EXPERTS = 1024
 
 
+def _pad_routes_dropped() -> bool:
+    """Whether this forward is a prefill padded to its captured bucket, whose pad rows route to -1
+    (layers/moe.drop_pad_routes): the triton alignment leaves negative ids out of every expert's blocks."""
+    from freetoken import core
+
+    batch = core._GLOBAL_CTX._batch if core._GLOBAL_CTX is not None else None
+    return getattr(batch, "pad_rows", None) is not None
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -102,7 +111,7 @@ def moe_align_block_size(
 
             return moe_align_block_size_triton(topk_ids, block_size, num_experts)
 
-    if not is_sgl_kernel_installed() or num_experts + 1 > _SGL_ALIGN_MAX_EXPERTS:
+    if not is_sgl_kernel_installed() or num_experts + 1 > _SGL_ALIGN_MAX_EXPERTS or _pad_routes_dropped():
         from freetoken.kernel.triton.moe_align import (
             moe_align_block_size as triton_moe_align_block_size,
         )

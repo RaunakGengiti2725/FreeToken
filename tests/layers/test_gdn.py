@@ -324,6 +324,83 @@ def test_prefill_chunk_rule_stays_one_call_under_graph_capture_and_the_replay_is
         assert torch.equal(pool.recurrent_states[0, live], eager_state[0]) and torch.equal(pool.conv_states[0, live], eager_state[1])
 
 
+@pytest.mark.parametrize("prefix", [0, 100])
+@pytest.mark.parametrize("rows", [65, 100, 127])
+def test_a_padded_chunk_capture_replays_the_eager_forward_of_its_own_rows(monkeypatch, prefix, rows):
+    """A capture of 128 rows replayed for a chunk of fewer: the chunk and conv kernels read the chunk's length on the
+    device, so the rows past it advance neither the recurrent nor the conv state, and the snapshot the replay writes
+    is the eager forward's own at the chunk's last 64-token boundary. The projections are read from one table, so
+    that only the linear-attention kernels are compared."""
+    from freetoken.attention.linear import ChunkCaptureLinearBackend
+
+    op, _ = _make_layer(2, "silu", seed=13)
+    ctx = _ctx(monkeypatch, 2)
+    pool = ctx.linear_state_pool
+    live, spare, track, bucket = 1, 2, 3, 128
+    torch.manual_seed(41)
+    table = op.in_proj.forward(torch.randn(bucket, HIDDEN, device=DEV, dtype=torch.bfloat16)).clone()
+    monkeypatch.setattr(op.in_proj, "forward", lambda x: table[: x.shape[0]])
+    monkeypatch.setattr(op.out_proj, "forward", lambda x: x)
+    rows_in = torch.zeros(bucket, HIDDEN, device=DEV, dtype=torch.bfloat16)
+
+    def req(n: int, cached: int, slot: int = live) -> Req:
+        return Req(input_ids=torch.zeros(cached + n, dtype=torch.int32), table_idx=slot, cached_len=cached,
+                   output_len=1, uid=slot, sampling_params=SamplingParams(), cache_handle=None)
+
+    def forward(r: Req, n: int) -> torch.Tensor:
+        batch = Batch(reqs=[r], phase="prefill")
+        batch.padded_reqs = [r]
+        with ctx.forward_batch(batch):
+            return op.forward(rows_in[:n])
+
+    pool.recurrent_states[0, live].zero_()
+    pool.conv_states[0, live].zero_()
+    if prefix:
+        forward(req(prefix, 0), prefix)
+    state = pool.recurrent_states[0, live].clone(), pool.conv_states[0, live].clone()
+
+    def restore() -> None:
+        pool.recurrent_states[0, live].copy_(state[0])
+        pool.conv_states[0, live].copy_(state[1])
+
+    tracked = req(rows, prefix)
+    tracked.mamba_ping_pong = (track, track + 1)
+    eager = forward(tracked, rows).clone()
+    eager_state = pool.recurrent_states[0, live].clone(), pool.conv_states[0, live].clone()
+    snapshot = pool.recurrent_states[0, track].clone(), pool.conv_states[0, track].clone()
+    # the kernels of the bucket's shapes, compiled outside the capture
+    warm = req(bucket, prefix, spare)
+    warm.mamba_ping_pong = (spare, spare)
+    forward(warm, bucket)
+
+    backend = ChunkCaptureLinearBackend(DEV, pool, bucket, padded=True)
+    batch = Batch(reqs=[req(bucket, prefix, spare)], phase="prefill")
+    batch.padded_reqs = batch.reqs
+    backend.prepare_for_capture(batch)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        with ctx.forward_batch(batch):
+            captured = op.forward(rows_in)
+    for dst in (None, track):
+        restore()
+        pool.recurrent_states[0, track].zero_()
+        pool.conv_states[0, track].zero_()
+        step = Batch(reqs=[req(rows, prefix)], phase="prefill")
+        step.padded_reqs = step.reqs
+        if dst is not None:
+            step.prefill_track_dst = torch.tensor([dst], dtype=torch.int64, device=DEV)
+        backend.prepare_metadata(step)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured[:rows], eager)
+        assert torch.equal(pool.recurrent_states[0, live], eager_state[0]) and torch.equal(pool.conv_states[0, live], eager_state[1])
+        if dst is None:
+            assert not pool.recurrent_states[0, track].any()
+        else:
+            assert torch.equal(pool.recurrent_states[0, track], snapshot[0]) and torch.equal(pool.conv_states[0, track], snapshot[1])
+
+
 def _track_snapshot_and_recomputed(monkeypatch, cached_len: int):
     """A 150-token prefill after ``cached_len`` cached tokens that snapshots its state at its last chunk boundary (128 tokens in), and the state of a request that prefills exactly those 128 tokens from the same cached state.
 

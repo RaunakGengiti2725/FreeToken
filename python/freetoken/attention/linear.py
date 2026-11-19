@@ -231,29 +231,66 @@ class LinearAttnBackend(BaseAttnBackend):
         self.capture.cache_indices[:bs].copy_(metadata.cache_indices)
 
 
+def padded_track_rows(tokens: int, km1: int) -> tuple[int, list[int]]:
+    """The track snapshot of a forward of ``tokens`` real rows, as its own eager forward places it: the forward-local
+    row of the deepest 64-token boundary before its end, and the rows of the conv window that ends there."""
+    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+    boundary = (tokens - 1) // CHUNK_SIZE * CHUNK_SIZE
+    return boundary, list(range(boundary - km1, boundary))
+
+
 class ChunkCaptureLinearBackend(LinearAttnBackend):
     """A capture for prefill chunks of one fixed length of one request that continue a live state: the metadata is
-    the same tensors at capture and at every replay, only the state slot changes."""
+    the same tensors at capture and at every replay, only the state slot changes.
 
-    def __init__(self, device: torch.device, pool: LinearStatePool, tokens: int) -> None:
+    ``padded``: the capture of a bucket a shorter chunk is padded to. The chunk's own length goes into ``cu_seqlens``
+    before each replay, and the chunk and conv kernels read it on the device, so the rows past it neither advance the
+    state nor reach the conv state; the forward also writes the track snapshot of its own length (the eager forward
+    of the chunk does too), to the request's track slot or, where it tracks nothing, to the capture's slot."""
+
+    def __init__(self, device: torch.device, pool: LinearStatePool, tokens: int, padded: bool = False) -> None:
         super().__init__(device, pool)
         # int64 as the chunk kernel wants it: a converted copy would be a new tensor each layer and miss fla's index cache
         self.cu_seqlens = torch.tensor([0, tokens], dtype=torch.int64, device=device)
         self.slot = torch.zeros(1, dtype=torch.int32, device=device)
         self.has_state = torch.ones(1, dtype=torch.bool, device=device)
+        self.padded = padded
+        self.km1 = pool.conv_states.shape[-1]
+        # dst, src, h row, seq, boundary row, then the conv window's rows
+        self.track = torch.zeros(5 + self.km1, dtype=torch.int64, device=device) if padded else None
+        self.spare_slot: int | None = None
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
         self.capture_bs = sorted(bs_list)
 
     def _metadata(self, batch: "Batch") -> None:
-        self.slot.fill_(gdn_slot(batch.padded_reqs[0]))
+        req = batch.padded_reqs[0]
+        self.slot.fill_(gdn_slot(req))
         batch.fla_metadata = FLAMetadata(cu_seqlens=self.cu_seqlens, cache_indices=self.slot, has_initial_state=self.has_state)
+        if not self.padded:
+            return
+        from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+        tokens = req.extend_len
+        self.cu_seqlens[1:].fill_(tokens)
+        boundary, conv_rows = padded_track_rows(tokens, self.km1)
+        dst = getattr(batch, "prefill_track_dst", None)
+        host = [self.spare_slot if dst is None else 0, gdn_slot(req), boundary // CHUNK_SIZE, 0, boundary, *conv_rows]
+        self.track.copy_(torch.tensor(host, dtype=torch.int64, pin_memory=torch.cuda.is_available()), non_blocking=True)
+        if dst is not None:
+            self.track[:1].copy_(dst)
+        t = self.track
+        batch.fla_metadata.track_dst, batch.fla_metadata.track_src = t[0:1], t[1:2]
+        batch.fla_metadata.track_h_row, batch.fla_metadata.track_seq = t[2:3], t[3:4]
+        batch.fla_metadata.track_boundary_row, batch.fla_metadata.track_conv_src = t[4:5], t[5:].view(1, self.km1)
 
     prepare_metadata = _metadata
 
     def prepare_for_capture(self, batch: "Batch") -> None:
         from freetoken.kernel.fla.index import prepare_chunk_indices, prepare_chunk_offsets, prepare_lens
 
+        self.spare_slot = gdn_slot(batch.padded_reqs[0])
         self._metadata(batch)
         # the chunk kernels take their index tensors from an identity cache of a few entries, which later prefills
         # evict; the capture reads the ones held here (16, 32 and 64 are the chunk sizes the kernels ask for)
@@ -283,4 +320,4 @@ class WideVerifyLinearBackend(LinearAttnBackend):
         batch.fla_metadata.verify_scratch = self.scratch
 
 
-__all__ = ["ChunkCaptureLinearBackend", "FLACaptureData", "FLAMetadata", "LinearAttnBackend", "WideVerifyLinearBackend", "build_fla_metadata"]
+__all__ = ["ChunkCaptureLinearBackend", "FLACaptureData", "FLAMetadata", "LinearAttnBackend", "WideVerifyLinearBackend", "build_fla_metadata", "padded_track_rows"]

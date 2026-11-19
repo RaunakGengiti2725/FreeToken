@@ -1327,6 +1327,16 @@ def test_preset_single_fast_serves_as_single_where_its_captures_do_not_fit(decod
     # typed chunks are not the preset's to drop
     typed = planned(16 << 30, preset_fields=("moe_strategy", "prefill_graph_tokens"))
     assert typed.prefill_graph_chunks == "1-64" and typed.prefill_graph_tokens == 64
+    # single-bucket leaves its own, larger share; dropped, it is single's too, unpadded
+    from freetoken.engine.engine import PRESET_BUCKET_CAPTURE_BYTES, _drop_preset_captures, _preset_capture_bytes
+
+    bucket = SimpleNamespace(
+        preset="single-bucket", preset_fields=("moe_strategy", *captures, "prefill_graph_pad"),
+        prefill_graph_tokens=1024, prefill_graph_chunks="1-64,128-1024:64", prefill_graph_pad=True,
+    )
+    assert _preset_capture_bytes(bucket) == PRESET_BUCKET_CAPTURE_BYTES > PRESET_CAPTURE_BYTES
+    _drop_preset_captures(bucket, "a test")
+    assert single(bucket) and not bucket.prefill_graph_pad and bucket.preset_fields == ("moe_strategy",)
 
 
 def test_preset_serves_the_stores_draft_token_map_only_where_every_expert_is_resident(decode_rows, monkeypatch):

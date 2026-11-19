@@ -163,6 +163,17 @@ def test_preset_single_fast_is_single_and_the_captured_prefill_forwards():
     assert (single.prefill_graph_tokens, single.prefill_graph_chunks) == (0, "") == (ServerArgs.prefill_graph_tokens, ServerArgs.prefill_graph_chunks)
 
 
+def test_preset_single_bucket_is_single_fast_and_the_padded_buckets():
+    fast, bucket = _parse("--preset", "single-fast"), _parse("--preset", "single-bucket")
+    differ = {f.name for f in dataclasses.fields(fast) if getattr(fast, f.name) != getattr(bucket, f.name)}
+    assert differ == {"preset", "preset_fields", "prefill_graph_tokens", "prefill_graph_chunks", "prefill_graph_pad"}
+    assert (bucket.prefill_graph_tokens, bucket.prefill_graph_chunks, bucket.prefill_graph_pad) == (1024, "1-64,128-1024:64", True)
+    # unpadded, the same captures and the memory left for them: the chunks run as one or two replays
+    split = _parse("--preset", "single-bucket", "--no-prefill-graph-pad")
+    assert not split.prefill_graph_pad and "prefill_graph_pad" not in split.preset_fields and "prefill_graph_chunks" in split.preset_fields
+    assert not fast.prefill_graph_pad and not ServerArgs.prefill_graph_pad
+
+
 def test_preset_kv_reserve_follows_the_output_limit_and_leaves_a_sized_kv_pool_alone():
     assert _parse("--preset", "single", "--max-output-tokens", "8192").kv_reserve_tokens == 8192 + 4096
     sized = _parse("--preset", "single", "--num-tokens", "65536")

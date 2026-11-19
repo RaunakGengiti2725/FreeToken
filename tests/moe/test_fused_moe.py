@@ -516,3 +516,50 @@ def test_moe_align_sorts_every_route_into_its_expert_blocks_past_1024_experts(nu
     assert sorted(real.tolist()) == list(range(flat.numel()))
     block_of = torch.arange(n, device="cuda") // 16
     assert torch.equal(flat[real.long()], expert_ids[block_of[rows]])
+
+
+def test_a_padded_prefill_routes_its_pad_rows_to_no_expert_and_aligns_on_triton(monkeypatch):
+    """A prefill padded to its captured bucket (Batch.pad_rows) gives its pad rows' routes no expert (-1), and its
+    alignment is the triton one, which leaves negative ids out of every expert's blocks; any other forward is unchanged."""
+    from types import SimpleNamespace
+
+    import freetoken.core as core
+    import freetoken.kernel.backend as backend
+    import freetoken.kernel.triton.moe_align as triton_align
+    import freetoken.moe.fused as fused
+    from freetoken.layers.moe import drop_pad_routes
+
+    ctx = core.Context(page_size=1)
+    monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)
+    monkeypatch.setattr(backend, "is_sgl_kernel_installed", lambda: True)
+    monkeypatch.setattr(backend, "is_rocm", lambda: False)
+    monkeypatch.setattr(triton_align, "moe_align_block_size", lambda ids, block, experts: ("triton", ids.clone()))
+    ids = torch.arange(24, dtype=torch.int32).view(6, 4)
+
+    ctx._batch = SimpleNamespace(pad_rows=None)
+    assert torch.equal(drop_pad_routes(ids.clone()), ids) and not fused._pad_routes_dropped()
+
+    ctx._batch = SimpleNamespace(pad_rows=torch.tensor([[False]] * 4 + [[True]] * 2))
+    routed = drop_pad_routes(ids.clone())
+    assert torch.equal(routed[:4], ids[:4]) and (routed[4:] == -1).all()
+    path, seen = fused.moe_align_block_size(routed, 16, 32)
+    assert path == "triton" and torch.equal(seen, routed)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rows", [16, 200])
+def test_triton_alignment_leaves_routes_to_no_expert_out(rows):
+    """The pad rows of a padded prefill route to -1: the triton alignment must give the real rows' blocks alone."""
+    from freetoken.kernel.triton.moe_align import moe_align_block_size
+
+    torch.manual_seed(0)
+    real = torch.randint(0, 64, (rows, 8), dtype=torch.int32, device="cuda")
+    padded = torch.cat([real, torch.full((37, 8), -1, dtype=torch.int32, device="cuda")])
+    _, experts_real, ntpp_real = moe_align_block_size(real, 16, 64)
+    sorted_ids, experts, ntpp = moe_align_block_size(padded, 16, 64)
+    assert int(ntpp) == int(ntpp_real)
+    blocks = int(ntpp) // 16
+    assert torch.equal(experts[:blocks], experts_real[:blocks])
+    kept = sorted_ids[: int(ntpp)]
+    kept = kept[kept < padded.numel()]
+    assert kept.numel() == real.numel() and int(kept.max()) < real.numel()

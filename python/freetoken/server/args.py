@@ -146,6 +146,12 @@ _PRESETS["single-measured"] = dict(_PRESETS["single"])
 # chunks run eagerly, as under 'single'. The engine drops the captures where not every expert is resident
 # (engine._drop_preset_captures).
 _PRESETS["single-fast"] = {**_PRESETS["single"], "prefill_graph_tokens": 64, "prefill_graph_chunks": "1-64"}
+# 'single-fast' and captures for chunks of 65 to 1,024 tokens: one replay of the smallest multiple of 64 that holds the
+# chunk, its rows past the chunk padding (--prefill-graph-pad). A padded replay runs the matrix kernels at the bucket's
+# row count, which may tile them otherwise than the eager forward of the chunk's tokens: its text can differ from 'single''s.
+_PRESETS["single-bucket"] = {
+    **_PRESETS["single-fast"], "prefill_graph_tokens": 1024, "prefill_graph_chunks": "1-64,128-1024:64", "prefill_graph_pad": True,
+}
 # 'single' for several requests at a time: 8 unless the command line names another number. The KV reserve and the decode
 # batch sizes captured as graphs follow that number (_apply_preset).
 _PRESETS["multi"] = {**_PRESETS["single"], "max_running_req": 8, "cuda_graph_bs": None}
@@ -1132,6 +1138,21 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--prefill-graph-pad",
+        action=argparse.BooleanOptionalAction,
+        dest="prefill_graph_pad",
+        default=ServerArgs.prefill_graph_pad,
+        help=(
+            "With --prefill-graph-chunks: a chunk of more than 64 tokens runs as one replay of the smallest captured "
+            "multiple of 64 that holds it, instead of two cut at its last 64-token boundary. The rows past the chunk "
+            "are padding: they store no K/V, leave the linear state where the chunk's tokens leave it and take no "
+            "expert route. The matrix kernels run at the bucket's row count, so the text can differ from an eager "
+            "forward's. Only where the experts are resident without an expert cache (--moe-strategy fused); elsewhere "
+            "the flag changes nothing."
+        ),
+    )
+
+    parser.add_argument(
         "--prefill-graph-rows",
         type=int,
         dest="prefill_graph_rows",
@@ -1250,6 +1271,11 @@ def parse_args(
             "computes what the eager forward computes, so its replies are the text 'single' gives; longer continuations "
             "run eagerly, as under 'single'. It needs every expert on the GPU and "
             "leaves 2.25 GiB free for the captures; where that does not fit it serves as 'single' and the log says so. "
+            "'single-bucket' is 'single-fast' with --prefill-graph-tokens 1024 --prefill-graph-chunks 1-64,128-1024:64 "
+            "--prefill-graph-pad: a chunk of 65 to 1,024 tokens, a unique prompt among them, runs as one captured forward "
+            "padded to the next multiple of 64. The padded forward runs other kernel shapes than the eager one, so its "
+            "replies can differ from 'single''s. It leaves 3.25 GiB free for the captures and serves as 'single' where "
+            "that does not fit; served from an expert cache, such a chunk runs as two replays as with --no-prefill-graph-pad. "
             "'multi' is 'single' for several requests at a time: --max-running-requests 8 (a typed number is kept, e.g. "
             f"16), a --kv-reserve-tokens of a {PRESET_PROMPT_TOKENS}-token prompt and as long an answer for each of them, and "
             f"a decode graph for every batch size up to {PRESET_GRAPH_EVERY_BS} (--cuda-graph-bs) so that a batch is not "
