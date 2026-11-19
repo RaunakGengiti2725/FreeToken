@@ -20,6 +20,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _FOLD_SAID = False  # the router fold's one line a process
+# FREETOKEN_ROUTER_FOLD=0 keeps the router's linear and its top-k two launches on every step, and with them the shared
+# expert's own kernels, since the ninth route's gate rides the fold's launch: every step then routes as a prefill does.
+# Read once, at import; a block decides at its first decode step.
+ROUTER_FOLD_ENV = "FREETOKEN_ROUTER_FOLD"
+_ROUTER_FOLD = os.environ.get(ROUTER_FOLD_ENV, "1").strip() != "0"
 
 # A decode step of up to this many rows (one row, or a verify of up to five drafts) on resident NVFP4 experts runs the
 # shared expert as one more route of the routed experts' kernels and its gate as one more row of the router's launch:
@@ -131,9 +136,11 @@ class Qwen3_5MoE(BaseOP):
 
     def _router_weight_off(self) -> str | None:
         """Why the router's weight cannot go into its top-k kernel, or None when it can: a bf16 [E, H]
-        torch linear without a bias on the GPU."""
+        torch linear without a bias on the GPU, and the fold not turned off."""
         from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
 
+        if not _ROUTER_FOLD:
+            return f"{ROUTER_FOLD_ENV}=0"
         layer = self.gate
         w = layer.weight
         if layer.bias is not None:

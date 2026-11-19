@@ -500,6 +500,34 @@ def test_qwen3_5_moe_says_once_why_its_router_does_not_fold(monkeypatch):
     assert block(torch.zeros(256, 2048))._router_weight_off() == "the router's weight is on cpu"
 
 
+def test_qwen3_5_moe_router_fold_off_keeps_the_ninth_route_off_too(monkeypatch):
+    """FREETOKEN_ROUTER_FOLD=0: no decode step folds the router, so none takes the ninth route whose gate rides the
+    fold's launch; the one line names the switch, checked before any property of the weight."""
+    from types import SimpleNamespace
+
+    from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
+    from freetoken.models.qwen3_5_moe import moe as qmoe
+
+    said = []
+    monkeypatch.setattr(qmoe, "_FOLD_SAID", False)
+    monkeypatch.setattr(qmoe, "_ROUTER_FOLD", False)
+    monkeypatch.setattr(qmoe, "_SHARED_ROUTE", True)
+    monkeypatch.setattr(qmoe.logger, "info_rank0", lambda msg, *a, **k: said.append(msg), raising=False)
+    monkeypatch.setattr(qmoe, "get_global_ctx", lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=False)))
+
+    m = object.__new__(qmoe.Qwen3_5MoE)
+    m.gate = SimpleNamespace(weight=torch.zeros(256, 2048, dtype=torch.bfloat16), bias=torch.zeros(256),
+                             quant_method=SimpleNamespace(kernel=TorchLinearKernel()))
+    m.experts = SimpleNamespace(top_k=8, renormalize=True)
+    m._router_weight, m._router_off = False, None
+    m._shared_route = {"gate_up": torch.empty(0)}   # built: only the fold's decision keeps it off
+    x = torch.zeros(6, 2048, dtype=torch.bfloat16)
+    assert m._shared_route_for(x) is None
+    assert m._routes_in_kernel(x) is None
+    assert m._router_weight is None and m._router_off == "FREETOKEN_ROUTER_FOLD=0"
+    assert said == ["router fold on decode: off (FREETOKEN_ROUTER_FOLD=0)"]
+
+
 def _router_gemv_inputs(rows, num_experts, hidden, seed):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(rows, hidden, generator=gen, device="cuda").to(torch.bfloat16)
@@ -530,7 +558,19 @@ def test_router_gemv_topk_routes_its_logits_as_the_router_does(rows, num_experts
     ref_w, ref_i = fused_topk_softmax(logits, topk, renormalize)
 
     assert torch.equal(ids, ref_i)
-    assert torch.equal(weights.view(torch.int32), ref_w.view(torch.int32))
+    if not renormalize:
+        assert torch.equal(weights.view(torch.int32), ref_w.view(torch.int32))
+        return
+    # The same picks, renormalized by their sum in selection order (the router sums its slots in its own
+    # layout's order, which the prefill keeps): the picks summed one by one in fp32, then Triton's division.
+    picks, _ = fused_topk_softmax(logits, topk, False)
+    total = torch.zeros(rows, dtype=torch.float32, device="cuda")
+    for k in range(topk):
+        total = total + picks[:, k]
+    want = picks / total[:, None]
+    ulp = torch.ldexp(torch.ones_like(want), torch.frexp(want).exponent - 24)
+    assert ((weights - want).abs() <= 3 * ulp).all()
+    torch.testing.assert_close(weights, ref_w, rtol=4e-6, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

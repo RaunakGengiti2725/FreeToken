@@ -74,8 +74,13 @@ def _route_rows(
     RENORMALIZE: tl.constexpr,
     HAS_TOKEN_LIMIT: tl.constexpr,
     launch_pdl: tl.constexpr,
+    SUM_IN_PICK_ORDER: tl.constexpr,
 ):
-    """The router past its logits: score the [BLOCK_M, BLOCK_N] fp32 ``logits`` of rows ``offs_m``, take the top-k, store it."""
+    """The router past its logits: score the [BLOCK_M, BLOCK_N] fp32 ``logits`` of rows ``offs_m``, take the top-k, store it.
+
+    SUM_IN_PICK_ORDER renormalizes the softmax weights by a sum taken as each pick is made; without it the sum is a
+    tl.sum over the K slots, in the order the compiled layout sets. The fold takes the first, so its order does not
+    depend on the loads beside it; the plain router keeps the second, its order on every prefill and unfolded step."""
     if SIGMOID:
         # libdevice exp and round-to-nearest division match torch.sigmoid bit for bit.
         activated = tl.div_rn(1.0, 1.0 + libdevice.exp(-logits))
@@ -97,9 +102,10 @@ def _route_rows(
     mask_k = offs_k < K
     selected_vals = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
     selected_idx = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.int32)
-    # The softmax weights' renormalizing sum, in selection order: a tl.sum over the K slots would add
-    # them in an order set by the compiled layout, which differs between kernels that inline this helper.
-    picked_sum = tl.zeros([BLOCK_M, 1], dtype=tl.float32)
+    if SUM_IN_PICK_ORDER:
+        # in selection order: a tl.sum over the K slots adds them in an order set by the compiled layout,
+        # which differs between kernels that inline this helper
+        picked_sum = tl.zeros([BLOCK_M, 1], dtype=tl.float32)
 
     cur = ranked
     for k in tl.static_range(K):
@@ -110,7 +116,8 @@ def _route_rows(
         win_activated = tl.sum(
             tl.where(offs_n[None, :] == win_lane, activated, 0.0), axis=1
         )[:, None]
-        picked_sum = picked_sum + win_activated
+        if SUM_IN_PICK_ORDER:
+            picked_sum = picked_sum + win_activated
         slot = offs_k[None, :] == k
         selected_vals = tl.where(slot, win_activated, selected_vals)
         selected_idx = tl.where(slot, win_lane, selected_idx)
@@ -120,11 +127,14 @@ def _route_rows(
         tl.extra.cuda.gdc_launch_dependents()
 
     if RENORMALIZE:
-        if SIGMOID:
-            routed_sum = tl.sum(tl.where(mask_k[None, :], selected_vals, 0.0), axis=1)[:, None]
-            selected_vals = tl.div_rn(selected_vals, routed_sum + 1e-20)
-        else:
+        if SUM_IN_PICK_ORDER:
             selected_vals = selected_vals / tl.where(picked_sum > 0.0, picked_sum, 1.0)
+        else:
+            routed_sum = tl.sum(tl.where(mask_k[None, :], selected_vals, 0.0), axis=1)[:, None]
+            if SIGMOID:
+                selected_vals = tl.div_rn(selected_vals, routed_sum + 1e-20)
+            else:
+                selected_vals = selected_vals / tl.where(routed_sum > 0.0, routed_sum, 1.0)
     if SIGMOID:
         selected_vals = selected_vals * routed_scale
 
@@ -187,7 +197,7 @@ def _router_triton_kernel(
     _route_rows(
         logits, offs_m, mask_m, offs_n, mask_n, bias_ptr, out_weights_ptr, out_indices_ptr, num_token_non_padded_ptr,
         routed_scale, stride_wm, stride_wk, stride_im, stride_ik,
-        N, K, BLOCK_M, BLOCK_K, SIGMOID, N_GROUP, TOPK_GROUP, BLOCK_G, RENORMALIZE, HAS_TOKEN_LIMIT, launch_pdl,
+        N, K, BLOCK_M, BLOCK_K, SIGMOID, N_GROUP, TOPK_GROUP, BLOCK_G, RENORMALIZE, HAS_TOKEN_LIMIT, launch_pdl, False,
     )
 
 
@@ -237,7 +247,8 @@ def _router_gemv_topk_kernel(
 ) -> None:
     """``(row, expert tile, H slice)``: one slice of BLOCK_E logits of a row. The last program to land
     a slice of the row sums the slices in a fixed order, stores the row's logits in bf16 as F.linear
-    does, and runs the softmax router's own one-row program on them.
+    does, and runs the softmax router's own one-row program on them, its renormalizing sum taken in
+    selection order.
 
     With SHARED_GATE one more tile (``pid_e == N_TILES``) computes the shared expert gate's logit, a row
     outside the softmax, by the same statements; the last program also writes route K of the row: the
@@ -299,7 +310,7 @@ def _router_gemv_topk_kernel(
         _route_rows(
             logits, offs_m, mask_m, offs_n, mask_n, w_ptr, out_weights_ptr, out_indices_ptr, c_ptr,
             1.0, stride_wm, stride_wk, stride_im, stride_ik,
-            N, K, 1, BLOCK_K, False, 1, 1, 1, RENORMALIZE, False, launch_pdl,
+            N, K, 1, BLOCK_K, False, 1, 1, 1, RENORMALIZE, False, launch_pdl, True,
         )
         if SHARED_GATE:
             one = tl.arange(0, 1)
@@ -459,7 +470,9 @@ def router_gemv_topk_softmax(
 
     The logits are rounded to bf16 as F.linear stores them and routed by the same program, but their
     dot is summed in this kernel's order, not cuBLAS's: a near-tie between two experts may route the
-    other way. ``logits_out`` [M, N] bf16, when given, receives the logits.
+    other way. The picks' renormalizing sum is taken in selection order, so with ``renormalize`` a
+    weight can differ from :func:`fused_topk_softmax`'s on the same logits in its last bits; the ids
+    and the unnormalized weights are its own. ``logits_out`` [M, N] bf16, when given, receives the logits.
 
     ``shared_gate`` [1, H] bf16, the weight of a shared expert's gate, adds a route after the top-k:
     [M, topk + 1] weights and ids whose last column is id N (no routed expert) with weight
