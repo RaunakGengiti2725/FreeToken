@@ -125,8 +125,10 @@ class MoELayer(BaseOP):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        sum_routes: bool = True,
     ) -> torch.Tensor:
-        """Expert compute for an externally computed routing decision (``TopK``).
+        """Expert compute for an externally computed routing decision (``TopK``); ``sum_routes`` as in ``forward``.
 
         Same name and shape as ``OffloadMoELayer.routed_forward`` so a model with
         its own router calls ``experts.routed_forward(...)`` without knowing whether
@@ -139,7 +141,7 @@ class MoELayer(BaseOP):
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
         shared branches that need the original input before calling this method.
         """
-        out = self._resident_gemm(hidden_states, topk_weights, topk_ids)
+        out = self._resident_gemm(hidden_states, topk_weights, topk_ids, sum_routes or self.tp_size > 1)
         return self._maybe_all_reduce(out)
 
     def forward(
@@ -233,8 +235,10 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        sum_routes: bool = True,
     ) -> torch.Tensor:
-        """Expert compute for an externally computed routing decision (``TopK``).
+        """Expert compute for an externally computed routing decision (``TopK``); ``sum_routes`` as in ``forward``.
 
         The entry point for models whose router does not fit ``fused_topk`` (sigmoid
         scores, selection bias, group-limited top-k, ...); identical to ``forward``
@@ -248,7 +252,7 @@ class OffloadMoELayer(MoELayer):
         if ctx.batch.is_prefill:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
-            out = self._decode_routed(hidden_states, topk_weights, topk_ids)
+            out = self._decode_routed(hidden_states, topk_weights, topk_ids, sum_routes or self.tp_size > 1)
         return self._maybe_all_reduce(out)
 
     def decode_forward(

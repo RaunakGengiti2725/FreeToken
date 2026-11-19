@@ -451,6 +451,109 @@ def test_fused_topk_softmax_is_cuda_graph_capturable():
     assert (ids[3:] == -1).all()
 
 
+@pytest.mark.parametrize(
+    "rows,num_experts,hidden,topk,folds",
+    [
+        (1, 256, 2048, 8, True),  # Qwen3.5/3.6 MoE, one row
+        (6, 256, 2048, 8, True),  # MTP-5 verify
+        (16, 256, 2048, 8, True),
+        (17, 256, 2048, 8, False),  # past the decode-sized batches
+        (0, 256, 2048, 8, False),
+        (1, 512, 1024, 10, True),
+        (1, 128, 2048, 8, False),  # the router packs several rows a program here
+        (1, 1024, 2048, 8, False),  # and runs four warps here
+        (1, 256, 2000, 8, False),  # no whole GEMV slices
+    ],
+)
+def test_router_gemv_topk_folds_only_where_the_router_runs_one_row_a_warp(rows, num_experts, hidden, topk, folds):
+    """The fold routes its logits with the softmax router's own program; that holds only for its one-row, one-warp tile."""
+    from freetoken.kernel.triton.moe_router import router_gemv_topk_folds
+
+    assert router_gemv_topk_folds(rows, num_experts, hidden, topk) is folds
+
+
+def _router_gemv_inputs(rows, num_experts, hidden, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(rows, hidden, generator=gen, device="cuda").to(torch.bfloat16)
+    w = (torch.randn(num_experts, hidden, generator=gen, device="cuda") * 0.02).to(torch.bfloat16)
+    return x, w
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("renormalize", [True, False])
+@pytest.mark.parametrize("rows,num_experts,hidden,topk", [(1, 256, 2048, 8), (6, 256, 2048, 8), (16, 256, 2048, 8), (3, 512, 1024, 10), (2, 200, 512, 8)])
+def test_router_gemv_topk_routes_its_logits_as_the_router_does(rows, num_experts, hidden, topk, renormalize):
+    from freetoken.kernel.triton.moe_router import fused_topk_softmax, router_gemv_topk_softmax
+
+    x, w = _router_gemv_inputs(rows, num_experts, hidden, rows * 7 + num_experts)
+    logits = torch.empty(rows, num_experts, dtype=torch.bfloat16, device="cuda")
+    weights, ids = router_gemv_topk_softmax(x, w, topk, renormalize, logits_out=logits)
+    ref_w, ref_i = fused_topk_softmax(logits, topk, renormalize)
+
+    assert torch.equal(ids, ref_i)
+    assert torch.equal(weights.view(torch.int32), ref_w.view(torch.int32))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rows,num_experts,hidden", [(1, 256, 2048), (6, 256, 2048), (16, 256, 2048), (2, 200, 512)])
+def test_router_gemv_topk_logits_round_the_exact_dot(rows, num_experts, hidden):
+    """Against the fp64 dot, not F.linear, whose split-K partials cuBLAS may round: one bf16 step from the final
+    rounding plus fp32 summation error; a slice read stale or twice is off by far more."""
+    from freetoken.kernel.triton.moe_router import router_gemv_topk_softmax
+
+    x, w = _router_gemv_inputs(rows, num_experts, hidden, 100 + rows)
+    logits = torch.empty(rows, num_experts, dtype=torch.bfloat16, device="cuda")
+    router_gemv_topk_softmax(x, w, 8, True, logits_out=logits)
+    exact = x.double() @ w.double().t()
+
+    big = torch.maximum(logits.double().abs(), exact.abs())
+    step = torch.ldexp(torch.ones_like(big), torch.frexp(big).exponent - 8)
+    summed = x.double().abs() @ w.double().abs().t()
+    assert ((logits.double() - exact).abs() <= step + 1e-5 * summed).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_router_gemv_topk_rows_do_not_depend_on_the_batch():
+    from freetoken.kernel.triton.moe_router import router_gemv_topk_softmax
+
+    x, w = _router_gemv_inputs(6, 256, 2048, 3)
+    logits = torch.empty(6, 256, dtype=torch.bfloat16, device="cuda")
+    weights, ids = router_gemv_topk_softmax(x, w, 8, True, logits_out=logits)
+    for r in range(6):
+        one = torch.empty(1, 256, dtype=torch.bfloat16, device="cuda")
+        w1, i1 = router_gemv_topk_softmax(x[r : r + 1], w, 8, True, logits_out=one)
+        assert torch.equal(one.view(torch.int16), logits[r : r + 1].view(torch.int16))
+        assert torch.equal(i1, ids[r : r + 1])
+        assert torch.equal(w1.view(torch.int32), weights[r : r + 1].view(torch.int32))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rows", [1, 6])
+def test_router_gemv_topk_replays_in_a_cuda_graph(rows):
+    """The arrival counters reset themselves, so every replay routes its own input."""
+    from freetoken.kernel.triton.moe_router import router_gemv_topk_softmax
+
+    x, w = _router_gemv_inputs(rows, 256, 2048, 21)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        router_gemv_topk_softmax(x, w, 8, True)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        weights, ids = router_gemv_topk_softmax(x, w, 8, True)
+
+    gen = torch.Generator(device="cuda").manual_seed(22)
+    for _ in range(3):
+        x.copy_(torch.randn(x.shape, generator=gen, device="cuda").to(torch.bfloat16))
+        graph.replay()
+        ref_w, ref_i = router_gemv_topk_softmax(x, w, 8, True)
+        torch.cuda.synchronize()
+        assert torch.equal(ids, ref_i)
+        assert torch.equal(weights.view(torch.int32), ref_w.view(torch.int32))
+
+
 def _reference_sigmoid_topk(logits, bias, topk, renormalize, scale, n_group, topk_group, num_token_non_padded):
     """The torch routing of the GLM / MiniMax MoE blocks: sigmoid, bias for selection only, optional group-limited top-k."""
     scores = logits.float().sigmoid()

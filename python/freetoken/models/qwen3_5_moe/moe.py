@@ -70,6 +70,7 @@ class Qwen3_5MoE(BaseOP):
         )
         self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
         self._fuse_shared = self._shared_expert_fusable(config)
+        self._router_weight: torch.Tensor | None | bool = False  # False until the first decode step decides
 
     def _shared_expert_fusable(self, config: ModelConfig) -> bool:
         """Whether decode can run the shared expert in the fused NVFP4 kernels: both projections
@@ -91,7 +92,41 @@ class Qwen3_5MoE(BaseOP):
         down = self.shared_expert.down_proj
         return shared_expert_fuses_rows(hidden_states.shape[0], down.out_features, down.in_features, hidden_states.device)
 
-    def _forward_fused(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+    def _router_weight_in_kernel(self) -> torch.Tensor | None:
+        """The router's weight when its top-k kernel can take the logits too: a bf16 [E, H] torch
+        linear without a bias on the GPU. Decided once, at the first decode step, when the weights are final."""
+        if self._router_weight is False:
+            from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
+
+            layer = self.gate
+            w = layer.weight
+            takes = layer.bias is None and isinstance(layer.quant_method.kernel, TorchLinearKernel)
+            takes = takes and w.is_cuda and w.dtype == torch.bfloat16 and w.dim() == 2 and w.stride(1) == 1
+            self._router_weight = w if takes else None
+        return self._router_weight
+
+    def _routes_in_kernel(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """(topk weights, topk ids) of a decode step from one launch that also computes the router's
+        logits, or None where the linear and the router stay two launches. The logits are summed in
+        that kernel's order, not cuBLAS's, so a near-tie may route to the other expert."""
+        if hidden_states.dtype != torch.bfloat16 or hidden_states.stride(1) != 1 or get_global_ctx().batch.is_prefill:
+            return None
+        w = self._router_weight_in_kernel()
+        if w is None:
+            return None
+        from freetoken.kernel.triton.moe_router import router_gemv_topk_folds, router_gemv_topk_softmax
+
+        experts = self.experts
+        if not router_gemv_topk_folds(hidden_states.shape[0], w.shape[0], w.shape[1], experts.top_k):
+            return None
+        return router_gemv_topk_softmax(hidden_states, w, experts.top_k, experts.renormalize)
+
+    def _routed(self, hidden_states, router_logits, routes, sum_routes: bool = True) -> torch.Tensor:
+        if routes is None:
+            return self.experts.forward(hidden_states=hidden_states, router_logits=router_logits, sum_routes=sum_routes)
+        return self.experts.routed_forward(hidden_states, *routes, sum_routes=sum_routes)
+
+    def _forward_fused(self, hidden_states: torch.Tensor, router_logits: torch.Tensor | None, routes) -> torch.Tensor:
         """A decode step with the shared expert's elementwise kernels inside its two projections,
         bit for bit the unfused statements of ``forward``."""
         from freetoken.kernel.triton.nvfp4_shared_expert import shared_expert_down_add, shared_expert_gate_up
@@ -101,7 +136,7 @@ class Qwen3_5MoE(BaseOP):
         act = shared_expert_gate_up(hidden_states, gate_up.weight, gate_up.weight_scale, gate_up.weight_global)
         gate = self.shared_expert_gate.forward(hidden_states).view(-1)
         # each route's output where the experts' decode kernel has it: the down kernel then sums the routes too
-        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits, sum_routes=False)
+        routed = self._routed(hidden_states, router_logits, routes, sum_routes=False)
         return shared_expert_down_add(act, down.weight, down.weight_scale, down.weight_global, gate, routed)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -110,12 +145,13 @@ class Qwen3_5MoE(BaseOP):
         # Compute the router + shared expert BEFORE the routed experts: the fused MoE
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
-        router_logits = self.gate.forward(hidden_states)
+        routes = self._routes_in_kernel(hidden_states)
+        router_logits = self.gate.forward(hidden_states) if routes is None else None
         if self._fuses_step(hidden_states):
-            return self._forward_fused(hidden_states, router_logits).view(num_tokens, hidden_dim)
+            return self._forward_fused(hidden_states, router_logits, routes).view(num_tokens, hidden_dim)
         shared = self.shared_expert.forward(hidden_states)
         shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
-        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        routed = self._routed(hidden_states, router_logits, routes)
         return (routed + shared).view(num_tokens, hidden_dim)
 
 
