@@ -500,9 +500,10 @@ def test_split_ba_in_the_recurrence_kernel_is_the_launched_projection_bit_for_bi
         ctx.linear_state_pool.commit_verify([r.table_idx for r in reqs], accepted)
         outs.append(_step(op, ctx, reqs, _exact_rows(len(lengths), gen)))
         pool = ctx.linear_state_pool
-        runs.append((outs, pool.recurrent_states.clone(), pool.conv_states.clone(), calls, op._ba_weight))
-    (folded, state1, conv1, calls1, w1), (launched, state0, conv0, calls0, w0) = runs
-    assert isinstance(w1, torch.Tensor) and w0 is False
+        runs.append((outs, pool.recurrent_states.clone(), pool.conv_states.clone(), calls, op._ba_weight, op._ba_off))
+    (folded, state1, conv1, calls1, w1, off1), (launched, state0, conv0, calls0, w0, off0) = runs
+    assert isinstance(w1, torch.Tensor) and off1 is None, off1
+    assert w0 is None and off0 == "FREETOKEN_GDN_BA_IN_KERNEL=0", off0
     assert calls1 == [sum(lengths)], calls1
     assert calls0 == [sum(lengths), len(lengths), len(lengths) * (K + 1), len(lengths)], calls0
     for what, a, b in zip(("prefill", "decode", "verify", "decode after the commit"), folded, launched):
