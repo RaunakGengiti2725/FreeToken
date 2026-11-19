@@ -30,6 +30,8 @@ _SHARED_ROUTE_MAX_ROWS = 6
 SHARED_ROUTE_ENV = "FREETOKEN_SHARED_EXPERT_ROUTE"
 _SHARED_ROUTE = os.environ.get(SHARED_ROUTE_ENV, "1").strip() != "0"
 _SHARED_ROUTE_ROLES = ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")
+# the row counts a step of the served model took the ninth route at: one line each a process
+_SHARED_ROUTE_ROWS_SAID: set[int] = set()
 
 
 def shared_expert_bank_slot(gate_up, down) -> dict[str, torch.Tensor]:
@@ -81,6 +83,9 @@ class Qwen3_5MoE(BaseOP):
 
     Router softmaxes over all experts, takes top-k, and renormalizes (HF semantics).
     """
+
+    # True once the engine's load has called prepare_decode_weights: a block of the served model, not of a draft
+    _decode_prepared = False
 
     def __init__(self, config: ModelConfig, layer_id: int | None = None, *, prefix: str = ""):
         self.experts = make_moe_layer(
@@ -193,6 +198,7 @@ class Qwen3_5MoE(BaseOP):
     def prepare_decode_weights(self) -> None:
         """The engine's call once the experts are loaded: the shared expert's route copy is made here, so the free
         memory the KV pool is sized from counts it. A block built without the engine makes it at its first decode."""
+        self._decode_prepared = True
         if _SHARED_ROUTE:
             self._shared_route_banks()
         elif self._shared_route is False:
@@ -263,6 +269,11 @@ class Qwen3_5MoE(BaseOP):
         sigmoid(gate), the gate's logit one more row of the router's launch, and the nine routes summed once."""
         from freetoken.kernel.triton.moe_router import router_gemv_topk_softmax
 
+        rows = hidden_states.shape[0]
+        if self._decode_prepared and rows not in _SHARED_ROUTE_ROWS_SAID:
+            # a capture runs this too, so the line also shows the path a captured step replays
+            _SHARED_ROUTE_ROWS_SAID.add(rows)
+            logger.info_rank0(f"shared expert as a ninth route on decode: taken at {rows} row{'' if rows == 1 else 's'}")
         experts = self.experts
         weights, ids = router_gemv_topk_softmax(
             hidden_states, self._router_weight_in_kernel(), experts.top_k, experts.renormalize,

@@ -178,6 +178,32 @@ def test_shared_route_is_built_for_resident_triton_nvfp4_experts_only(monkeypatc
     assert refused(lambda m: m.experts._expert_banks.update(down=torch.zeros(E, H, MI // 4, dtype=torch.uint8)))
 
 
+def test_shared_route_says_once_a_row_count_that_a_served_step_took_it(decode, monkeypatch):
+    """One line a row count a process, from the blocks the engine prepared (the served model's, not a draft's)."""
+    from freetoken.kernel.triton import moe_router
+
+    said, seen = [], []
+    monkeypatch.setattr(qmoe, "_SHARED_ROUTE_ROWS_SAID", set())
+    monkeypatch.setattr(qmoe.logger, "info_rank0", lambda msg, *a, **k: said.append(msg), raising=False)
+    monkeypatch.setattr(moe_router, "router_gemv_topk_softmax", lambda x, w, k, renorm, shared_gate=None: (None, None))
+
+    def block(prepared):
+        moe = _moe()
+        moe._router_weight = moe.gate.weight
+        if prepared:
+            moe._decode_prepared = True
+        moe.experts.routed_forward = lambda x, w, i, shared=None: seen.append(x.shape[0]) or x
+        return moe
+
+    served, draft = block(True), block(False)
+    route = {"gate_up": torch.empty(0)}
+    for moe, rows in ((draft, 6), (served, 6), (served, 6), (draft, 1), (served, 1), (served, 6)):
+        moe._forward_shared_route(torch.zeros(rows, H, dtype=torch.bfloat16), route)
+    assert seen == [6, 6, 6, 1, 1, 6]
+    assert said == ["shared expert as a ninth route on decode: taken at 6 rows",
+                    "shared expert as a ninth route on decode: taken at 1 row"]
+
+
 def test_shared_expert_bank_slot_undoes_the_resident_transpose():
     gen = torch.Generator().manual_seed(3)
     gate_up, down = _row_major(2 * MI, H, gen), _row_major(H, MI, gen)
