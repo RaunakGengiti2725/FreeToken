@@ -194,16 +194,17 @@ class SpecRunner:
     def prefill_plan(self, batch: Batch) -> List[tuple[str, int]] | None:
         """How a short prefill chunk of one request is cut into steps, or None when it must run as one eager forward.
 
-        ("chunk", b): a replay of the prefill graph of b tokens. ("bucket", b): a replay of the prefill graph of b
-        tokens for the chunk's tokens left, at most b, whose rows past them are padding; the replay writes the chunk's
-        snapshot itself. ("eager", m): an eager prefill forward of m tokens (no
+        ("chunk", b): a replay of the prefill graph of b tokens. ("bucket", b): a replay of the bucket capture of b
+        tokens for a chunk of exactly b tokens; the replay writes the chunk's snapshot itself. ("eager", m): an eager prefill forward of m tokens (no
         plan made here has one; the self-test builds a prefix with it). ("verify", w): a verify step of w rows, whose rows past the chunk are padding. ("track", 0): the linear state
         as it is there is the chunk's snapshot.
 
         With prefill graphs (--prefill-graph-chunks) a chunk of at most --prefill-graph-tokens tokens runs as one or
         two replays of them, cut at the last 64-token boundary before its end, where its snapshot goes anyway: the
         result is that of eager prefill forwards cut at that token. A chunk no such pair covers runs as one eager
-        forward. Without prefill graphs the chunk runs as verify steps, on the decode kernels.
+        forward. With --prefill-graph-pad a chunk past 64 tokens is one replay of the bucket capture of its own size,
+        which computes what the eager forward of the chunk computes, or one eager forward where no capture is of its
+        size. Without prefill graphs the chunk runs as verify steps, on the decode kernels.
         """
         from freetoken.kernel.fla.chunk import CHUNK_SIZE
 
@@ -222,13 +223,15 @@ class SpecRunner:
             # metadata already set.
             if left > engine.config.prefill_graph_tokens or not engine.chunk_graphs_usable():
                 return None
-            if getattr(engine, "chunk_pad", False) and left > CHUNK_SIZE:
-                # padded: one replay of the smallest captured multiple of 64 that holds the chunk
-                bucket = min((b for b in sizes if b % CHUNK_SIZE == 0 and b >= left), default=None)
-                if bucket is not None:
-                    if fla is not None and fla.track_dst is not None:
-                        batch.prefill_track_dst = fla.track_dst
-                    return [("bucket", bucket)]
+            if getattr(engine.config, "prefill_graph_pad", False) and left > CHUNK_SIZE:
+                # bucket captures: one replay where the chunk fills one exactly, else one eager forward. A replay of b
+                # rows for a shorter chunk, or two replays, would run the matrix kernels at other row counts than the
+                # eager forward of the chunk's tokens, which cuBLAS tiles by row count: other bits.
+                if not getattr(engine, "chunk_pad", False) or left not in engine.chunk_runners or left % CHUNK_SIZE:
+                    return None
+                if fla is not None and fla.track_dst is not None:
+                    batch.prefill_track_dst = fla.track_dst
+                return [("bucket", left)]
             head = (left - 1) // CHUNK_SIZE * CHUNK_SIZE
             tail = left - head
             if tail not in engine.chunk_runners or (head and head not in engine.chunk_runners):
@@ -313,9 +316,12 @@ class SpecRunner:
                 cols = _mrope_rows(step.padded_reqs)
                 step.mrope_positions = torch.cat([cols, cols[:, -1:].expand(-1, pad)], dim=1).to(self.device, non_blocking=True)
 
-        def eager(size: int, done: int) -> tuple[torch.Tensor, torch.Tensor]:
-            """One eager prefill forward of the chunk's tokens [done, done + size): its last row's logits and its rows' hidden."""
+        def eager(size: int, done: int, track: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+            """One eager prefill forward of the chunk's tokens [done, done + size): its last row's logits and its rows' hidden.
+            ``track``: a state slot the forward writes its own snapshot to, as a served request's eager forward does."""
             step, ids, out_loc = make("eager", size, done, size)
+            if track is not None:
+                step.reqs[0].mamba_ping_pong, step.reqs[0].mamba_next_track_idx = (track, track), 0
             engine.graph_runner.pad_batch(step)
             place(step, ids, out_loc)
             if engine.graph_runner.linear_backend is not None:
@@ -350,7 +356,7 @@ class SpecRunner:
                     state.index_copy_(1, dst, state[:, src].expand(-1, dst.numel(), *state.shape[2:]))
                 continue
             if kind == "eager":
-                logits, rows_hidden = eager(size, done)
+                logits, rows_hidden = eager(size, done, getattr(batch, "eager_track_slot", None))
                 hidden.append(rows_hidden.clone())
                 done += size
                 continue
@@ -358,6 +364,8 @@ class SpecRunner:
             chunk = kind == "chunk" or bucket
             runner = engine.chunk_runners[size] if chunk else (engine.prefill_runner if size != self.k + 1 else engine.graph_runner)
             m = size if kind == "chunk" else min(size, n - done)
+            if bucket and m != size:
+                raise ValueError(f"a bucket capture of {size} tokens replays a chunk of exactly {size} tokens, not {m}")
             if chunk and check:
                 before = [state[:, slot].clone() for state in states]
                 want_logits, want_hidden = eager(m, done)

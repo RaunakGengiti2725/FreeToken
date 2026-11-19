@@ -252,8 +252,9 @@ def _drop_preset_fields(config, *names: str) -> None:
 # Qwen3.6-35B-A3B NVFP4, RTX 5090); the preset now captures the 64 sizes 1 to 64, which is kept under the same bound;
 # the margin on top is unmeasured
 PRESET_CAPTURE_BYTES = 2304 << 20
-# --preset single-bucket: 15 more sizes, the largest 1,024 tokens; unmeasured, the box run logs what each size took
-PRESET_BUCKET_CAPTURE_BYTES = 3328 << 20
+# --preset single-bucket: 4 more sizes, 128, 256, 512 and 1,024 tokens, which took 10, 18, 10 and 132 MiB (170 MiB) on
+# box G's RTX 5090 (fb1b20f's start, by the free-memory difference); 256 MiB on top of single-fast's share
+PRESET_BUCKET_CAPTURE_BYTES = PRESET_CAPTURE_BYTES + (256 << 20)
 
 
 # the decode graphs of the batch sizes a preset names (--preset multi): on box F's RTX 5090, fused servers of 8 and 16
@@ -2383,13 +2384,17 @@ class Engine:
             if not (1 <= low <= high and step >= 1):
                 raise ValueError(f"--prefill-graph-chunks: '{part.strip()}' is not a token count, a range a-b or a range a-b:step of positive counts")
             sizes.update(range(low, high + 1, step))
-        # padded, a chunk past 64 tokens is one replay of a multiple of 64 that holds it; the pad rows take no expert
-        # route only where the experts are resident without an expert cache (layers/moe.drop_pad_routes)
+        # bucket captures of the multiples of 64 past 64, each replayed for a chunk of its own size: their routes go
+        # through the triton alignment only where the experts are resident without an expert cache (layers/moe.drop_pad_routes)
         padded = config.prefill_graph_pad and cache is None and not (pool is not None and pool.slot_states)
         if config.prefill_graph_pad and not padded and not have:
-            logger.info_rank0("--prefill-graph-pad: not padded, the chunks run as one or two replays (it needs the experts resident without an expert cache, and no draft state on the linear slots)")
-        # the plan replays a tail of 1 to 64 tokens and a head that is a multiple of 64 within the limit; nothing else
-        top = -(-config.prefill_graph_tokens // CHUNK) * CHUNK if padded else (config.prefill_graph_tokens - 1) // CHUNK * CHUNK
+            logger.info_rank0("--prefill-graph-pad: not padded, the chunks past 64 tokens run eagerly (it needs the experts resident without an expert cache, and no draft state on the linear slots)")
+        # the plan replays a tail of 1 to 64 tokens and a head that is a multiple of 64 within the limit, or a bucket of
+        # the chunk's own size; nothing else (asked for buckets that cannot be served, the chunks past 64 run eagerly)
+        if padded:
+            top = -(-config.prefill_graph_tokens // CHUNK) * CHUNK
+        else:
+            top = 0 if config.prefill_graph_pad else (config.prefill_graph_tokens - 1) // CHUNK * CHUNK
         usable = {t for t in sizes if t <= CHUNK or (t % CHUNK == 0 and t <= top)}
         if sizes - usable:
             logger.info_rank0(f"--prefill-graph-chunks: not captured, no plan replays them: {sorted(sizes - usable)}")
@@ -2452,11 +2457,12 @@ class Engine:
         forward of the same tokens, once from an empty state and once after a 96-token prefix, then three two-replay
         plans with their snapshot, on the padding request's row with seeded token ids. SpecRunner.prefill_as_verify
         prints one PREFILL_SPLIT_CHECK line a captured step; a line here says whether each snapshot is the state at its cut.
-        Padded (--prefill-graph-pad), each bucket also replays chunks 63 and 1 tokens short of it, and one of its own
-        size, as a request's chunk replays it, against their eager forwards (PREFILL_PAD_CHECK), and the smallest and
-        largest write their own snapshot (PREFILL_PAD_TRACK_CHECK). The check request takes the padding request's row
-        for its pages, so its pad rows store to the padding request's own page as a served chunk's do, not to the row's
-        first page, which here holds a token."""
+        With bucket captures (--prefill-graph-pad), the plan of every chunk length from 1 to past the limit, from an
+        empty state and after a 64-token prefix, is counted (PREFILL_BUCKET_PLAN_CHECK: a bucket replay is planned only
+        for a chunk of its own size), and each bucket replays a chunk of its own size, as a request's chunk replays it,
+        against its eager forward (PREFILL_PAD_CHECK) and writes its snapshot, which is checked against the snapshot the
+        eager forward of the same tokens writes itself (PREFILL_BUCKET_TRACK_CHECK), from an empty state and after the
+        prefix."""
         from types import SimpleNamespace
 
         from freetoken.kernel.fla.chunk import CHUNK_SIZE as CHUNK
@@ -2473,13 +2479,14 @@ class Engine:
         live = own if own is not None else self.dummy_req.linear_slot_idx
         spare = None
 
-        def run(ids: torch.Tensor, start: int, plan: list, track: int | None = None) -> None:
+        def run(ids: torch.Tensor, start: int, plan: list, track: int | None = None, eager_track: int | None = None) -> None:
             req = SimpleNamespace(
                 table_idx=self.dummy_req.table_idx, cached_len=start, device_len=ids.numel(), extend_len=ids.numel() - start,
                 linear_slot_idx=live, mrope_delta=0, mrope_positions_full=None,
             )
             batch = SimpleNamespace(
                 reqs=[req], input_ids=ids[start:].to(self.device), out_loc=row[start : ids.numel()], prefill_plan=plan, pad_loc=pad_loc,
+                eager_track_slot=eager_track,
             )
             if track is not None:
                 batch.prefill_track_dst = torch.tensor([track], dtype=torch.int64, device=self.device)
@@ -2498,17 +2505,6 @@ class Engine:
                 run(ids[:size], 0, [("chunk", size)])
                 run(ids[:prefix], 0, [("eager", prefix)])
                 run(ids, prefix, [("chunk", size)])
-            # padded: each bucket against the eager forward of chunks one and 63 tokens short of it and of its own size,
-            # from an empty state and after the prefix (PREFILL_PAD_CHECK lines)
-            for size in sorted(s for s in self.chunk_runners if own is not None and s > CHUNK):
-                for m in (size - CHUNK + 1, size - 1, size):
-                    if prefix + size > self.max_seq_len:
-                        continue
-                    row[: prefix + size] = torch.arange(prefix + size, dtype=row.dtype, device=row.device)
-                    ids = tokens(prefix + m)
-                    run(ids[:m], 0, [("bucket", size)])
-                    run(ids[:prefix], 0, [("eager", prefix)])
-                    run(ids, prefix, [("bucket", size)])
             # the plans as requests run them: a head, the snapshot, a tail over what the head's replay stored
             spare = pool.alloc(1)[0] if pool is not None and pool.num_free_slots > 0 else None
             for head, tail in ((64, 64), (128, 37), (max((s for s in self.chunk_runners if s % CHUNK == 0), default=CHUNK), 1)):
@@ -2523,30 +2519,60 @@ class Engine:
                 run(ids, prefix, [("chunk", head), ("track", 0), ("chunk", tail)], track=spare)
                 same = torch.equal(pool.recurrent_states[:, spare], at_cut[0]) and torch.equal(pool.conv_states[:, spare], at_cut[1])
                 print(f"PREFILL_SPLIT_CHECK plan={head}+{tail} start={prefix} snapshot_is_the_eager_state_at_the_cut={same}", flush=True)
-            # a bucket's own snapshot: the state at the last 64-token boundary before the chunk's end, as an eager forward
-            # of the tokens before that boundary leaves it
             buckets = sorted(s for s in self.chunk_runners if own is not None and s > CHUNK)
-            for size in ({buckets[0], buckets[-1]} if buckets and spare is not None else ()):
-                m = size - 1
-                cut = (m - 1) // CHUNK * CHUNK
-                if prefix + size > self.max_seq_len:
-                    continue
-                row[: prefix + size] = torch.arange(prefix + size, dtype=row.dtype, device=row.device)
-                ids = tokens(prefix + m)
-                run(ids[:prefix], 0, [("eager", prefix)])
-                run(ids[: prefix + cut], prefix, [("eager", cut)])
-                at_cut = [pool.recurrent_states[:, live].clone(), pool.conv_states[:, live].clone()]
-                run(ids[:prefix], 0, [("eager", prefix)])
-                run(ids, prefix, [("bucket", size)], track=spare)
-                got = [pool.recurrent_states[:, spare], pool.conv_states[:, spare]]
-                same = all(torch.equal(a, b) for a, b in zip(got, at_cut))
-                # the replay's projections run at the bucket's row count, the eager forward's at the cut's: how far apart
-                rel = [float((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-30)) for a, b in zip(got, at_cut)]
-                print(
-                    f"PREFILL_PAD_TRACK_CHECK size={size} rows={m} start={prefix} snapshot_is_the_eager_state_at_the_cut={same} "
-                    f"rec_rel={rel[0]:.3g} conv_rel={rel[1]:.3g}",
-                    flush=True,
-                )
+            if buckets:
+                # every chunk length's plan: a bucket only for a chunk of its own size, never a padded one or two replays
+                limit = self.config.prefill_graph_tokens
+                for start in (0, CHUNK):
+                    counts = dict(whole_bucket=0, padded_bucket=0, split=0, eager=0, small=0)
+                    whole = []
+                    for n in [*range(1, limit + CHUNK + 1), 2 * limit, 8192]:
+                        probe = SimpleNamespace(cached_len=start, extend_len=n, mamba_ping_pong=None)
+                        dst = torch.tensor([live], dtype=torch.int64) if n > CHUNK else None
+                        steps = self.spec.prefill_plan(SimpleNamespace(reqs=[probe], fla_metadata=SimpleNamespace(track_dst=dst)))
+                        if steps is None:
+                            counts["eager"] += 1
+                        elif any(k == "bucket" and b != n for k, b in steps):
+                            counts["padded_bucket"] += 1
+                        elif any(k == "bucket" for k, _ in steps):
+                            counts["whole_bucket"] += 1
+                            whole.append(n)
+                        elif n > CHUNK:
+                            counts["split"] += 1
+                        else:
+                            counts["small"] += 1
+                    print(
+                        f"PREFILL_BUCKET_PLAN_CHECK start={start} lengths={sum(counts.values())} "
+                        + " ".join(f"{k}={v}" for k, v in counts.items()) + f" whole_sizes={whole} buckets={buckets}",
+                        flush=True,
+                    )
+            # each bucket for a chunk of its own size, as a served chunk replays it: its rows against the eager forward of
+            # the same tokens (PREFILL_PAD_CHECK), and its snapshot against the one that eager forward writes itself
+            tracked = [pool.recurrent_states, pool.conv_states] if pool is not None else []
+            for size in (buckets if spare is not None else ()):
+                for start in (0, prefix):
+                    if start + size > self.max_seq_len:
+                        continue
+                    row[: start + size] = torch.arange(start + size, dtype=row.dtype, device=row.device)
+                    ids = tokens(start + size)
+                    snaps = []
+                    for plan, kw in (([("eager", size)], dict(eager_track=spare)), ([("bucket", size)], dict(track=spare))):
+                        if start:
+                            run(ids[:start], 0, [("eager", start)])
+                        # a snapshot nobody wrote stays nan, which no state equals
+                        for state in tracked:
+                            state[:, spare].fill_(float("nan"))
+                        run(ids, start, plan, **kw)
+                        snaps.append([state[:, spare].clone() for state in tracked] + [state[:, live].clone() for state in tracked])
+                    eager_snap, replay_snap = snaps
+                    k = len(tracked)
+                    same = [torch.equal(a, b) for a, b in zip(replay_snap, eager_snap)]
+                    rel = [float((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-30)) for a, b in zip(replay_snap, eager_snap)]
+                    print(
+                        f"PREFILL_BUCKET_TRACK_CHECK size={size} rows={size} start={start} snapshot_equal={k > 0 and all(same[:k])} "
+                        f"live_equal={all(same[k:])} snapshot_rel={[round(x, 6) for x in rel[:k]]} live_rel={[round(x, 6) for x in rel[k:]]}",
+                        flush=True,
+                    )
         finally:
             for slot in (spare, own):
                 if slot is not None:

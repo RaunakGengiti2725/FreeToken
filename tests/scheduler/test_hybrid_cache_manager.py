@@ -245,34 +245,40 @@ def test_prefill_plan_is_one_or_two_replays_cut_at_the_forwards_own_snapshot():
     assert runner.prefill_plan(SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=None))) is None
 
 
-def test_padded_prefill_plan_is_one_replay_of_the_bucket_that_holds_the_chunk():
-    """With --prefill-graph-pad a chunk past 64 tokens is one replay of the smallest captured multiple of 64 that holds
-    it, the forward's own snapshot slot handed to it; 64 tokens or fewer stay one unpadded replay, past the limit eager."""
+def test_bucket_prefill_plan_replays_a_bucket_only_for_a_chunk_of_its_own_size():
+    """With --prefill-graph-pad a chunk past 64 tokens is one replay of the bucket capture of its own size, the
+    forward's own snapshot slot handed to it, and one eager forward at any other length: never a replay padded to a
+    larger bucket, nor two replays, whose matrix kernels would run at other row counts than the eager forward's.
+    64 tokens or fewer stay one unpadded replay; asked for and not captured as buckets, every chunk past 64 is eager."""
     from freetoken.spec.runner import SpecRunner
 
-    sizes, limit, pair = {*range(1, 65), *range(128, 1025, 64)}, 1024, (7, 8)
+    buckets, limit, pair = (128, 256, 512, 1024), 1024, (7, 8)
     runner = object.__new__(SpecRunner)
     runner.k, runner.device = 3, torch.device("cpu")
     runner.engine = SimpleNamespace(
-        chunk_runners=dict.fromkeys(sizes), chunk_graphs_usable=lambda: True, page_table=torch.zeros(1, 1 << 16), chunk_pad=True,
-        config=SimpleNamespace(prefill_graph_tokens=limit, prefill_graph_chunks="1-64,128-1024:64", page_size=1), prefill_runner=None,
+        chunk_runners=dict.fromkeys([*range(1, 65), *buckets]), chunk_graphs_usable=lambda: True, page_table=torch.zeros(1, 1 << 16),
+        chunk_pad=True, prefill_runner=None,
+        config=SimpleNamespace(prefill_graph_tokens=limit, prefill_graph_chunks="1-64,128,256,512,1024", prefill_graph_pad=True, page_size=1),
     )
+
+    def plan(start: int, n: int):
+        req = SimpleNamespace(cached_len=start, extend_len=n, mamba_ping_pong=pair)
+        dst = torch.tensor([pair[0]]) if n > 64 else None
+        batch = SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=dst))
+        return runner.prefill_plan(batch), batch, dst
+
     for start in (0, 100):
         for n in [*range(1, 1100), 8192]:
-            req = SimpleNamespace(cached_len=start, extend_len=n, mamba_ping_pong=pair)
-            dst = torch.tensor([pair[0]]) if n > 64 else None
-            batch = SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=dst))
-            steps = runner.prefill_plan(batch)
-            if n > limit:
-                assert steps is None, (n, steps)
-            elif n <= 64:
+            steps, batch, dst = plan(start, n)
+            if n <= 64:
                 assert steps == [("chunk", n)]
+            elif n in buckets:
+                assert steps == [("bucket", n)] and batch.prefill_track_dst is dst, (n, steps)
             else:
-                assert steps == [("bucket", -(-n // 64) * 64)] and batch.prefill_track_dst is dst, (n, steps)
-    # a bucket that was not captured hands the chunk to the next one up
-    del runner.engine.chunk_runners[640]
-    req = SimpleNamespace(cached_len=0, extend_len=600, mamba_ping_pong=None)
-    assert runner.prefill_plan(SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=None))) == [("bucket", 704)]
+                assert steps is None, (n, steps)
+    # the buckets cannot be served (an expert cache, a draft state on the slots): the chunks past 64 run eagerly
+    runner.engine.chunk_pad = False
+    assert plan(0, 1024)[0] is None and plan(0, 300)[0] is None and plan(0, 64)[0] == [("chunk", 64)]
 
 
 def test_the_replay_check_keeps_a_nan_in_its_distances():

@@ -1332,7 +1332,7 @@ def test_preset_single_fast_serves_as_single_where_its_captures_do_not_fit(decod
 
     bucket = SimpleNamespace(
         preset="single-bucket", preset_fields=("moe_strategy", *captures, "prefill_graph_pad"),
-        prefill_graph_tokens=1024, prefill_graph_chunks="1-64,128-1024:64", prefill_graph_pad=True,
+        prefill_graph_tokens=1024, prefill_graph_chunks="1-64,128,256,512,1024", prefill_graph_pad=True,
     )
     assert _preset_capture_bytes(bucket) == PRESET_BUCKET_CAPTURE_BYTES > PRESET_CAPTURE_BYTES
     _drop_preset_captures(bucket, "a test")

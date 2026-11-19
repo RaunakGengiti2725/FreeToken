@@ -44,7 +44,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--port` | 1919 | Bind port |
 | `--api-key` | `$FREETOKEN_API_KEY`, else off | Require the key on every route except `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`; other requests get a 401 |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
-| `--preset` | — | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. `single-fast`: `single` with a captured prefill forward for continuations of up to 64 tokens, with `single`'s replies. `single-bucket`: `single-fast` with padded captured forwards for chunks of 65 to 1,024 tokens; its replies can differ from `single`'s. `multi`: `single` for several requests at a time, 8 unless `--max-running-requests` names another number. See [Presets](#presets) |
+| `--preset` | — | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. `single-fast`: `single` with a captured prefill forward for continuations of up to 64 tokens, with `single`'s replies. `single-bucket`: `single-fast` with captured forwards for chunks of exactly 128, 256, 512 and 1,024 tokens, with `single`'s replies. `multi`: `single` for several requests at a time, 8 unless `--max-running-requests` names another number. See [Presets](#presets) |
 | `--calibrate-again` | off | With `--preset single-measured`: time on this start also when a choice is stored for this checkpoint, flags and machine: the candidates the stored calibration had no time for, or all of them once none is left. See [Presets](#presets) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
@@ -104,7 +104,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does, [performa
 | `--moe-collect-stats` | off | Log decode MoE stats with each decode log line: hit rate, and per layer-step the misses, experts fetched and experts computed on CPU, for pinned, locked and CPU-only layers |
 | `--prefill-graph-tokens` | 0 | Prefill: with speculative decoding, a chunk of at most this many tokens on a cached prefix runs as captured verify steps instead of an eager forward; 0 = always eager |
 | `--prefill-graph-chunks` | none | Prefill: with `--prefill-graph-tokens`, token counts of the prefill forwards to capture, e.g. `1-64,128-384:64`; a chunk within the limit then runs as one or two captured forwards, cut at its last 64-token boundary, instead of one eager forward. Needs every expert resident |
-| `--prefill-graph-pad` | off | Prefill: with `--prefill-graph-chunks`, a chunk of more than 64 tokens runs as one captured forward of the smallest captured multiple of 64 that holds it; the rows past the chunk store no K/V, leave the linear state as the chunk leaves it and take no expert route. Other kernel shapes than the eager forward's, so other text is possible. Only with the experts resident and no expert cache |
+| `--prefill-graph-pad` | off | Prefill: with `--prefill-graph-chunks`, the captured multiples of 64 past 64 tokens are bucket captures; a chunk of exactly such a size runs as one replay of it, which computes what its eager forward computes, and any other chunk of more than 64 tokens runs as one eager forward. Only with the experts resident and no expert cache; elsewhere those chunks run eagerly |
 | `--prefill-graph-rows` | 0 | Prefill: rows of a wider verify step captured for `--prefill-graph-tokens` chunks longer than a decode step; 0 = only the decode step's rows |
 | `--moe-prefill-demand-tokens` | 0 | Prefill: a chunk of at most this many tokens loads only the experts it routes to, through the expert cache as decode does (GPU decode only); 0 streams whole layers |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
@@ -332,15 +332,16 @@ keep every expert resident and the KV reserve, or speculative decoding is off, t
 on the command line are kept as typed; typed chunks get no memory left free for them.
 
 `--preset single-bucket` is `--preset single-fast` with `--prefill-graph-tokens 1024`,
-`--prefill-graph-chunks 1-64,128-1024:64` and `--prefill-graph-pad`: a chunk of 65 to 1,024 tokens (a
-unique prompt of that length, a longer next turn) runs as one captured forward of the next multiple
-of 64, its rows past the chunk padding. A padding row stores no K/V, leaves the linear state where the
-chunk's own tokens leave it and takes no expert route, and the forward writes the snapshot the
-prefix cache keeps, as the eager forward does. The matrix kernels run at the bucket's row count, which
-can tile them otherwise than an eager forward of the chunk's tokens, so the replies can differ from
-`single`'s. It leaves 3.25 GiB free for the captures (not measured) and is dropped to `single` by the
-same rules as `single-fast`. Where the experts are served from an expert cache, a chunk runs as one
-or two unpadded replays cut at its last 64-token boundary, as with `--no-prefill-graph-pad`.
+`--prefill-graph-chunks 1-64,128,256,512,1024` and `--prefill-graph-pad`: a chunk of exactly 128,
+256, 512 or 1,024 tokens (a unique prompt of that length, a next turn of that length) runs as one
+captured forward, which writes the snapshot the prefix cache keeps, as the eager forward does. Any
+other chunk past 64 tokens runs as one eager forward. A replay for a shorter chunk, padded to the
+bucket, would run the matrix kernels at the bucket's row count, which cuBLAS can tile otherwise than
+the eager forward of the chunk's tokens; served only for a chunk of its own size, the replay computes
+what the eager forward computes, so the replies are `single`'s. The four captures took 170 MiB on an
+RTX 5090; the preset leaves 2.5 GiB free for all of its captures and is dropped to `single` by the
+same rules as `single-fast`. Where the experts are served from an expert cache, the chunks past 64
+tokens run eagerly.
 
 `--preset multi` is `--preset single` for several requests at a time. It sets
 `--max-running-requests 8`; a typed number is kept (`--preset multi --max-running-requests 16`), and
