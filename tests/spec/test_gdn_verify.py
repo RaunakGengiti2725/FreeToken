@@ -308,3 +308,33 @@ def test_kernel_ba_fold_changes_only_the_dots_order_and_replays_in_a_graph(bs, s
     _assert_same_bits(state_g.reshape(-1, dim), state.reshape(-1, dim), f"the graph's state, {what}")
     for s, s_ref in zip(stash_g, stash):
         _assert_same_bits(s, s_ref, f"the graph's stash, {what}")
+
+
+def test_gdn_says_once_why_decode_does_not_take_b_and_a_in_the_kernel(monkeypatch):
+    """One line a process, at the first decode step, naming the predicate that keeps the b|a projection's launch."""
+    from types import SimpleNamespace
+
+    from freetoken.layers.linear_attn import gdn
+    from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
+
+    said = []
+    monkeypatch.setattr(gdn, "_BA_SAID", False)
+    monkeypatch.setattr(gdn, "_BA_IN_KERNEL", True)
+    monkeypatch.setattr(gdn.logger, "info_rank0", lambda msg, *a, **k: said.append(msg), raising=False)
+
+    def layer(weight, bias=None, split=True):
+        op = object.__new__(gdn.GatedDeltaNet)
+        op._split_in_proj, op.num_v_heads = split, 4
+        op.in_proj_ba = SimpleNamespace(weight=weight, bias=bias, quant_method=SimpleNamespace(kernel=TorchLinearKernel()))
+        op._ba_weight, op._ba_off = False, None
+        return op
+
+    x = torch.zeros(1, 64, dtype=torch.bfloat16)
+    assert layer(torch.zeros(8, 64, dtype=torch.bfloat16))._ba_weight_in_kernel(x) is None
+    assert layer(torch.zeros(8, 64, dtype=torch.bfloat16), bias=torch.zeros(8))._ba_weight_in_kernel(x) is None
+    assert said == ["gdn b|a in the recurrence kernel on decode: off (the b|a weight is on cpu)"]
+    assert layer(torch.zeros(8, 64), bias=torch.zeros(8))._ba_weight_off(64) == "the b|a projection has a bias"
+    assert layer(torch.zeros(8, 64), split=False)._ba_weight_off(64) == "b and a come out of the one input projection"
+    assert layer(torch.zeros(8, 64))._ba_weight_off(64) == "the b|a weight is on cpu"
+    monkeypatch.setattr(gdn, "_BA_IN_KERNEL", False)
+    assert layer(torch.zeros(8, 64))._ba_weight_off(64) == "FREETOKEN_GDN_BA_IN_KERNEL=0"

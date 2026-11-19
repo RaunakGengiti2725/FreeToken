@@ -9,6 +9,9 @@ from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_v
 from freetoken.kvcache.linear_state_pool import gdn_rule_tokens
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
 
 # A prefill's chunk kernel reads the values out of the conv output where they lie, a row a value dim, with the
 # operations it runs on a token-major copy. Set FREETOKEN_GDN_VALUES_IN_PLACE=0 to hand it the copy again.
@@ -18,6 +21,7 @@ _VALUES_IN_PLACE = os.getenv("FREETOKEN_GDN_VALUES_IN_PLACE", "1") != "0"
 # projection is its own bf16 linear (see GatedDeltaNet._ba_weight_in_kernel). FREETOKEN_GDN_BA_IN_KERNEL=0 launches it.
 _BA_IN_KERNEL = os.getenv("FREETOKEN_GDN_BA_IN_KERNEL", "1") != "0"
 _BA_IN_KERNEL_MAX_ROWS = 64
+_BA_SAID = False  # the b|a fold's one line a process
 
 # cu_seqlens of one sequence, a tensor a length: the chunk kernels look their index tensors up by its identity
 _SPAN_CU: dict[tuple[int, torch.device], torch.Tensor] = {}
@@ -101,13 +105,14 @@ class GatedDeltaNet(BaseOP):
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_ba",
             )
-            self._ba_weight: torch.Tensor | None | bool = False  # False until the first decode step decides
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
             self.in_proj = LinearColParallelMerged(
                 hidden_size, self._in_proj_split, has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj",
             )
+        self._ba_weight: torch.Tensor | None | bool = False  # False until the first decode step decides
+        self._ba_off: str | None = None
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
@@ -198,27 +203,59 @@ class GatedDeltaNet(BaseOP):
 
         return gated_norm_row_tile(total * self.num_v_heads, self.head_v_dim, device) is not None
 
+    def _ba_weight_off(self, hidden: int) -> str | None:
+        """Why decode cannot take b and a inside the recurrence kernel, or None when it can: a separate b|a linear
+        (qkv|z quantized, b|a not) run by torch in bf16 without a bias, its weight [2 * num_v_heads, hidden], on
+        NVIDIA. Unsplit, b and a come out of the one input GEMM, with no launch of their own to save."""
+        if not self._split_in_proj:
+            return "b and a come out of the one input projection"
+        if not _BA_IN_KERNEL:
+            return "FREETOKEN_GDN_BA_IN_KERNEL=0"
+        from freetoken.kernel.backend import is_rocm
+        from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
+
+        layer = self.in_proj_ba
+        w = layer.weight
+        if layer.bias is not None:
+            return "the b|a projection has a bias"
+        if not isinstance(layer.quant_method.kernel, TorchLinearKernel):
+            return f"the b|a projection runs {type(layer.quant_method.kernel).__name__}, not the torch linear"
+        if is_rocm():
+            return "the GPU is not NVIDIA"
+        if not w.is_cuda:
+            return f"the b|a weight is on {w.device}"
+        if w.dtype != torch.bfloat16:
+            return f"the b|a weight is {w.dtype}"
+        if tuple(w.shape) != (2 * self.num_v_heads, hidden) or not w.is_contiguous():
+            return f"the b|a weight is not a contiguous ({2 * self.num_v_heads}, {hidden}) matrix (shape {tuple(w.shape)}, strides {w.stride()})"
+        return None
+
     def _ba_weight_in_kernel(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         """The b|a projection's weight when a decode or verify step of ``hidden_states`` takes b and a inside the
-        recurrence kernel: a separate b|a linear (qkv|z quantized, b|a not) run by torch in bf16 without a bias, on
-        NVIDIA, and a bf16 step of 1 to 64 rows. b and a then differ from F.linear's only in the summation order of
-        each dot. Unsplit, b and a come out of the one input GEMM, with no launch of their own to save. The weight
-        is decided once, at the first decode step, when the weights are final."""
-        if not self._split_in_proj or not _BA_IN_KERNEL:
-            return None
+        recurrence kernel (bf16 rows of unit inner stride, 1 to 64 of them), else None. b and a then differ from
+        F.linear's only in the summation order of each dot. The weight is decided once, at the first decode step,
+        when the weights are final; that step also logs, once a process, whether decode-sized steps fold and why not
+        (the step's own row count is left out, as CUDA-graph capture also runs steps past the cap)."""
+        global _BA_SAID
         if self._ba_weight is False:
-            from freetoken.kernel.backend import is_rocm
-            from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
-
-            layer = self.in_proj_ba
-            w = layer.weight
-            takes = layer.bias is None and isinstance(layer.quant_method.kernel, TorchLinearKernel) and not is_rocm()
-            takes = takes and w.is_cuda and w.dtype == torch.bfloat16 and w.shape == (2 * self.num_v_heads, hidden_states.shape[1])
-            self._ba_weight = w if takes and w.is_contiguous() else None
+            self._ba_off = self._ba_weight_off(hidden_states.shape[1])
+            self._ba_weight = self.in_proj_ba.weight if self._ba_off is None else None
         w = self._ba_weight
-        rows = hidden_states.shape[0]
-        if w is None or hidden_states.dtype != torch.bfloat16 or hidden_states.stride(1) != 1:
+        steps_off = None
+        if hidden_states.dtype != torch.bfloat16:
+            steps_off = f"the hidden states are {hidden_states.dtype}"
+        elif hidden_states.stride(1) != 1:
+            steps_off = "the hidden states' rows are not contiguous"
+        if not _BA_SAID:
+            _BA_SAID = True
+            off = self._ba_off if w is None else steps_off
+            if off is None:
+                logger.info_rank0("gdn b|a in the recurrence kernel on decode: on (no b|a launch for decode-sized steps)")
+            else:
+                logger.info_rank0(f"gdn b|a in the recurrence kernel on decode: off ({off})")
+        if w is None or steps_off is not None:
             return None
+        rows = hidden_states.shape[0]
         return w if 0 < rows <= _BA_IN_KERNEL_MAX_ROWS and hidden_states.shape[1] == w.shape[1] else None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
