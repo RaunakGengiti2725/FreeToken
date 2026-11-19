@@ -481,6 +481,7 @@ def test_qwen3_5_moe_says_once_why_its_router_does_not_fold(monkeypatch):
 
     said = []
     monkeypatch.setattr(qmoe, "_FOLD_SAID", False)
+    monkeypatch.setattr(qmoe, "_ROUTER_FOLD", True)
     monkeypatch.setattr(qmoe.logger, "info_rank0", lambda msg, *a, **k: said.append(msg), raising=False)
     monkeypatch.setattr(qmoe, "get_global_ctx", lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=False)))
 
@@ -511,6 +512,7 @@ def test_qwen3_5_moe_router_fold_off_keeps_the_ninth_route_off_too(monkeypatch):
     said = []
     monkeypatch.setattr(qmoe, "_FOLD_SAID", False)
     monkeypatch.setattr(qmoe, "_ROUTER_FOLD", False)
+    monkeypatch.setattr(qmoe, "_ROUTER_FOLD_SET", "0")
     monkeypatch.setattr(qmoe, "_SHARED_ROUTE", True)
     monkeypatch.setattr(qmoe.logger, "info_rank0", lambda msg, *a, **k: said.append(msg), raising=False)
     monkeypatch.setattr(qmoe, "get_global_ctx", lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=False)))
@@ -843,3 +845,29 @@ def test_triton_alignment_leaves_routes_to_no_expert_out(rows):
     kept = sorted_ids[: int(ntpp)]
     kept = kept[kept < padded.numel()]
     assert kept.numel() == real.numel() and int(kept.max()) < real.numel()
+
+
+def test_qwen3_5_moe_router_fold_is_off_and_silent_with_its_switch_unset(monkeypatch):
+    """FREETOKEN_ROUTER_FOLD unset: the router's linear and its top-k stay two launches and no line is logged."""
+    from types import SimpleNamespace
+
+    from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
+    from freetoken.models.qwen3_5_moe import moe as qmoe
+    from freetoken.utils.misc import opt_in_env
+
+    assert opt_in_env(None) == ("", False)
+    said = []
+    monkeypatch.setattr(qmoe, "_FOLD_SAID", False)
+    monkeypatch.setattr(qmoe, "_ROUTER_FOLD", False)
+    monkeypatch.setattr(qmoe, "_ROUTER_FOLD_SET", "")
+    monkeypatch.setattr(qmoe.logger, "info_rank0", lambda msg, *a, **k: said.append(msg), raising=False)
+    monkeypatch.setattr(qmoe, "get_global_ctx", lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=False)))
+
+    m = object.__new__(qmoe.Qwen3_5MoE)
+    m.gate = SimpleNamespace(weight=torch.zeros(256, 2048, dtype=torch.bfloat16), bias=None,
+                             quant_method=SimpleNamespace(kernel=TorchLinearKernel()))
+    m.experts = SimpleNamespace(top_k=8, renormalize=True)
+    m._router_weight, m._router_off = False, None
+    assert m._routes_in_kernel(torch.zeros(1, 2048, dtype=torch.bfloat16)) is None
+    assert m._router_weight is None and m._router_off == "FREETOKEN_ROUTER_FOLD unset"
+    assert said == []

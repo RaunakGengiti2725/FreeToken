@@ -14,26 +14,30 @@ from freetoken.layers import (
     silu_and_mul,
 )
 from freetoken.utils import init_logger
+from freetoken.utils.misc import opt_in_env
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 logger = init_logger(__name__)
 _FOLD_SAID = False  # the router fold's one line a process
-# FREETOKEN_ROUTER_FOLD=0 keeps the router's linear and its top-k two launches on every step, and with them the shared
-# expert's own kernels, since the ninth route's gate rides the fold's launch: every step then routes as a prefill does.
-# Read once, at import; a block decides at its first decode step.
+# The router fold runs only under FREETOKEN_ROUTER_FOLD=1 (or true, yes, on). Unset, the router's linear and its top-k
+# stay two launches on every step, and with them the shared expert's own kernels, since the ninth route's gate rides the
+# fold's launch: every step then routes as a prefill does and no line is logged. Any other value keeps them too and the
+# first decode step says so. Read once, at import; a block decides at its first decode step.
 ROUTER_FOLD_ENV = "FREETOKEN_ROUTER_FOLD"
-_ROUTER_FOLD = os.environ.get(ROUTER_FOLD_ENV, "1").strip() != "0"
+_ROUTER_FOLD_SET, _ROUTER_FOLD = opt_in_env(os.environ.get(ROUTER_FOLD_ENV))
 
 # A decode step of up to this many rows (one row, or a verify of up to five drafts) on resident NVFP4 experts runs the
 # shared expert as one more route of the routed experts' kernels and its gate as one more row of the router's launch:
 # the router fold's own cap (moe_router._FOLD_MAX_ROWS), since the gate rides the fold's launch.
 _SHARED_ROUTE_MAX_ROWS = 6
-# FREETOKEN_SHARED_EXPERT_ROUTE=0 keeps the shared expert's own kernels on those steps -- a measurement-only escape
-# hatch. Each decode step reads _SHARED_ROUTE, so a captured graph runs the path that was set when it was captured.
+# It runs only under FREETOKEN_SHARED_EXPERT_ROUTE=1 (or true, yes, on), and only with the router fold on. Unset, those
+# steps keep the shared expert's own kernels, no route copy is made and no line is logged; any other value keeps them
+# too and the load says so once. Each decode step reads _SHARED_ROUTE, so a captured graph runs the path that was set
+# when it was captured.
 SHARED_ROUTE_ENV = "FREETOKEN_SHARED_EXPERT_ROUTE"
-_SHARED_ROUTE = os.environ.get(SHARED_ROUTE_ENV, "1").strip() != "0"
+_SHARED_ROUTE_SET, _SHARED_ROUTE = opt_in_env(os.environ.get(SHARED_ROUTE_ENV))
 _SHARED_ROUTE_ROLES = ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")
 # the row counts a step of the served model took the ninth route at: one line each a process
 _SHARED_ROUTE_ROWS_SAID: set[int] = set()
@@ -136,11 +140,11 @@ class Qwen3_5MoE(BaseOP):
 
     def _router_weight_off(self) -> str | None:
         """Why the router's weight cannot go into its top-k kernel, or None when it can: a bf16 [E, H]
-        torch linear without a bias on the GPU, and the fold not turned off."""
+        torch linear without a bias on the GPU, and the fold asked for."""
         from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
 
         if not _ROUTER_FOLD:
-            return f"{ROUTER_FOLD_ENV}=0"
+            return f"{ROUTER_FOLD_ENV}={_ROUTER_FOLD_SET}" if _ROUTER_FOLD_SET else f"{ROUTER_FOLD_ENV} unset"
         layer = self.gate
         w = layer.weight
         if layer.bias is not None:
@@ -186,7 +190,8 @@ class Qwen3_5MoE(BaseOP):
         if get_global_ctx().batch.is_prefill:
             return None
         w = self._router_weight_in_kernel()
-        if not _FOLD_SAID:
+        # silent when nobody asked for the fold
+        if not _FOLD_SAID and (_ROUTER_FOLD or _ROUTER_FOLD_SET):
             _FOLD_SAID = True
             off = self._fold_off(hidden_states, w)
             if off is None:
@@ -205,15 +210,18 @@ class Qwen3_5MoE(BaseOP):
     def prepare_decode_weights(self) -> None:
         """The engine's call once the experts are loaded: the shared expert's route copy is made here, so the free
         memory the KV pool is sized from counts it. A block built without the engine makes it at its first decode.
-        With the router fold off no step can take the route, so no copy is made and none of the KV pool goes to it."""
+        With the router fold off no step can take the route, so no copy is made and none of the KV pool goes to it;
+        with the route's switch unset no copy is made either."""
         self._decode_prepared = True
         if not _ROUTER_FOLD:
             self._shared_route = None
-            logger.info_once(f"shared expert as a ninth route on decode: off ({ROUTER_FOLD_ENV}=0)")
+            if _SHARED_ROUTE:
+                fold = f"{ROUTER_FOLD_ENV}={_ROUTER_FOLD_SET}" if _ROUTER_FOLD_SET else f"{ROUTER_FOLD_ENV} unset"
+                logger.info_once(f"shared expert as a ninth route on decode: off ({fold})")
         elif _SHARED_ROUTE:
             self._shared_route_banks()
-        elif self._shared_route is False:
-            logger.info_once(f"shared expert as a ninth route on decode: off ({SHARED_ROUTE_ENV}=0)")
+        elif _SHARED_ROUTE_SET and self._shared_route is False:
+            logger.info_once(f"shared expert as a ninth route on decode: off ({SHARED_ROUTE_ENV}={_SHARED_ROUTE_SET})")
 
     def _shared_route_banks(self) -> dict[str, torch.Tensor] | None:
         """The shared expert as one expert of the routed experts' banks: each projection in the bank's role, shape,

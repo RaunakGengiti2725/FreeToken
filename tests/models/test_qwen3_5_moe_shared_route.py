@@ -84,6 +84,13 @@ def _moe(device="cpu", seed=0, glob=1.0):
     return moe
 
 
+@pytest.fixture(autouse=True)
+def switched_on(monkeypatch):
+    """Both switches are opt-in; these tests check the path they turn on."""
+    monkeypatch.setattr(qmoe, "_ROUTER_FOLD", True)
+    monkeypatch.setattr(qmoe, "_SHARED_ROUTE", True)
+
+
 @pytest.fixture
 def decode(monkeypatch):
     state = {"prefill": False}
@@ -183,6 +190,7 @@ def test_shared_route_is_not_built_with_the_router_fold_off(decode, monkeypatch)
     makes no copy (none of the KV pool goes to it) and says so once, naming the switch."""
     said = []
     monkeypatch.setattr(qmoe, "_ROUTER_FOLD", False)
+    monkeypatch.setattr(qmoe, "_ROUTER_FOLD_SET", "0")
     monkeypatch.setattr(qmoe, "_SHARED_ROUTE", True)
     monkeypatch.setattr(qmoe.logger, "info_once", lambda msg, *a, **k: said.append(msg), raising=False)
     moe = _moe()
@@ -193,6 +201,22 @@ def test_shared_route_is_not_built_with_the_router_fold_off(decode, monkeypatch)
     assert said == ["shared expert as a ninth route on decode: off (FREETOKEN_ROUTER_FOLD=0)"]
     moe._router_weight = False
     assert moe._shared_route_for(torch.zeros(6, H, dtype=torch.bfloat16)) is None
+    assert not built
+
+
+def test_shared_route_is_not_built_and_says_nothing_with_both_switches_unset(decode, monkeypatch):
+    """Nothing set: the load makes no route copy, logs no line, and no decode step takes the route."""
+    said = []
+    for name, value in (("_ROUTER_FOLD", False), ("_ROUTER_FOLD_SET", ""), ("_SHARED_ROUTE", False), ("_SHARED_ROUTE_SET", "")):
+        monkeypatch.setattr(qmoe, name, value)
+    monkeypatch.setattr(qmoe.logger, "info_once", lambda msg, *a, **k: said.append(msg), raising=False)
+    moe = _moe()
+    built = []
+    monkeypatch.setattr(moe, "_build_shared_route", lambda: built.append(1) or {})
+    moe.prepare_decode_weights()
+    assert moe._shared_route is None and not built and said == []
+    moe._router_weight = False
+    assert moe._shared_route_for(torch.zeros(1, H, dtype=torch.bfloat16)) is None
     assert not built
 
 
