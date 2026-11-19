@@ -456,8 +456,8 @@ def test_fused_topk_softmax_is_cuda_graph_capturable():
     [
         (1, 256, 2048, 8, True),  # Qwen3.5/3.6 MoE, one row
         (6, 256, 2048, 8, True),  # MTP-5 verify
-        (16, 256, 2048, 8, True),
-        (17, 256, 2048, 8, False),  # past the decode-sized batches
+        (7, 256, 2048, 8, False),  # past the decode-sized batches
+        (16, 256, 2048, 8, False),
         (0, 256, 2048, 8, False),
         (1, 512, 1024, 10, True),
         (1, 128, 2048, 8, False),  # the router packs several rows a program here
@@ -514,11 +514,10 @@ def _router_gemv_inputs(rows, num_experts, hidden, seed):
     [
         (1, 256, 2048, 8),
         (6, 256, 2048, 8),
-        (16, 256, 2048, 8),
         (3, 512, 1024, 10),
         # expert counts whose row stride is not a multiple of 16: the kernels' loads vectorize differently
         (2, 200, 512, 8),
-        (16, 200, 512, 8),
+        (6, 200, 512, 8),
         (5, 136, 768, 6),
     ],
 )
@@ -535,7 +534,7 @@ def test_router_gemv_topk_routes_its_logits_as_the_router_does(rows, num_experts
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("rows,num_experts,hidden", [(1, 256, 2048), (6, 256, 2048), (16, 256, 2048), (2, 200, 512)])
+@pytest.mark.parametrize("rows,num_experts,hidden", [(1, 256, 2048), (6, 256, 2048), (2, 200, 512), (6, 200, 512)])
 def test_router_gemv_topk_logits_round_the_exact_dot(rows, num_experts, hidden):
     """Against the fp64 dot, not F.linear, whose split-K partials cuBLAS may round: one bf16 step from the final
     rounding plus fp32 summation error; a slice read stale or twice is off by far more."""

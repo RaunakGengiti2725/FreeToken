@@ -369,8 +369,10 @@ def fused_topk_sigmoid(
 _FOLD_BLOCK_E = 8
 _FOLD_BLOCK_H = 256
 _FOLD_MAX_SPLIT_K = 8
-# Each row re-reads the whole weight; past this many rows the cuBLAS GEMM's reuse wins.
-_FOLD_MAX_ROWS = 16
+# Each row re-reads the whole weight, so the cuBLAS GEMM's reuse wins past a few rows: on an RTX 5090
+# at 256 experts and H 2048 the fold was faster at 1 and 6 rows and slower at 16, cold and hot.
+# Six rows also covers the MTP-5 verify step.
+_FOLD_MAX_ROWS = 6
 _FOLD_COUNTERS: dict = {}
 
 
