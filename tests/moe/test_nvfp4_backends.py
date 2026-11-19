@@ -1012,8 +1012,7 @@ def test_triton_decode_marlin_unsummed_routes_are_what_its_sum_kernel_reads(kern
     cache.copy_missing()
     banks = cache.pool_bank_views(0)
     if kernel == "gemm":
-        ids = cache.slot_for_id[0][ids.long()].to(torch.int32)
-
+        # ensure_experts rewrote ids to the slots, which index the pool's banks
         def run(x, **kwargs):
             return fused_experts_nvfp4(x, *banks, topk_weights, ids, cache.pool_slots(0), "silu", False, **kwargs)
     else:
@@ -1105,14 +1104,14 @@ def test_decode_grouped_kernel_runs_from_a_row_count_on(monkeypatch):
 
 def test_decode_gemm_runs_from_a_row_count_on(monkeypatch):
     """A decode step takes the prefill GEMM from 32 rows (8 requests with 3 drafts) by default; FREETOKEN_NVFP4_DECODE_GEMM
-    names another count, 0 for never."""
+    names another count, 0 for never, on for the default."""
     from freetoken.kernel import nvfp4_moe
 
     takes = nvfp4_moe.decode_takes_gemm
     assert nvfp4_moe.decode_gemm_rows(None) == nvfp4_moe.decode_gemm_rows(" ") == 32
     monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", 32)
     assert [rows for rows in (1, 4, 6, 16, 24, 31, 32, 36, 64, 96) if takes(rows)] == [32, 36, 64, 96]
-    for value, rows, gemm in (("0", 0, []), ("off", 0, []), ("1", 1, [1, 4, 31, 64]), ("48", 48, [64])):
+    for value, rows, gemm in (("0", 0, []), ("off", 0, []), ("on", 32, [64]), ("Yes", 32, [64]), ("1", 1, [1, 4, 31, 64]), ("48", 48, [64])):
         assert nvfp4_moe.decode_gemm_rows(value) == rows
         monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", rows)
         assert [n for n in (1, 4, 31, 64) if takes(n)] == gemm
@@ -1161,6 +1160,66 @@ def test_triton_wide_decode_on_resident_banks_takes_the_prefill_gemm(monkeypatch
     assert ran == [kernel, kernel] + (["sum"] if sum_routes else [])
     assert aligned_over == ([E] if kernel == "gemm" else [])
     assert out.shape == ((rows, H) if sum_routes else (rows, TOPK, H))
+
+
+@cuda
+@pytest.mark.parametrize("sum_routes", [True, False])
+@pytest.mark.parametrize("rows", [32, 96])
+def test_triton_wide_decode_gemm_replays_in_a_cuda_graph_as_it_runs_eager(monkeypatch, rows, sum_routes):
+    """A wide decode step on resident banks runs the prefill GEMM inside the decode CUDA graph: captured at the step's
+    rows (8 requests with 3 drafts, 16 with 5) at the 35B-A3B shapes, a replay over new activations, routes and weights
+    gives the eager call's bits, and its output is the decode GEMV's up to the order of the sums."""
+    from types import SimpleNamespace
+
+    from freetoken.kernel import nvfp4_moe
+    from freetoken.layers.quantization import ExpertView
+    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
+
+    device = torch.device("cuda")
+    experts, top_k, hidden_size, inter = 256, 8, 2048, 512
+    g = torch.Generator().manual_seed(rows + sum_routes)
+
+    def bank(n, k):
+        packed = torch.randint(0, 256, (experts, n, k // 2), dtype=torch.uint8, generator=g)
+        scale = (torch.rand(experts, n, k // 16, generator=g) * 1.5 + 0.25).to(torch.float8_e4m3fn)
+        return packed.to(device), scale.to(device), (torch.rand(experts, n, generator=g) + 0.5).to(device)
+
+    def inputs():
+        x = (torch.randn(rows, hidden_size, generator=g) / 4).to(device, torch.bfloat16)
+        weights = torch.rand(rows, top_k, generator=g).to(device)
+        ids = torch.stack([torch.randperm(experts, generator=g)[:top_k] for _ in range(rows)])
+        return x, weights, ids.to(device, torch.int32).contiguous()
+
+    roles = ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")
+    view = ExpertView(dict(zip(roles, (*bank(2 * inter, hidden_size), *bank(hidden_size, inter)))), n=experts)
+    view.sum_routes = sum_routes
+    layer = SimpleNamespace(activation="silu", alpha=1.702, limit=7.0, apply_router_weight_on_input=False)
+    kernel = TritonNvfp4MoEKernel()
+    monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", 32)
+    static = inputs()
+
+    def step():
+        return kernel.apply(layer, *static, view, is_prefill=False)
+
+    for _ in range(3):
+        step()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = step()
+    fresh = inputs()
+    for into, value in zip(static, fresh):
+        into.copy_(value)
+    graph.replay()
+    torch.cuda.synchronize()
+    eager = kernel.apply(layer, *fresh, view, is_prefill=False)
+    assert captured.shape == ((rows, hidden_size) if sum_routes else (rows, top_k, hidden_size))
+    assert not torch.isnan(captured).any()
+    assert torch.equal(captured.view(torch.int16), eager.view(torch.int16))
+
+    monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", 0)
+    gemv = kernel.apply(layer, *fresh, view, is_prefill=False).float()
+    assert ((captured.float() - gemv).norm() / gemv.norm()).item() < 2e-2
 
 
 @cuda

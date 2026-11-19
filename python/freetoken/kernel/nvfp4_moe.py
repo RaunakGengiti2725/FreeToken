@@ -82,7 +82,8 @@ def decode_takes_grouped(rows: int) -> bool:
 
 # A wide verify step (many requests, each with its drafts) pays the GEMV's per-route ALU work on every row, while the
 # prefill tensor-core GEMM decodes each expert tile once per M block. From this row count a decode call on full-layer
-# banks takes the prefill GEMM: FREETOKEN_NVFP4_DECODE_GEMM is that count, 0 for never. The two paths differ in bits.
+# banks takes the prefill GEMM: FREETOKEN_NVFP4_DECODE_GEMM is that count, 0 (or false/no/off) for never, true/yes/on
+# for the default count. The two paths differ in bits.
 DECODE_GEMM_ENV = "FREETOKEN_NVFP4_DECODE_GEMM"
 # measured on one RTX 5090, 40 layers in a CUDA graph: GEMV 4.1 / 7.4 / 13.4 ms against GEMM 4.0 / 5.2 / 6.6 ms at 16 / 32 / 64 rows
 _DECODE_GEMM_DEFAULT_ROWS = 32
@@ -95,8 +96,10 @@ def decode_gemm_rows(value: str | None) -> int:
         return _DECODE_GEMM_DEFAULT_ROWS
     if text in ("false", "no", "off"):
         return 0
+    if text in ("true", "yes", "on"):
+        return _DECODE_GEMM_DEFAULT_ROWS
     if not text.isdigit():
-        raise ValueError(f"{DECODE_GEMM_ENV}={value!r} is not a row count (0 = never)")
+        raise ValueError(f"{DECODE_GEMM_ENV}={value!r} is not a row count (0 = never, on = {_DECODE_GEMM_DEFAULT_ROWS})")
     return int(text)
 
 
