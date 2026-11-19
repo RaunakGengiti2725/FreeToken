@@ -59,6 +59,18 @@ def _layer_kv(kv_cache, layer: int, loc: torch.Tensor) -> list[torch.Tensor]:
         return []
 
 
+def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
+    """max |a - b| over max |b|: nan where either holds a nan (torch's max keeps it)."""
+    return float((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-30))
+
+
+def _worst(values: list[float]) -> float:
+    """The largest of ``values``, nan if any is nan (Python's max keeps a nan only when it comes first); -1 for none."""
+    if any(v != v for v in values):
+        return float("nan")
+    return max(values, default=-1.0)
+
+
 class _RowsSink:
     """Copies a verify forward's final hidden rows into a buffer the runner owns, so a captured graph writes it too."""
 
@@ -255,14 +267,19 @@ class SpecRunner:
         after a prefill.
 
         ``check``: every prefill graph step is also run as an eager prefill forward of the same tokens from the same
-        state, and a line says whether the two are equal bit for bit (logits, hidden rows, K/V rows, linear state).
+        state, and a line says whether the two are equal bit for bit (logits, hidden rows, K/V rows, linear state) and
+        how far apart they are (max abs difference over the eager forward's max abs value; nan where either is not finite).
+        ``batch.pad_loc``, where set, is the page the padding rows store to in place of the padding request's first page
+        (the self-test lays its check request on that request's row).
         """
         from freetoken.attention.linear import gdn_slot
         from freetoken.core import Batch as _Batch
 
         engine, req = self.engine, batch.reqs[0]
         start, n = req.cached_len, req.extend_len
-        pad_loc = engine.page_table[engine.dummy_req.table_idx, 0]
+        pad_loc = getattr(batch, "pad_loc", None)
+        if pad_loc is None:
+            pad_loc = engine.page_table[engine.dummy_req.table_idx, 0]
         pool, slot = engine.linear_state_pool, gdn_slot(req)
         mrope = engine.config.model_config.model_is_mrope
         states = [] if pool is None else [pool.recurrent_states, pool.conv_states, *pool.slot_states.values()]
@@ -385,25 +402,20 @@ class SpecRunner:
                 same = [torch.equal(a, b) for a, b in zip(got, want, strict=True)]
                 kv = same[2 : len(same) - len(states)]
                 far = float((got[0].float() - want[0].float()).abs().max())
+                top = want[0][0].float().topk(2).values
+                kv_rel = [_rel(a, b) for a, b in zip(got[2 : len(got) - len(states)], want[2 : len(want) - len(states)])]
                 line = (
                     f"size={size} start={start + done} logits_equal={same[0]} logits_max_abs_diff={far:.6g} "
                     f"hidden_equal={same[1]} kv_equal={all(kv)} kv_tensors={len(kv)} kv_first_unequal={kv.index(False) if not all(kv) else -1} "
-                    f"state_equal={same[len(same) - len(states):]} argmax_equal={int(got[0].argmax()) == int(want[0].argmax())}"
+                    f"state_equal={same[len(same) - len(states):]} argmax_equal={int(got[0].argmax()) == int(want[0].argmax())} "
+                    f"eager_top2_gap={float(top[0] - top[1]):.6g} logits_rel={_rel(got[0], want[0]):.3g} hidden_rel={_rel(got[1], want[1]):.3g} "
+                    f"kv_rel_max={_worst(kv_rel):.3g} "
+                    f"state_rel={[round(_rel(a, b), 6) for a, b in zip(got[len(got) - len(states):], want[len(want) - len(states):])]}"
                 )
                 if bucket:
-
-                    def rel(a: torch.Tensor, b: torch.Tensor) -> float:
-                        return float((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-30))
-
                     untouched = all(torch.equal(a, b) for a, b in zip(
                         past_kv, [t for layer in range(engine.config.model_config.num_layers) for t in _layer_kv(engine.kv_cache, layer, past)]))
-                    print(
-                        f"PREFILL_PAD_CHECK rows={m} {line} hidden_rel={rel(got[1], want[1]):.3g} "
-                        f"kv_rel_max={max((rel(a, b) for a, b in zip(got[2 : len(got) - len(states)], want[2 : len(want) - len(states)])), default=-1):.3g} "
-                        f"state_rel={[round(rel(a, b), 6) for a, b in zip(got[len(got) - len(states):], want[len(want) - len(states):])]} "
-                        f"pad_kv_untouched={untouched}",
-                        flush=True,
-                    )
+                    print(f"PREFILL_PAD_CHECK rows={m} {line} pad_kv_untouched={untouched}", flush=True)
                 else:
                     print(f"PREFILL_SPLIT_CHECK {line}", flush=True)
             done += m

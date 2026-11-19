@@ -275,6 +275,18 @@ def test_padded_prefill_plan_is_one_replay_of_the_bucket_that_holds_the_chunk():
     assert runner.prefill_plan(SimpleNamespace(reqs=[req], fla_metadata=SimpleNamespace(track_dst=None))) == [("bucket", 704)]
 
 
+def test_the_replay_check_keeps_a_nan_in_its_distances():
+    """A replay's check line reports nan where a row came out nan, wherever that row is among the K/V tensors."""
+    from freetoken.spec.runner import _rel, _worst
+
+    good, bad = torch.ones(4), torch.tensor([1.0, float("nan"), 1.0, 1.0])
+    assert _rel(good, good) == 0.0
+    assert _rel(bad, good) != _rel(bad, good)
+    assert _worst([0.01, float("nan"), 0.02]) != _worst([0.01, float("nan"), 0.02])
+    assert _worst([0.01, float("inf")]) == float("inf")
+    assert _worst([0.01, 0.03]) == 0.03 and _worst([]) == -1.0
+
+
 def test_a_padded_capture_places_the_snapshot_where_the_eager_forward_does():
     """The track rows a padded chunk capture writes before a replay of n real rows are the ones the eager forward of
     those n rows builds (_build_track_metadata), and its cu_seqlens end at n; with no slot to track the snapshot

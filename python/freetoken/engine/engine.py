@@ -2452,8 +2452,11 @@ class Engine:
         forward of the same tokens, once from an empty state and once after a 96-token prefix, then three two-replay
         plans with their snapshot, on the padding request's row with seeded token ids. SpecRunner.prefill_as_verify
         prints one PREFILL_SPLIT_CHECK line a captured step; a line here says whether each snapshot is the state at its cut.
-        Padded (--prefill-graph-pad), each bucket also replays chunks 63 and 1 tokens short of it against their eager
-        forwards (PREFILL_PAD_CHECK) and the smallest and largest write their own snapshot (PREFILL_PAD_TRACK_CHECK)."""
+        Padded (--prefill-graph-pad), each bucket also replays chunks 63 and 1 tokens short of it, and one of its own
+        size, as a request's chunk replays it, against their eager forwards (PREFILL_PAD_CHECK), and the smallest and
+        largest write their own snapshot (PREFILL_PAD_TRACK_CHECK). The check request takes the padding request's row
+        for its pages, so its pad rows store to the padding request's own page as a served chunk's do, not to the row's
+        first page, which here holds a token."""
         from types import SimpleNamespace
 
         from freetoken.kernel.fla.chunk import CHUNK_SIZE as CHUNK
@@ -2462,18 +2465,22 @@ class Engine:
             return
         row, pool = self.page_table[self.dummy_req.table_idx], self.linear_state_pool
         saved, prefix = row.clone(), 96
+        pad_loc = saved[0].clone()
         generator = torch.Generator().manual_seed(0)
         vocab = min(self.config.model_config.vocab_size, 100_000)
         # a padded replay that tracks nothing writes its snapshot to the padding request's slot: the checks run on another
         own = pool.alloc(1)[0] if getattr(self, "chunk_pad", False) and pool is not None and pool.num_free_slots > 0 else None
         live = own if own is not None else self.dummy_req.linear_slot_idx
+        spare = None
 
         def run(ids: torch.Tensor, start: int, plan: list, track: int | None = None) -> None:
             req = SimpleNamespace(
                 table_idx=self.dummy_req.table_idx, cached_len=start, device_len=ids.numel(), extend_len=ids.numel() - start,
                 linear_slot_idx=live, mrope_delta=0, mrope_positions_full=None,
             )
-            batch = SimpleNamespace(reqs=[req], input_ids=ids[start:].to(self.device), out_loc=row[start : ids.numel()], prefill_plan=plan)
+            batch = SimpleNamespace(
+                reqs=[req], input_ids=ids[start:].to(self.device), out_loc=row[start : ids.numel()], prefill_plan=plan, pad_loc=pad_loc,
+            )
             if track is not None:
                 batch.prefill_track_dst = torch.tensor([track], dtype=torch.int64, device=self.device)
             self.spec.prefill_as_verify(batch, check=True)
@@ -2491,10 +2498,10 @@ class Engine:
                 run(ids[:size], 0, [("chunk", size)])
                 run(ids[:prefix], 0, [("eager", prefix)])
                 run(ids, prefix, [("chunk", size)])
-            # padded: each bucket against the eager forward of chunks one and 63 tokens short of it, from an empty state
-            # and after the prefix (PREFILL_PAD_CHECK lines)
+            # padded: each bucket against the eager forward of chunks one and 63 tokens short of it and of its own size,
+            # from an empty state and after the prefix (PREFILL_PAD_CHECK lines)
             for size in sorted(s for s in self.chunk_runners if own is not None and s > CHUNK):
-                for m in (size - CHUNK + 1, size - 1):
+                for m in (size - CHUNK + 1, size - 1, size):
                     if prefix + size > self.max_seq_len:
                         continue
                     row[: prefix + size] = torch.arange(prefix + size, dtype=row.dtype, device=row.device)
@@ -2540,11 +2547,10 @@ class Engine:
                     f"rec_rel={rel[0]:.3g} conv_rel={rel[1]:.3g}",
                     flush=True,
                 )
-            if spare is not None:
-                pool.free([spare])
-            if own is not None:
-                pool.free([own])
         finally:
+            for slot in (spare, own):
+                if slot is not None:
+                    pool.free([slot])
             row.copy_(saved)
             self.spec.proposer._prefill_sink = None
             if self.moe_offload_cache is not None:
@@ -2655,13 +2661,16 @@ class Engine:
         hid_g = self.spec.proposer._prefill_sink.hidden.float()
         rel = lambda a, b: float((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-30))
         top = eager[0].topk(2)
-        kv = [max(rel(self.kv_cache.k_cache(i)[loc], k), rel(self.kv_cache.v_cache(i)[loc], v)) for i, (k, v) in enumerate(kv_e)]
+        # a nan stays a nan: Python's max drops one that does not come first
+        kv = [float("nan") if any(x != x for x in pair) else max(pair) for pair in (
+            (rel(self.kv_cache.k_cache(i)[loc], k), rel(self.kv_cache.v_cache(i)[loc], v)) for k, v in kv_e)]
+        kv_max = float("nan") if any(x != x for x in kv) else max(kv, default=-1)
         logger.info_rank0(
             f"PREFILL_GRAPH_CHECK n={req.extend_len} cached={req.cached_len} argmax eager={int(eager[0].argmax())} graph={int(graph[0].argmax())} "
             f"equal={bool(eager[0].argmax() == graph[0].argmax())} eager_top2_gap={float(top.values[0] - top.values[1]):.4f} "
             f"logits_max_abs_diff={float((eager - graph.float()).abs().max()):.4f} logits_scale={float(eager.abs().max()):.2f} "
             f"hidden_rel={rel(hid_g, hid_e):.5f} rec_state_rel={rel(pool.recurrent_states[:, slot], rec_e):.5f} "
-            f"conv_state_rel={rel(pool.conv_states[:, slot], conv_e):.5f} kv_rel_max={max(kv) if kv else -1:.5f} kv_layers={len(kv)} "
+            f"conv_state_rel={rel(pool.conv_states[:, slot], conv_e):.5f} kv_rel_max={kv_max:.5f} kv_layers={len(kv)} "
             f"kv_rel_first={kv[0] if kv else -1:.5f} kv_rel_last={kv[-1] if kv else -1:.5f} "
             f"rec_by_layer={[round(rel(pool.recurrent_states[i, slot], rec_e[i]), 5) for i in range(0, rec_e.shape[0], max(1, rec_e.shape[0] // 8))]} "
             f"conv_by_layer={[round(rel(pool.conv_states[i, slot], conv_e[i]), 5) for i in range(0, conv_e.shape[0], max(1, conv_e.shape[0] // 8))]} "
