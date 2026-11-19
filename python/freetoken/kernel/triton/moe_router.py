@@ -97,15 +97,20 @@ def _route_rows(
     mask_k = offs_k < K
     selected_vals = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
     selected_idx = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.int32)
+    # The softmax weights' renormalizing sum, in selection order: a tl.sum over the K slots would add
+    # them in an order set by the compiled layout, which differs between kernels that inline this helper.
+    picked_sum = tl.zeros([BLOCK_M, 1], dtype=tl.float32)
 
     cur = ranked
     for k in tl.static_range(K):
         max_val = tl.max(cur, axis=1)[:, None]
         lane_id = tl.where(cur == max_val, offs_n[None, :], N + 1)  # lowest expert id wins ties
         win_lane = tl.min(lane_id, axis=1)[:, None].to(tl.int32)
+        # one lane is nonzero, so this sum is exact in any order
         win_activated = tl.sum(
             tl.where(offs_n[None, :] == win_lane, activated, 0.0), axis=1
         )[:, None]
+        picked_sum = picked_sum + win_activated
         slot = offs_k[None, :] == k
         selected_vals = tl.where(slot, win_activated, selected_vals)
         selected_idx = tl.where(slot, win_lane, selected_idx)
@@ -115,11 +120,11 @@ def _route_rows(
         tl.extra.cuda.gdc_launch_dependents()
 
     if RENORMALIZE:
-        routed_sum = tl.sum(tl.where(mask_k[None, :], selected_vals, 0.0), axis=1)[:, None]
         if SIGMOID:
+            routed_sum = tl.sum(tl.where(mask_k[None, :], selected_vals, 0.0), axis=1)[:, None]
             selected_vals = tl.div_rn(selected_vals, routed_sum + 1e-20)
         else:
-            selected_vals = selected_vals / tl.where(routed_sum > 0.0, routed_sum, 1.0)
+            selected_vals = selected_vals / tl.where(picked_sum > 0.0, picked_sum, 1.0)
     if SIGMOID:
         selected_vals = selected_vals * routed_scale
 
@@ -190,7 +195,7 @@ def _router_triton_kernel(
 def _router_gemv_topk_kernel(
     x_ptr,        # [M, H] bf16 hidden states, unit inner stride
     w_ptr,        # [N, H] bf16 router weight, unit inner stride
-    part_ptr,     # [M, SPLIT_K, N] fp32 partial logits
+    part_ptr,     # [SPLIT_K, M, N] fp32 partial logits
     counter_ptr,  # [M] int32 arrival counters, zeroed (self-resetting)
     logits_ptr,   # [M, N] bf16 logits
     out_weights_ptr,
@@ -419,10 +424,13 @@ def router_gemv_topk_softmax(
     indices = torch.empty((M, topk), dtype=torch.int32, device=x.device)
     if logits_out is None:
         logits_out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
-    assert logits_out.shape == (M, N) and logits_out.dtype == torch.bfloat16 and logits_out.stride(1) == 1
+    assert logits_out.shape == (M, N) and logits_out.dtype == torch.bfloat16 and logits_out.is_contiguous()
     split_k = _fold_split_k(H)
     n_tiles = triton.cdiv(N, _FOLD_BLOCK_E)
-    part = torch.empty((M, split_k, N), dtype=torch.float32, device=x.device)
+    # A row of partials steps by N, as a row of contiguous logits does, so the alignment Triton can prove
+    # for the tail's loads is the router's own: it vectorizes a load as wide as the widest access of that
+    # shape on the same indices, and that sets the layout, so the order, of the tail's sums.
+    part = torch.empty((split_k, M, N), dtype=torch.float32, device=x.device)
     _router_gemv_topk_kernel[(M, n_tiles, split_k)](
         x,
         weight,
@@ -435,8 +443,8 @@ def router_gemv_topk_softmax(
         H // (_FOLD_BLOCK_H * split_k),
         x.stride(0),
         weight.stride(0),
-        part.stride(0),
         part.stride(1),
+        part.stride(0),
         logits_out.stride(0),
         weights.stride(0),
         weights.stride(1),

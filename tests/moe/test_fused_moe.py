@@ -509,7 +509,19 @@ def _router_gemv_inputs(rows, num_experts, hidden, seed):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("renormalize", [True, False])
-@pytest.mark.parametrize("rows,num_experts,hidden,topk", [(1, 256, 2048, 8), (6, 256, 2048, 8), (16, 256, 2048, 8), (3, 512, 1024, 10), (2, 200, 512, 8)])
+@pytest.mark.parametrize(
+    "rows,num_experts,hidden,topk",
+    [
+        (1, 256, 2048, 8),
+        (6, 256, 2048, 8),
+        (16, 256, 2048, 8),
+        (3, 512, 1024, 10),
+        # expert counts whose row stride is not a multiple of 16: the kernels' loads vectorize differently
+        (2, 200, 512, 8),
+        (16, 200, 512, 8),
+        (5, 136, 768, 6),
+    ],
+)
 def test_router_gemv_topk_routes_its_logits_as_the_router_does(rows, num_experts, hidden, topk, renormalize):
     from freetoken.kernel.triton.moe_router import fused_topk_softmax, router_gemv_topk_softmax
 
