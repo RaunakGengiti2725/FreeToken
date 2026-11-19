@@ -166,7 +166,7 @@ def test_chunked_reqs_share_one_stats_stamped_at_the_first_chunk():
     pm.add_one_req(SimpleNamespace(
         uid=UID, input_ids=torch.arange(prompt_len, dtype=torch.int32),
         sampling_params=SamplingParams(max_tokens=4), mm_items=None,
-        mrope_positions=None, mrope_delta=0,
+        mrope_positions=None, mrope_delta=0, stamps=None,
     ))
     pending = pm.pending_list[0]
     assert pending.stats.enqueued_at is not None

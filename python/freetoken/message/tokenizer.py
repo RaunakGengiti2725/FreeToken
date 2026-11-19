@@ -83,6 +83,8 @@ class TokenizeMsg(BaseTokenizerMsg):
     inline_system_policy: str | None = None
     # the chat prompt the frontend already rendered from ``text``, which the worker then encodes as is
     prompt: str | None = None
+    # perf_counter readings for the timings split (ReqStats.stamps); None unless --enable-timings-report
+    stamps: List[float] | None = None
 
 
 @dataclass

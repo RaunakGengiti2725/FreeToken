@@ -310,7 +310,7 @@ class PrefillManager:
         return None
 
     def add_one_req(self, req: UserMsg) -> None:
-        stats = ReqStats(enqueued_at=time.perf_counter())
+        stats = ReqStats(enqueued_at=time.perf_counter(), stamps=req.stamps)
         self.pending_list.append(
             PendingReq(
                 req.uid,
