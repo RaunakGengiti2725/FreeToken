@@ -370,6 +370,32 @@ The text of a reply depends on the requests decoded beside it: a decode step com
 every running request together, and a row's last bits change with the rows beside it. A seeded
 request gives one text only when it runs alone (`--max-running-requests 1`).
 
+### Opt-in paths
+
+Each path below is off by default; a server started with none of them set serves the default path.
+
+`FREETOKEN_ROUTER_FOLD=1` computes the router's logits inside its top-k launch on decode steps of up
+to 6 rows, so the router's linear and its top-k are one launch instead of two, and
+`FREETOKEN_SHARED_EXPERT_ROUTE=1` then runs the shared expert as a ninth route of the routed experts'
+decode kernels on decode steps of 1 to 6 rows on resident NVFP4 experts, with its gate as one more
+row of the router's launch. Both are off by default and on only for `1`, `true`, `yes` or `on`; the
+ninth route needs the fold, and a step that the grouped decode kernel or the wide decode GEMM takes
+keeps the shared expert's own kernels. The logits are summed in the kernel's order, not cuBLAS's, so
+a near-tie may route to the other expert. Measured together, with MTP at 5 draft tokens and the
+expert map, they decoded 763.1 and 666.2 tok/s against 648.7 and 524.5 tok/s with both off in the
+same run, at a KL of 0.001636 against the default path. The hard30 and gate rows have not finished.
+
+`--moe-expert-activation-scales` runs prefill forwards of at least 2048 tokens through the W4A4
+expert kernel (see [MoE offload](#moe-offload)). It is off by default and changes the output. It
+passes the gate and hard30, but its KL is 0.0150, over the 0.00268 line, so it stays off until a KL
+row under the line.
+
+`--preset single-bucket` captures prefill forwards for chunks of exactly 128, 256, 512 and 1,024
+tokens (see [Presets](#presets)). It is off by default: `--preset single` does not include it. A
+1,024-token prompt's first token came in 52.9 ms against 65.3 ms without the buckets. Its replies
+are `single`'s only for chunks of those four sizes, which are the ones that replay a capture; every
+other chunk past 64 tokens runs eagerly.
+
 ### API behaviour
 
 | Flag | Default | Meaning |
