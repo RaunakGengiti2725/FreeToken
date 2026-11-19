@@ -119,6 +119,7 @@ class TokenizeManager:
         from freetoken.core import SamplingParams
 
         prompts, reused = self._prefix_cache.prompts, self._prefix_cache.reused_tokens
+        self._prefix_cache.warm()
         try:
             (msg,) = self.tokenize([TokenizeMsg(uid=-1, text=[dict(m) for m in _WARM_CONVERSATION], sampling_params=SamplingParams())])
         finally:

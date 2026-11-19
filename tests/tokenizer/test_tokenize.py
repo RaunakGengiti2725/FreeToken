@@ -910,6 +910,48 @@ def test_prefix_cache_ids_equal_a_full_encode_wherever_the_prompts_part(chat_tok
     assert len(cache.prompts) == 2
 
 
+_PIECE_TEXTS = [
+    "one line\nTwo lines\n\nthree 'quoted' lines\n  indented\n\tand tabs\n<|im_end|>\n<think>x</think>\n",
+    "a word, another word's end; we'd go\nThe end.\n\n\"Quoted\" start\n(paren) start\n_under_ start\n123 numbers",
+    "café au lait été ßä 中文 ́mark \U0001f600 emoji nbsp　wide\r\nCRLF line\rCR",
+    "  spaces   between   words \n \n\n  \n trailing  \nx y z 'll 're 've\n'twas\n'S\n",
+]
+
+
+@pytest.mark.parametrize("repo", ["Qwen/Qwen3-0.6B", "nvidia/Qwen3.6-35B-A3B-NVFP4"])
+def test_prefix_cache_pieces_encode_to_the_ids_of_the_whole_text(repo, monkeypatch):
+    """A long prompt is cut after a newline or at a space between letters and its pieces encoded apart: the ids,
+    the cut tokens a later prompt reuses and the reused count equal those of the whole-text encode."""
+    import random
+
+    from freetoken.tokenizer import prefix_cache
+
+    tokenizer = _hub_tokenizer(repo)
+    pieces, whole = prefix_cache.TokenPrefixCache(tokenizer, 2), prefix_cache.TokenPrefixCache(tokenizer, 2)
+    whole.pieces = None
+    assert pieces.pieces is not None
+    monkeypatch.setattr(prefix_cache, "_PIECE_CHARS", 1)
+    rng = random.Random(0)
+    texts = _PIECE_TEXTS + ["".join(rng.choice(_PIECE_TEXTS)[rng.randrange(40):][:rng.randrange(1, 60)] for _ in range(8))
+                            for _ in range(200)]
+    for most in (2, 7, 64):
+        monkeypatch.setattr(prefix_cache, "_MAX_PIECES", most)
+        for text in texts:
+            prompt = _CHAT + text + "<|im_end|>\n<|im_start|>assistant\n"
+            assert pieces.encode(prompt).tolist() == whole.encode(prompt).tolist() == tokenizer.encode(prompt, add_special_tokens=False)
+            assert pieces.prompts[0].cuts == whole.prompts[0].cuts
+        turn = _CHAT + texts[0] + "<|im_end|>\n<|im_start|>assistant\nok<|im_end|>\n<|im_start|>user\n" + texts[1]
+        assert pieces.encode(turn).tolist() == whole.encode(turn).tolist()
+        assert pieces.reused_tokens == whole.reused_tokens > 0
+
+
+def test_prefix_cache_keeps_the_whole_text_encode_where_a_cut_could_change_ids():
+    from freetoken.tokenizer.prefix_cache import piece_encoder
+
+    # byte-level with its own split pattern, which this check does not know
+    assert piece_encoder(_chat_tokenizer()) is None
+
+
 def test_tokenize_manager_takes_the_prefix_cache_for_templated_prompts_only():
     tokenizer = _chat_tokenizer()
     manager = TokenizeManager(tokenizer)
