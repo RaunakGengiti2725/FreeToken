@@ -73,11 +73,19 @@ class TritonNvfp4MoEKernel(MoEKernel):
         return {}
 
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
+        from freetoken.kernel import nvfp4_moe
         from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin, fused_experts_nvfp4
 
         t = view.tensors
         banks = (t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"])
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
+        # resident full-layer banks only (row == expert id); the offload and hybrid slot views stay on the GEMV
+        full_layer = view.n is not None and view.slots is None and view.routed is None
+        if not is_prefill and full_layer and nvfp4_moe.decode_takes_gemm(x.shape[0]):
+            return fused_experts_nvfp4(
+                x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit,
+                sum_routes=view.sum_routes,
+            )
         if is_prefill:
             routed = view.routed
             return fused_experts_nvfp4(

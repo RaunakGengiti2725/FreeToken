@@ -152,13 +152,15 @@ def fused_experts_nvfp4(
     act_limit: float = 7.0,
     routed_experts: int | None = None,
     slot_of: torch.Tensor | None = None,
+    sum_routes: bool = True,
 ) -> torch.Tensor:
     """Prefill inline-NVFP4 MoE. ``topk_ids`` index rows of the bank tensors in
     ``[0, num_experts)``: full-layer banks with position == expert id (the
     materialized ``[:E]`` slot view or the overlap double buffer), raw ids; or the
     cache slots a demand prefill chunk routes to, whose layer's ``routed_experts``
     size the tiles as the stream's banks would. With ``slot_of`` they are the expert
-    ids of that layer, and ``slot_of[expert]`` the bank row of each."""
+    ids of that layer, and ``slot_of[expert]`` the bank row of each.
+    ``sum_routes=False`` skips the sum-reduce and returns each route's weighted output [M, top_k, H], as decode does."""
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]
@@ -185,6 +187,8 @@ def fused_experts_nvfp4(
         tw, sorted_ids, expert_ids, ntpp, num_valid, 1,
         not apply_router_weight_on_input, cfg,
     )
+    if not sum_routes:
+        return ic3
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
     return out

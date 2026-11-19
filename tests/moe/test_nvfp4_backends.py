@@ -994,11 +994,13 @@ def test_triton_decode_marlin_matches_baseline_kernel():
 
 
 @cuda
-def test_triton_decode_marlin_unsummed_routes_are_what_its_sum_kernel_reads():
+@pytest.mark.parametrize("kernel", ["gemv", "gemm"])
+def test_triton_decode_marlin_unsummed_routes_are_what_its_sum_kernel_reads(kernel):
     """sum_routes=False returns each route's weighted output [M, top_k, H]: the sum kernel over it gives the summed
-    call's bits, so a caller that sums the routes as that kernel does changes nothing."""
+    call's bits, so a caller that sums the routes as that kernel does changes nothing. The same holds for the prefill
+    GEMM a wide decode step takes."""
     from freetoken.kernel import moe_sum_reduce_triton
-    from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
+    from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin, fused_experts_nvfp4
 
     device = torch.device("cuda")
     cache, _ = _triton_cache(device)
@@ -1009,8 +1011,16 @@ def test_triton_decode_marlin_unsummed_routes_are_what_its_sum_kernel_reads():
     cache.ensure_experts(0, ids)
     cache.copy_missing()
     banks = cache.pool_bank_views(0)
-    summed = fused_experts_decode_nvfp4_marlin(hidden.clone(), *banks, topk_weights, ids, "silu", False)
-    routes = fused_experts_decode_nvfp4_marlin(hidden.clone(), *banks, topk_weights, ids, "silu", False, sum_routes=False)
+    if kernel == "gemm":
+        ids = cache.slot_for_id[0][ids.long()].to(torch.int32)
+
+        def run(x, **kwargs):
+            return fused_experts_nvfp4(x, *banks, topk_weights, ids, cache.pool_slots(0), "silu", False, **kwargs)
+    else:
+        def run(x, **kwargs):
+            return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, ids, "silu", False, **kwargs)
+    summed = run(hidden.clone())
+    routes = run(hidden.clone(), sum_routes=False)
     assert routes.shape == (3, TOPK, H) and routes.dtype == summed.dtype
     out = torch.empty_like(summed)
     moe_sum_reduce_triton(routes, out)
@@ -1091,6 +1101,66 @@ def test_decode_grouped_kernel_runs_from_a_row_count_on(monkeypatch):
         assert [n for n in (1, 2, 4) if takes(n)] == grouped
     with pytest.raises(ValueError, match="FREETOKEN_NVFP4_DECODE_GROUPED"):
         nvfp4_moe.decode_grouped_rows("many")
+
+
+def test_decode_gemm_runs_from_a_row_count_on(monkeypatch):
+    """A decode step takes the prefill GEMM from 32 rows (8 requests with 3 drafts) by default; FREETOKEN_NVFP4_DECODE_GEMM
+    names another count, 0 for never."""
+    from freetoken.kernel import nvfp4_moe
+
+    takes = nvfp4_moe.decode_takes_gemm
+    assert nvfp4_moe.decode_gemm_rows(None) == nvfp4_moe.decode_gemm_rows(" ") == 32
+    monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", 32)
+    assert [rows for rows in (1, 4, 6, 16, 24, 31, 32, 36, 64, 96) if takes(rows)] == [32, 36, 64, 96]
+    for value, rows, gemm in (("0", 0, []), ("off", 0, []), ("1", 1, [1, 4, 31, 64]), ("48", 48, [64])):
+        assert nvfp4_moe.decode_gemm_rows(value) == rows
+        monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", rows)
+        assert [n for n in (1, 4, 31, 64) if takes(n)] == gemm
+    with pytest.raises(ValueError, match="FREETOKEN_NVFP4_DECODE_GEMM"):
+        nvfp4_moe.decode_gemm_rows("wide")
+
+
+@pytest.mark.parametrize("sum_routes", [True, False])
+@pytest.mark.parametrize("view_kind", ["resident", "offload", "hybrid"])
+@pytest.mark.parametrize("rows", [1, 31, 32, 64, 96])
+def test_triton_wide_decode_on_resident_banks_takes_the_prefill_gemm(monkeypatch, rows, view_kind, sum_routes):
+    """From the switch's row count a decode call on resident full-layer banks runs the prefill GEMM over the layer's
+    experts and returns what the caller asked for: the sum [M, H], or each route's output [M, top_k, H] for the
+    shared-expert kernel to sum. A slot cache view (offload: the slots, hybrid: no expert count) stays on the GEMV,
+    and so does a narrower step."""
+    from types import SimpleNamespace
+
+    from freetoken.kernel import nvfp4_moe
+    from freetoken.layers.quantization import ExpertView
+    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
+    from freetoken.moe import fused_nvfp4
+
+    ran, aligned_over = [], []
+
+    def align(ids, block, num_experts):
+        aligned_over.append(num_experts)
+        return _align_on_cpu(ids, block, num_experts)
+
+    monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", 32)
+    monkeypatch.setattr(nvfp4_moe, "prefill_config", lambda *args: {"BLOCK_SIZE_M": 16})
+    monkeypatch.setattr(nvfp4_moe, "prefill_gemm", lambda *args: ran.append("gemm"))
+    monkeypatch.setattr(nvfp4_moe, "decode_gemm_marlin", lambda *args, **kwargs: ran.append("gemv"))
+    monkeypatch.setattr(fused_nvfp4, "moe_align_block_size", align)
+    monkeypatch.setattr(fused_nvfp4, "gated_act_and_mul", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fused_nvfp4, "moe_sum_reduce_triton", lambda *args: ran.append("sum"))
+    ids = torch.randint(0, E, (rows, TOPK), dtype=torch.int32)
+    banks = {role: torch.zeros(E, 2 * I, H // 2) for role in ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")}
+    view = {"resident": ExpertView(banks, n=E), "offload": ExpertView(banks, slots=ids), "hybrid": ExpertView(banks)}[view_kind]
+    view.sum_routes = sum_routes
+    out = TritonNvfp4MoEKernel().apply(
+        SimpleNamespace(activation="silu", alpha=1.702, limit=7.0, apply_router_weight_on_input=False),
+        torch.zeros(rows, H, dtype=torch.bfloat16), torch.ones(rows, TOPK), ids, view, is_prefill=False,
+    )
+
+    kernel = "gemm" if view_kind == "resident" and rows >= 32 else "gemv"
+    assert ran == [kernel, kernel] + (["sum"] if sum_routes else [])
+    assert aligned_over == ([E] if kernel == "gemm" else [])
+    assert out.shape == ((rows, H) if sum_routes else (rows, TOPK, H))
 
 
 @cuda
