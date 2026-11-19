@@ -100,7 +100,8 @@ class Qwen3_5MoE(BaseOP):
         self._fuse_shared = self._shared_expert_fusable(config)
         self._router_weight: torch.Tensor | None | bool = False  # False until the first decode step decides
         self._router_off: str | None = None
-        # the shared expert in the experts' bank layout; False until the first decode step outside a capture decides
+        # the shared expert in the experts' bank layout; False until the engine's load (prepare_decode_weights) or the
+        # first decode step outside a capture decides
         self._shared_route: dict[str, torch.Tensor] | None | bool = False
 
     def _shared_expert_fusable(self, config: ModelConfig) -> bool:
@@ -188,6 +189,14 @@ class Qwen3_5MoE(BaseOP):
         if not router_gemv_topk_folds(hidden_states.shape[0], w.shape[0], w.shape[1], experts.top_k):
             return None
         return router_gemv_topk_softmax(hidden_states, w, experts.top_k, experts.renormalize)
+
+    def prepare_decode_weights(self) -> None:
+        """The engine's call once the experts are loaded: the shared expert's route copy is made here, so the free
+        memory the KV pool is sized from counts it. A block built without the engine makes it at its first decode."""
+        if _SHARED_ROUTE:
+            self._shared_route_banks()
+        elif self._shared_route is False:
+            logger.info_once(f"shared expert as a ninth route on decode: off ({SHARED_ROUTE_ENV}=0)")
 
     def _shared_route_banks(self) -> dict[str, torch.Tensor] | None:
         """The shared expert as one expert of the routed experts' banks: each projection in the bank's role, shape,

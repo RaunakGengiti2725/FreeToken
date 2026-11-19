@@ -147,12 +147,20 @@ def test_shared_route_leaves_the_grouped_kernels_row_counts_alone(decode, monkey
     assert moe._shared_route_for(torch.zeros(6, H, dtype=torch.bfloat16)) is None
 
 
-def test_shared_route_is_built_for_resident_triton_nvfp4_experts_only():
+def test_shared_route_is_built_for_resident_triton_nvfp4_experts_only(monkeypatch):
     moe = _moe()
     route = moe._build_shared_route()
     assert set(route) == set(ROLES)
     for role in ROLES:
         assert route[role].shape == moe.experts._expert_banks[role].shape[1:]
+    loaded = _moe()
+    loaded.prepare_decode_weights()   # the engine's load makes it, before the KV pool is sized
+    assert set(loaded._shared_route) == set(ROLES)
+    monkeypatch.setattr(qmoe, "_SHARED_ROUTE", False)
+    off = _moe()
+    off.prepare_decode_weights()   # the knob off: no copy
+    assert off._shared_route is False
+    monkeypatch.setattr(qmoe, "_SHARED_ROUTE", True)
 
     def refused(change):
         m = _moe()
