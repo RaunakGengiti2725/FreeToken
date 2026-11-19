@@ -178,6 +178,24 @@ def test_shared_route_is_built_for_resident_triton_nvfp4_experts_only(monkeypatc
     assert refused(lambda m: m.experts._expert_banks.update(down=torch.zeros(E, H, MI // 4, dtype=torch.uint8)))
 
 
+def test_shared_route_is_not_built_with_the_router_fold_off(decode, monkeypatch):
+    """FREETOKEN_ROUTER_FOLD=0: the route's gate rides the fold's launch, so no step can take it; the engine's load
+    makes no copy (none of the KV pool goes to it) and says so once, naming the switch."""
+    said = []
+    monkeypatch.setattr(qmoe, "_ROUTER_FOLD", False)
+    monkeypatch.setattr(qmoe, "_SHARED_ROUTE", True)
+    monkeypatch.setattr(qmoe.logger, "info_once", lambda msg, *a, **k: said.append(msg), raising=False)
+    moe = _moe()
+    built = []
+    monkeypatch.setattr(moe, "_build_shared_route", lambda: built.append(1) or {})
+    moe.prepare_decode_weights()
+    assert moe._shared_route is None and not built
+    assert said == ["shared expert as a ninth route on decode: off (FREETOKEN_ROUTER_FOLD=0)"]
+    moe._router_weight = False
+    assert moe._shared_route_for(torch.zeros(6, H, dtype=torch.bfloat16)) is None
+    assert not built
+
+
 def test_shared_route_says_once_a_row_count_that_a_served_step_took_it(decode, monkeypatch):
     """One line a row count a process, from the blocks the engine prepared (the served model's, not a draft's)."""
     from freetoken.kernel.triton import moe_router
