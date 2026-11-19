@@ -2576,6 +2576,9 @@ class Engine:
         finally:
             for slot in (spare, own):
                 if slot is not None:
+                    # the track check leaves nan in them, which a request given the slot next must not start from
+                    for state in (pool.recurrent_states, pool.conv_states, *pool.slot_states.values()):
+                        state[:, slot].zero_()
                     pool.free([slot])
             row.copy_(saved)
             self.spec.proposer._prefill_sink = None
