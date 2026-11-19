@@ -103,6 +103,9 @@ class ExpertView:
     # False: a decode apply() may return each route's weighted output [M, top_k, hidden], unsummed
     sum_routes: bool = True
     routed: RoutedExperts | None = None
+    # an expert outside the bank by the layout's roles, one slot's shape each: a decode apply() of a kernel with
+    # ``takes_shared_route`` reads it for the last column of the routes, whose id it ignores
+    shared: dict[str, torch.Tensor] | None = None
 
 
 def fused_piece(pieces: dict[str, torch.Tensor], role: str) -> torch.Tensor:
@@ -166,6 +169,8 @@ class MoEKernel(ABC):
     groups_prefill_by_expert: ClassVar[bool] = False
     # Whether ``apply`` reads ``ExpertView.alphas`` of a slot view; a kernel that does not is spared their per-slot gather, which a decode step would repeat for every layer.
     reads_slot_alphas: ClassVar[bool] = True
+    # Whether a decode ``apply`` takes ``ExpertView.shared``: one more expert, outside the bank, as every row's last route.
+    takes_shared_route: ClassVar[bool] = False
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         return None

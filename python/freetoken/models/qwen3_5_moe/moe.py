@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -19,6 +20,29 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _FOLD_SAID = False  # the router fold's one line a process
+
+# A decode step of up to this many rows (one row, or a verify of up to five drafts) on resident NVFP4 experts runs the
+# shared expert as one more route of the routed experts' kernels and its gate as one more row of the router's launch:
+# the router fold's own cap (moe_router._FOLD_MAX_ROWS), since the gate rides the fold's launch.
+_SHARED_ROUTE_MAX_ROWS = 6
+# FREETOKEN_SHARED_EXPERT_ROUTE=0 keeps the shared expert's own kernels on those steps -- a measurement-only escape
+# hatch. Each decode step reads _SHARED_ROUTE, so a captured graph runs the path that was set when it was captured.
+SHARED_ROUTE_ENV = "FREETOKEN_SHARED_EXPERT_ROUTE"
+_SHARED_ROUTE = os.environ.get(SHARED_ROUTE_ENV, "1").strip() != "0"
+_SHARED_ROUTE_ROLES = ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")
+
+
+def shared_expert_bank_slot(gate_up, down) -> dict[str, torch.Tensor]:
+    """The two NVFP4 projections of a shared expert on the triton linear kernel's K-major resident layout
+    (``nvfp4_transpose_resident``: [K // 8, N] int32 words, [K // 16, N] block scales, [N] row globals) as one
+    expert of the Triton MoE banks: [N, K // 2] uint8, [N, K // 16] e4m3 and [N] fp32 per projection, by the
+    layout's roles. The transpose back is an exact permutation; the row globals are the projections' own."""
+    route = {}
+    for name, proj in (("gate_up", gate_up), ("down", down)):
+        route[name] = proj.weight.t().contiguous().view(torch.uint8)
+        route[f"{name}_scale"] = proj.weight_scale.t().contiguous()
+        route[f"{name}_global"] = proj.weight_global.to(torch.float32).contiguous()
+    return route
 
 
 class _SharedExpert(BaseOP):
@@ -76,6 +100,8 @@ class Qwen3_5MoE(BaseOP):
         self._fuse_shared = self._shared_expert_fusable(config)
         self._router_weight: torch.Tensor | None | bool = False  # False until the first decode step decides
         self._router_off: str | None = None
+        # the shared expert in the experts' bank layout; False until the first decode step outside a capture decides
+        self._shared_route: dict[str, torch.Tensor] | None | bool = False
 
     def _shared_expert_fusable(self, config: ModelConfig) -> bool:
         """Whether decode can run the shared expert in the fused NVFP4 kernels: both projections
@@ -163,6 +189,78 @@ class Qwen3_5MoE(BaseOP):
             return None
         return router_gemv_topk_softmax(hidden_states, w, experts.top_k, experts.renormalize)
 
+    def _shared_route_banks(self) -> dict[str, torch.Tensor] | None:
+        """The shared expert as one expert of the routed experts' banks: each projection in the bank's role, shape,
+        dtype and strides of one slot, or None where it cannot be a route. Built once, from the K-major resident
+        weights by the exact permutation back (prefill and wider steps keep reading those)."""
+        if self._shared_route is False:
+            self._shared_route = self._build_shared_route()
+            if self._shared_route is not None:
+                logger.info_once("shared expert as a ninth route on decode: on")
+        return self._shared_route
+
+    def _build_shared_route(self) -> dict[str, torch.Tensor] | None:
+        from freetoken.layers.moe import OffloadMoELayer
+        from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
+
+        experts, gate = self.experts, self.shared_expert_gate
+        kernel = getattr(experts.quant_method, "kernel", None)
+        if not self._fuse_shared or isinstance(experts, OffloadMoELayer) or not getattr(kernel, "takes_shared_route", False):
+            return None
+        if experts.tp_size > 1 or experts.activation != "silu" or experts.apply_router_weight_on_input:
+            return None
+        g = gate.weight
+        if gate.bias is not None or not isinstance(gate.quant_method.kernel, TorchLinearKernel):
+            return None
+        if not (g.dtype == torch.bfloat16 and g.dim() == 2 and g.shape[0] == 1 and g.stride(1) == 1):
+            return None
+        banks = getattr(experts, "_expert_banks", None)
+        if banks is None or any(role not in banks for role in _SHARED_ROUTE_ROLES):
+            return None
+        route = shared_expert_bank_slot(self.shared_expert.gate_up_proj, self.shared_expert.down_proj)
+        for role, t in route.items():
+            bank = banks[role]
+            if t.shape != bank.shape[1:] or t.dtype != bank.dtype or t.stride() != bank.stride()[1:] or t.device != bank.device:
+                logger.info_once(f"shared expert as a ninth route on decode: off (its {role} is not one slot of the experts' bank)")
+                return None
+        return route
+
+    def _shared_route_for(self, hidden_states: torch.Tensor) -> dict[str, torch.Tensor] | None:
+        """The shared expert as the last route of this step, or None for today's kernels: a decode step of 1 to
+        _SHARED_ROUTE_MAX_ROWS rows whose router logits the top-k launch computes, on resident NVFP4 experts under
+        a kernel that takes a route outside the bank, outside the grouped decode kernel's row counts."""
+        if not _SHARED_ROUTE or self._shared_route is None:
+            return None
+        rows = hidden_states.shape[0]
+        if not 1 <= rows <= _SHARED_ROUTE_MAX_ROWS or hidden_states.dtype != torch.bfloat16 or hidden_states.stride(1) != 1:
+            return None
+        if get_global_ctx().batch.is_prefill:
+            return None
+        w = self._router_weight_in_kernel()
+        if w is None:
+            return None
+        from freetoken.kernel.nvfp4_moe import decode_takes_grouped
+        from freetoken.kernel.triton.moe_router import router_gemv_topk_folds
+
+        if decode_takes_grouped(rows) or not router_gemv_topk_folds(rows, w.shape[0], w.shape[1], self.experts.top_k):
+            return None
+        # built from the loaded weights outside a capture; the capture runs each forward eagerly first
+        if self._shared_route is False and hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
+            return None
+        return self._shared_route_banks()
+
+    def _forward_shared_route(self, hidden_states: torch.Tensor, shared: dict[str, torch.Tensor]) -> torch.Tensor:
+        """A decode step with the shared expert as route top_k + 1 of the routed experts' kernels: weight
+        sigmoid(gate), the gate's logit one more row of the router's launch, and the nine routes summed once."""
+        from freetoken.kernel.triton.moe_router import router_gemv_topk_softmax
+
+        experts = self.experts
+        weights, ids = router_gemv_topk_softmax(
+            hidden_states, self._router_weight_in_kernel(), experts.top_k, experts.renormalize,
+            shared_gate=self.shared_expert_gate.weight,
+        )
+        return experts.routed_forward(hidden_states, weights, ids, shared=shared)
+
     def _routed(self, hidden_states, router_logits, routes, sum_routes: bool = True) -> torch.Tensor:
         if routes is None:
             return self.experts.forward(hidden_states=hidden_states, router_logits=router_logits, sum_routes=sum_routes)
@@ -184,6 +282,9 @@ class Qwen3_5MoE(BaseOP):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        shared_route = self._shared_route_for(hidden_states)
+        if shared_route is not None:
+            return self._forward_shared_route(hidden_states, shared_route).view(num_tokens, hidden_dim)
         # Compute the router + shared expert BEFORE the routed experts: the fused MoE
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
@@ -197,4 +298,4 @@ class Qwen3_5MoE(BaseOP):
         return (routed + shared).view(num_tokens, hidden_dim)
 
 
-__all__ = ["Qwen3_5MoE", "Qwen3_5DenseMLP"]
+__all__ = ["Qwen3_5MoE", "Qwen3_5DenseMLP", "shared_expert_bank_slot"]

@@ -593,6 +593,104 @@ def test_router_gemv_topk_replays_in_a_cuda_graph(rows):
         assert torch.equal(weights.view(torch.int32), ref_w.view(torch.int32))
 
 
+def _shared_gate(hidden, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    return (torch.randn(1, hidden, generator=gen, device="cuda") * 0.05).to(torch.bfloat16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("renormalize", [True, False])
+@pytest.mark.parametrize(
+    "rows,num_experts,hidden",
+    [
+        (1, 256, 2048),
+        (2, 256, 2048),
+        (6, 256, 2048),
+        # a row stride Triton cannot prove a multiple of 16: the gate's partials must not move the tail's layout
+        (2, 200, 512),
+        (6, 200, 512),
+    ],
+)
+def test_router_gemv_topk_shared_gate_adds_the_shared_experts_route(rows, num_experts, hidden, renormalize):
+    """The shared expert gate as one more row of the fold: its top-k columns are the fold's without it, bit for bit,
+    and the last column is id num_experts with torch's bf16 sigmoid of the gate's own bf16 logit, which keeps the
+    fp64 bound."""
+    from freetoken.kernel.triton.moe_router import router_gemv_topk_softmax
+
+    x, w = _router_gemv_inputs(rows, num_experts, hidden, 40 + rows + num_experts)
+    gate = _shared_gate(hidden, 50 + rows)
+    logits = torch.empty(rows, num_experts, dtype=torch.bfloat16, device="cuda")
+    ref_w, ref_i = router_gemv_topk_softmax(x, w, 8, renormalize, logits_out=logits)
+    logits2 = torch.empty_like(logits)
+    glog = torch.empty(rows, dtype=torch.bfloat16, device="cuda")
+    weights, ids = router_gemv_topk_softmax(x, w, 8, renormalize, logits_out=logits2, shared_gate=gate, gate_logit_out=glog)
+
+    assert weights.shape == (rows, 9) and ids.shape == (rows, 9)
+    assert torch.equal(logits2.view(torch.int16), logits.view(torch.int16))
+    assert torch.equal(ids[:, :8], ref_i)
+    assert torch.equal(weights[:, :8].contiguous().view(torch.int32), ref_w.view(torch.int32))
+    assert (ids[:, 8] == num_experts).all()
+    assert torch.equal(weights[:, 8].contiguous().view(torch.int32), torch.sigmoid(glog).float().view(torch.int32))
+
+    exact = (x.double() @ gate.double().t()).view(-1)
+    big = torch.maximum(glog.double().abs(), exact.abs())
+    step = torch.ldexp(torch.ones_like(big), torch.frexp(big).exponent - 8)
+    summed = (x.double().abs() @ gate.double().abs().t()).view(-1)
+    assert ((glog.double() - exact).abs() <= step + 1e-5 * summed).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_router_gemv_topk_shared_gate_weight_is_torch_sigmoid_of_the_bf16_logit():
+    """Logits set exactly (one nonzero product a row) over a spread of bf16 values, the saturated tails and the
+    infinities included: the gate's route weight is torch.sigmoid of the bf16 logit, bit for bit."""
+    from freetoken.kernel.triton.moe_router import router_gemv_topk_softmax
+
+    values = torch.arange(0, 1 << 16, 3, dtype=torch.int32).to(torch.int16).view(torch.bfloat16).float()
+    values = values[~values.isnan()]
+    values = torch.cat([values, torch.tensor([float("inf"), float("-inf"), 0.0, -0.0])]).cuda()
+    w = (torch.randn(256, 2048, device="cuda") * 0.02).to(torch.bfloat16)
+    gate = torch.zeros(1, 2048, dtype=torch.bfloat16, device="cuda")
+    gate[0, 0] = 1.0
+    for chunk in values.split(6):  # the fold takes up to six rows a call
+        x = torch.zeros(chunk.numel(), 2048, dtype=torch.bfloat16, device="cuda")
+        x[:, 0] = chunk.to(torch.bfloat16)
+        glog = torch.empty(chunk.numel(), dtype=torch.bfloat16, device="cuda")
+        weights, _ = router_gemv_topk_softmax(x, w, 8, True, shared_gate=gate, gate_logit_out=glog)
+        # values, not bits: the dot's sum starts from +0, so a -0 logit comes back +0
+        assert torch.equal(glog.float(), x[:, 0].float())
+        assert torch.equal(weights[:, 8].contiguous().view(torch.int32), torch.sigmoid(glog).float().view(torch.int32))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rows", [1, 6])
+def test_router_gemv_topk_shared_gate_replays_in_a_cuda_graph(rows):
+    """The extra tile counts among the arrivals, so the counters still reset themselves at every replay."""
+    from freetoken.kernel.triton.moe_router import router_gemv_topk_softmax
+
+    x, w = _router_gemv_inputs(rows, 256, 2048, 23)
+    gate = _shared_gate(2048, 24)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        router_gemv_topk_softmax(x, w, 8, True, shared_gate=gate)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        weights, ids = router_gemv_topk_softmax(x, w, 8, True, shared_gate=gate)
+
+    gen = torch.Generator(device="cuda").manual_seed(25)
+    for _ in range(3):
+        x.copy_(torch.randn(x.shape, generator=gen, device="cuda").to(torch.bfloat16))
+        graph.replay()
+        ref_w, ref_i = router_gemv_topk_softmax(x, w, 8, True, shared_gate=gate)
+        # and the fold without the gate after it: the counters were left at zero
+        plain_w, plain_i = router_gemv_topk_softmax(x, w, 8, True)
+        torch.cuda.synchronize()
+        assert torch.equal(ids, ref_i) and torch.equal(weights.view(torch.int32), ref_w.view(torch.int32))
+        assert torch.equal(plain_i, ref_i[:, :8])
+
+
 def _reference_sigmoid_topk(logits, bias, topk, renormalize, scale, n_group, topk_group, num_token_non_padded):
     """The torch routing of the GLM / MiniMax MoE blocks: sigmoid, bias for selection only, optional group-limited top-k."""
     scores = logits.float().sigmoid()

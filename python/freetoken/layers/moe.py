@@ -111,10 +111,11 @@ class MoELayer(BaseOP):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         sum_routes: bool = True,
+        shared: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         view = self.quant_method.resident_view(self)
-        if not sum_routes:
-            view = dataclasses.replace(view, sum_routes=False)
+        if not sum_routes or shared is not None:
+            view = dataclasses.replace(view, sum_routes=sum_routes, shared=shared)
         return self.quant_method.apply(
             hidden_states, topk_weights, topk_ids, view,
             layer=self, is_prefill=get_global_ctx().batch.is_prefill,
@@ -127,8 +128,12 @@ class MoELayer(BaseOP):
         topk_ids: torch.Tensor,
         *,
         sum_routes: bool = True,
+        shared: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Expert compute for an externally computed routing decision (``TopK``); ``sum_routes`` as in ``forward``.
+
+        ``shared`` is one more expert, outside the banks, for a decode step of a kernel with ``takes_shared_route``:
+        the last column of ``topk_ids`` / ``topk_weights`` is its route (:class:`ExpertView`). Resident layers only.
 
         Same name and shape as ``OffloadMoELayer.routed_forward`` so a model with
         its own router calls ``experts.routed_forward(...)`` without knowing whether
@@ -141,7 +146,9 @@ class MoELayer(BaseOP):
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
         shared branches that need the original input before calling this method.
         """
-        out = self._resident_gemm(hidden_states, topk_weights, topk_ids, sum_routes or self.tp_size > 1)
+        if shared is not None:
+            assert self.tp_size == 1 and self.quant_method.kernel.takes_shared_route and not get_global_ctx().batch.is_prefill
+        out = self._resident_gemm(hidden_states, topk_weights, topk_ids, sum_routes or self.tp_size > 1, shared)
         return self._maybe_all_reduce(out)
 
     def forward(

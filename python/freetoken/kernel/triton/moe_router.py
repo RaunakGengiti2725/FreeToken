@@ -192,6 +192,15 @@ def _router_triton_kernel(
 
 
 @triton.jit
+def _round_to_bf16(x):
+    """fp32 onto the bf16 grid, round to nearest even, in integer arithmetic (a cast to bf16 and back may be
+    folded away); an inf or a NaN passes through. ``nvfp4_shared_expert._round_bf16``'s statements."""
+    b = x.to(tl.uint32, bitcast=True)
+    r = (b + 0x7FFF + ((b >> 16) & 1)) & 0xFFFF0000
+    return tl.where((b & 0x7F800000) == 0x7F800000, b, r).to(tl.float32, bitcast=True)
+
+
+@triton.jit
 def _router_gemv_topk_kernel(
     x_ptr,        # [M, H] bf16 hidden states, unit inner stride
     w_ptr,        # [N, H] bf16 router weight, unit inner stride
@@ -200,6 +209,9 @@ def _router_gemv_topk_kernel(
     logits_ptr,   # [M, N] bf16 logits
     out_weights_ptr,
     out_indices_ptr,
+    gate_ptr,        # [1, H] bf16 shared expert gate weight, unit inner stride (read with SHARED_GATE)
+    gate_logit_ptr,  # [M] bf16 the gate's logits (written with SHARED_GATE)
+    gate_part_ptr,   # [SPLIT_K, M] fp32 the gate's partial logits (with SHARED_GATE)
     M,
     tiles_per,
     stride_xm,
@@ -221,16 +233,29 @@ def _router_gemv_topk_kernel(
     BLOCK_K: tl.constexpr,
     RENORMALIZE: tl.constexpr,
     launch_pdl: tl.constexpr,
+    SHARED_GATE: tl.constexpr,
 ) -> None:
     """``(row, expert tile, H slice)``: one slice of BLOCK_E logits of a row. The last program to land
     a slice of the row sums the slices in a fixed order, stores the row's logits in bf16 as F.linear
-    does, and runs the softmax router's own one-row program on them."""
+    does, and runs the softmax router's own one-row program on them.
+
+    With SHARED_GATE one more tile (``pid_e == N_TILES``) computes the shared expert gate's logit, a row
+    outside the softmax, by the same statements; the last program also writes route K of the row: the
+    shared expert (id N) with weight sigmoid(logit) on the bf16 grid, as torch scales by a bf16 gate."""
     row = tl.program_id(0)
     pid_e = tl.program_id(1)
     pid_k = tl.program_id(2)
     offs_e = pid_e * BLOCK_E + tl.arange(0, BLOCK_E)
-    mask_e = offs_e < N
     offs_h = pid_k * tiles_per * BLOCK_H + tl.arange(0, BLOCK_H)
+    rows_e = offs_e
+    mask_e = offs_e < N
+    w_tile = w_ptr
+    if SHARED_GATE:
+        if pid_e == N_TILES:
+            # the gate is the tile's first row; its partial goes to the gate's own buffer
+            rows_e = offs_e - pid_e * BLOCK_E
+            mask_e = rows_e < 1
+            w_tile = gate_ptr
 
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -240,16 +265,22 @@ def _router_gemv_topk_kernel(
     for t in range(tiles_per):
         h = offs_h + t * BLOCK_H
         xv = tl.load(x_row + h).to(tl.float32)
-        wv = tl.load(w_ptr + offs_e[:, None] * stride_wn + h[None, :], mask=mask_e[:, None], other=0.0).to(tl.float32)
+        wv = tl.load(w_tile + rows_e[:, None] * stride_wn + h[None, :], mask=mask_e[:, None], other=0.0).to(tl.float32)
         acc += wv * xv[None, :]
     q_row = part_ptr + row.to(tl.int64) * stride_qm
-    tl.store(q_row + pid_k * stride_qk + offs_e, tl.sum(acc, axis=1), mask=mask_e)
+    if SHARED_GATE:
+        if pid_e == N_TILES:
+            tl.store(gate_part_ptr + pid_k * M + row + rows_e, tl.sum(acc, axis=1), mask=mask_e)
+        else:
+            tl.store(q_row + pid_k * stride_qk + offs_e, tl.sum(acc, axis=1), mask=mask_e)
+    else:
+        tl.store(q_row + pid_k * stride_qk + offs_e, tl.sum(acc, axis=1), mask=mask_e)
 
     # every thread's store lands before the one atomic that publishes them
     tl.debug_barrier()
     c_ptr = counter_ptr + row
     cnt = tl.atomic_add(c_ptr, 1)  # default acq_rel/gpu
-    if cnt == N_TILES * SPLIT_K - 1:
+    if cnt == (N_TILES + SHARED_GATE) * SPLIT_K - 1:
         # the router's one-row tile, so the program past the logits is its program
         offs_m = row + tl.arange(0, 1)
         offs_n = tl.arange(0, BLOCK_N)
@@ -270,6 +301,17 @@ def _router_gemv_topk_kernel(
             1.0, stride_wm, stride_wk, stride_im, stride_ik,
             N, K, 1, BLOCK_K, False, 1, 1, 1, RENORMALIZE, False, launch_pdl,
         )
+        if SHARED_GATE:
+            one = tl.arange(0, 1)
+            gate = tl.zeros([1], dtype=tl.float32)
+            for k in tl.static_range(SPLIT_K):  # the logits' order
+                gate += tl.load(gate_part_ptr + k * M + row + one, cache_modifier=".cg")
+            gate = _round_to_bf16(gate)
+            tl.store(gate_logit_ptr + row + one, gate.to(tl.bfloat16))
+            # torch's sigmoid of a bf16 tensor: the fp32 formula, rounded to bf16 once
+            scale = _round_to_bf16(tl.div_rn(1.0, 1.0 + libdevice.exp(-gate)))
+            tl.store(out_weights_ptr + row * stride_wm + K * stride_wk + one, scale)
+            tl.store(out_indices_ptr + row * stride_im + K * stride_ik + one, tl.full([1], N, dtype=tl.int32))
         tl.store(c_ptr, 0)  # leave zeroed for the next launch/replay
 
 
@@ -409,6 +451,8 @@ def router_gemv_topk_softmax(
     topk: int,
     renormalize: bool,
     logits_out: torch.Tensor | None = None,
+    shared_gate: torch.Tensor | None = None,
+    gate_logit_out: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``fused_topk_softmax(F.linear(x, weight), topk, renormalize)`` in one launch, for ``x`` [M, H]
     and ``weight`` [N, H] bf16 where :func:`router_gemv_topk_folds` holds. CUDA-graph safe.
@@ -416,24 +460,39 @@ def router_gemv_topk_softmax(
     The logits are rounded to bf16 as F.linear stores them and routed by the same program, but their
     dot is summed in this kernel's order, not cuBLAS's: a near-tie between two experts may route the
     other way. ``logits_out`` [M, N] bf16, when given, receives the logits.
+
+    ``shared_gate`` [1, H] bf16, the weight of a shared expert's gate, adds a route after the top-k:
+    [M, topk + 1] weights and ids whose last column is id N (no routed expert) with weight
+    ``sigmoid(F.linear(x, shared_gate))``, the logit and the sigmoid each rounded to bf16 as torch
+    rounds them. The top-k columns are the call's without it, bit for bit. ``gate_logit_out`` [M] bf16,
+    when given, receives the gate's logits (summed in this kernel's order, as the router's).
     """
     M, H = x.shape
     N = weight.shape[0]
     assert router_gemv_topk_folds(M, N, H, topk), "this step keeps the linear and the router apart"
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
     assert weight.shape == (N, H) and x.stride(1) == 1 and weight.stride(1) == 1
-    weights = torch.empty((M, topk), dtype=torch.float32, device=x.device)
-    indices = torch.empty((M, topk), dtype=torch.int32, device=x.device)
+    shared = shared_gate is not None
+    routes = topk + shared
+    weights = torch.empty((M, routes), dtype=torch.float32, device=x.device)
+    indices = torch.empty((M, routes), dtype=torch.int32, device=x.device)
     if logits_out is None:
         logits_out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
     assert logits_out.shape == (M, N) and logits_out.dtype == torch.bfloat16 and logits_out.is_contiguous()
+    if shared:
+        assert shared_gate.shape == (1, H) and shared_gate.dtype == torch.bfloat16 and shared_gate.stride(1) == 1
+        if gate_logit_out is None:
+            gate_logit_out = torch.empty((M,), dtype=torch.bfloat16, device=x.device)
+        assert gate_logit_out.shape == (M,) and gate_logit_out.dtype == torch.bfloat16 and gate_logit_out.is_contiguous()
     split_k = _fold_split_k(H)
     n_tiles = triton.cdiv(N, _FOLD_BLOCK_E)
     # A row of partials steps by N, as a row of contiguous logits does, so the alignment Triton can prove
     # for the tail's loads is the router's own: it vectorizes a load as wide as the widest access of that
-    # shape on the same indices, and that sets the layout, so the order, of the tail's sums.
+    # shape on the same indices, and that sets the layout, so the order, of the tail's sums. The gate's
+    # partials are kept apart for the same reason: a column for them would make the row step N + 1.
     part = torch.empty((split_k, M, N), dtype=torch.float32, device=x.device)
-    _router_gemv_topk_kernel[(M, n_tiles, split_k)](
+    gate_part = torch.empty((split_k, M), dtype=torch.float32, device=x.device) if shared else part
+    _router_gemv_topk_kernel[(M, n_tiles + shared, split_k)](
         x,
         weight,
         part,
@@ -441,6 +500,9 @@ def router_gemv_topk_softmax(
         logits_out,
         weights,
         indices,
+        shared_gate if shared else weight,
+        gate_logit_out if shared else logits_out,
+        gate_part,
         M,
         H // (_FOLD_BLOCK_H * split_k),
         x.stride(0),
@@ -462,6 +524,7 @@ def router_gemv_topk_softmax(
         BLOCK_K=triton.next_power_of_2(topk),
         RENORMALIZE=renormalize,
         launch_pdl=_pdl_supported(),
+        SHARED_GATE=shared,
         num_warps=1,
     )
     return weights, indices

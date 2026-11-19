@@ -1086,6 +1086,57 @@ def test_triton_decode_grouped_kernel_gives_the_per_route_bits(monkeypatch, rows
     assert torch.equal(bits(layer[0]), bits(layer[1]))
 
 
+@cuda
+@pytest.mark.parametrize("rows", [1, 2, 6, 8])
+def test_triton_decode_shared_route_is_a_route_to_a_slot_holding_its_weights(rows):
+    """With ``shared`` the last route of every row reads an expert kept outside the bank. The decode gives the bits of
+    the same step with that expert copied into one more slot of the bank and the last ids naming it: both GEMMs at the
+    35B-A3B shapes (deep-K gate_up, short-K down), summed and per route."""
+    from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
+
+    device = torch.device("cuda")
+    slots, top_k, hidden_size, inter = 24, 8, 2048, 512
+    g = torch.Generator().manual_seed(17 + rows)
+
+    def bank(n, k):   # slots + 1: the last slot holds the shared expert
+        packed = torch.randint(0, 256, (slots + 1, n, k // 2), dtype=torch.uint8, generator=g)
+        scale = (torch.rand(slots + 1, n, k // 16, generator=g) * 1.5 + 0.25).to(torch.float8_e4m3fn)
+        return packed.to(device), scale.to(device), (torch.rand(slots + 1, n, generator=g) + 0.5).to(device)
+
+    gate_up, down = bank(2 * inter, hidden_size), bank(hidden_size, inter)
+    roles = ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")
+    full = (*gate_up, *down)
+    shared = {role: t[slots].clone() for role, t in zip(roles, full)}
+    routed = tuple(t[:slots] for t in full)
+    ids = torch.stack([torch.randperm(slots, generator=g)[: top_k - 1] for _ in range(rows)])
+    ids = torch.cat([ids, torch.full((rows, 1), slots)], dim=1).to(device, torch.int32).contiguous()
+    weights = torch.rand(rows, top_k, generator=g).to(device)
+    x = (torch.randn(rows, hidden_size, generator=g) / 4).to(device, torch.bfloat16)
+
+    for sum_routes in (True, False):
+        in_bank = fused_experts_decode_nvfp4_marlin(x, *full, weights, ids, "silu", False, sum_routes=sum_routes)
+        as_route = fused_experts_decode_nvfp4_marlin(x, *routed, weights, ids, "silu", False, sum_routes=sum_routes, shared=shared)
+        assert as_route.shape == in_bank.shape and not torch.isnan(as_route).any()
+        assert torch.equal(as_route.view(torch.int16), in_bank.view(torch.int16)), sum_routes
+
+
+@cuda
+def test_triton_decode_shared_route_is_only_the_per_route_kernels():
+    """The grouped kernel reads every route from the bank: a step with a route outside it never takes that kernel."""
+    from freetoken.kernel import nvfp4_moe
+
+    device = torch.device("cuda")
+    packed = torch.zeros(4, 64, 64, dtype=torch.uint8, device=device)
+    scale = torch.ones(4, 64, 8, device=device).to(torch.float8_e4m3fn)
+    glob = torch.ones(4, 64, device=device)
+    ids = torch.zeros(2, 3, dtype=torch.int32, device=device)
+    c = torch.empty(2, 3, 64, dtype=torch.bfloat16, device=device)
+    a = torch.zeros(2, 128, dtype=torch.bfloat16, device=device)
+    with pytest.raises(AssertionError, match="grouped"):
+        nvfp4_moe.decode_gemm_marlin(a, packed, scale, glob, c, torch.ones(2, 3, device=device), ids, False, False,
+                                     grouped=True, shared=(packed[0], scale[0], glob[0]))
+
+
 def test_decode_grouped_kernel_runs_from_a_row_count_on(monkeypatch):
     """The grouped kernel is the slower one for the 4 to 6 rows of one request with drafts: by default a step takes it
     from 24 rows, and FREETOKEN_NVFP4_DECODE_GROUPED names another count, 0 for never, 1 for every step that can share."""
