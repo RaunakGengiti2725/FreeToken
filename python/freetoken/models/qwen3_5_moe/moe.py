@@ -262,7 +262,8 @@ class Qwen3_5MoE(BaseOP):
     def _shared_route_for(self, hidden_states: torch.Tensor) -> dict[str, torch.Tensor] | None:
         """The shared expert as the last route of this step, or None for today's kernels: a decode step of 1 to
         _SHARED_ROUTE_MAX_ROWS rows whose router logits the top-k launch computes, on resident NVFP4 experts under
-        a kernel that takes a route outside the bank, outside the grouped decode kernel's row counts."""
+        a kernel that takes a route outside the bank, outside the grouped decode kernel's row counts and the wide decode
+        GEMM's (neither reads a route outside the bank, so a step they take keeps the shared expert's own kernels)."""
         if not _SHARED_ROUTE or self._shared_route is None:
             return None
         rows = hidden_states.shape[0]
@@ -273,10 +274,10 @@ class Qwen3_5MoE(BaseOP):
         w = self._router_weight_in_kernel()
         if w is None:
             return None
-        from freetoken.kernel.nvfp4_moe import decode_takes_grouped
+        from freetoken.kernel.nvfp4_moe import decode_takes_gemm, decode_takes_grouped
         from freetoken.kernel.triton.moe_router import router_gemv_topk_folds
 
-        if decode_takes_grouped(rows) or not router_gemv_topk_folds(rows, w.shape[0], w.shape[1], self.experts.top_k):
+        if decode_takes_grouped(rows) or decode_takes_gemm(rows) or not router_gemv_topk_folds(rows, w.shape[0], w.shape[1], self.experts.top_k):
             return None
         # built from the loaded weights outside a capture; the capture runs each forward eagerly first
         if self._shared_route is False and hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():

@@ -143,6 +143,28 @@ def test_shared_route_leaves_prefill_other_dtypes_the_knob_and_the_unfolded_rout
     assert moe._shared_route_for(x) is None
 
 
+def test_shared_route_leaves_the_wide_decode_gemms_row_counts_alone(decode, monkeypatch):
+    """A step the wide decode GEMM takes keeps the shared expert's own kernels: that GEMM reads every route from the
+    bank, so the model hands it no ninth route, and the kernel refuses one."""
+    from freetoken.kernel import nvfp4_moe
+
+    moe = _moe()
+    moe._router_weight = moe.gate.weight
+    moe._shared_route = route = {"gate_up": torch.empty(0)}
+    monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", nvfp4_moe._DECODE_GEMM_DEFAULT_ROWS)
+    assert moe._shared_route_for(torch.zeros(6, H, dtype=torch.bfloat16)) is route   # the default threshold is past 6 rows
+    monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", 6)
+    assert moe._shared_route_for(torch.zeros(5, H, dtype=torch.bfloat16)) is route
+    assert moe._shared_route_for(torch.zeros(6, H, dtype=torch.bfloat16)) is None
+    monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", 1)
+    for rows in (1, 6):
+        assert moe._shared_route_for(torch.zeros(rows, H, dtype=torch.bfloat16)) is None
+    experts = moe.experts
+    view = ExpertView(experts._expert_banks, n=E, shared={"gate": torch.zeros(6, dtype=torch.bfloat16)})
+    with pytest.raises(AssertionError, match="reads every route from the bank"):
+        experts.quant_method.kernel.apply(experts, torch.zeros(6, H, dtype=torch.bfloat16), None, None, view, is_prefill=False)
+
+
 def test_shared_route_leaves_the_grouped_kernels_row_counts_alone(decode, monkeypatch):
     from freetoken.kernel import nvfp4_moe
 
@@ -331,3 +353,21 @@ def test_shared_route_block_replays_in_a_cuda_graph(decode, rows):
         ref = moe.forward(x.clone())
         torch.cuda.synchronize()
         assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+
+
+@cuda
+@pytest.mark.parametrize("rows", [1, 6])
+def test_shared_route_block_keeps_its_own_kernels_bits_where_the_wide_gemm_runs(decode, monkeypatch, rows):
+    """With the wide decode GEMM taking the step, the block's output is the switch-off output bit for bit: the GEMM
+    sums the eight routed experts and the shared expert keeps its own kernels."""
+    from freetoken.kernel import nvfp4_moe
+
+    moe = _moe(torch.device("cuda"), seed=40 + rows, glob=1.0 / 64)
+    gen = torch.Generator(device="cuda").manual_seed(200 + rows)
+    x = torch.randn(rows, H, generator=gen, device="cuda").to(torch.bfloat16)
+    monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", 1)
+    on = moe.forward(x.clone())
+    assert moe._shared_route is False, "the step built a ninth route"
+    monkeypatch.setattr(qmoe, "_SHARED_ROUTE", False)
+    off = moe.forward(x.clone())
+    assert torch.isfinite(on.float()).all() and torch.equal(on, off)

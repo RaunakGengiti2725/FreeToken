@@ -83,6 +83,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
         # resident full-layer banks only (row == expert id); the offload and hybrid slot views stay on the GEMV
         full_layer = view.n is not None and view.slots is None and view.routed is None
         if not is_prefill and full_layer and nvfp4_moe.decode_takes_gemm(x.shape[0]):
+            assert view.shared is None, "the wide decode GEMM reads every route from the bank"
             return fused_experts_nvfp4(
                 x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit,
                 sum_routes=view.sum_routes,
