@@ -472,6 +472,21 @@ def _exact_rows(rows: int, gen: torch.Generator) -> torch.Tensor:
     return (torch.randint(-8, 9, (rows, HIDDEN), device=DEV, generator=gen) * 2.0**-4).to(torch.bfloat16)
 
 
+@pytest.fixture
+def cublas_bf16_fp32_partials():
+    """cuBLAS keeps bf16 GEMM partials in fp32 for the test; afterwards the setting comes back whole (its split-K part
+    too). monkeypatch cannot undo this flag: cuBLASModule serves it through __getattr__ and __setattr__, so there is no
+    instance attribute to restore and undo() deletes one that is not there."""
+    matmul = torch.backends.cuda.matmul
+    was = torch._C._get_cublas_allow_bf16_reduced_precision_reduction()
+    matmul.allow_bf16_reduced_precision_reduction = False
+    try:
+        yield
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = tuple(was)
+
+
+@pytest.mark.usefixtures("cublas_bf16_fp32_partials")
 def test_split_ba_in_the_recurrence_kernel_is_the_launched_projection_bit_for_bit_on_exact_dots(monkeypatch):
     """With b|a its own bf16 linear, a decode or verify step takes b and a inside the recurrence kernel and does not
     launch the linear; a prefill still launches it. On b|a dots every summation order gets exactly (cuBLAS kept to fp32
@@ -479,7 +494,7 @@ def test_split_ba_in_the_recurrence_kernel_is_the_launched_projection_bit_for_bi
     decode step give the outputs and states of the launched linear, bit for bit."""
     import freetoken.layers.linear_attn.gdn as gdn
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction", False)
+    assert not torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
     lengths, accepted = [128, 37, 5], [1, 2, K + 1]
     runs = []
     for fold in (True, False):
