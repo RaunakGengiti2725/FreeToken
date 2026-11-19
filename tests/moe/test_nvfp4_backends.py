@@ -598,7 +598,8 @@ def test_expert_activation_scales_take_w4a4_only_for_prefill_forwards_of_the_eng
     view = ExpertView(banks, n=E, alphas=(torch.ones(E), torch.ones(E)))
     for is_prefill in (True, False):
         method.apply(torch.zeros(tokens, H), torch.ones(tokens, TOPK), torch.zeros(tokens, TOPK, dtype=torch.int32), view, layer=layer, is_prefill=is_prefill)
-    assert calls == ["a4" if a4 else "a16", "decode"]
+    # decode keeps the W4A16 weights' kernels: the GEMV, or from the wide-decode row count the W4A16 prefill GEMM
+    assert calls == ["a4" if a4 else "a16", "a16" if nvfp4_moe.decode_takes_gemm(tokens) else "decode"]
 
 
 def test_w4a4_prefill_over_cache_slots_takes_the_routed_layers_scales_and_tiles(monkeypatch):
