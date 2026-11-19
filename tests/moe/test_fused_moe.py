@@ -472,6 +472,34 @@ def test_router_gemv_topk_folds_only_where_the_router_runs_one_row_a_warp(rows, 
     assert router_gemv_topk_folds(rows, num_experts, hidden, topk) is folds
 
 
+def test_qwen3_5_moe_says_once_why_its_router_does_not_fold(monkeypatch):
+    """One line a process, at the first decode step, naming the predicate that keeps the router's linear apart."""
+    from types import SimpleNamespace
+
+    from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
+    from freetoken.models.qwen3_5_moe import moe as qmoe
+
+    said = []
+    monkeypatch.setattr(qmoe, "_FOLD_SAID", False)
+    monkeypatch.setattr(qmoe.logger, "info_rank0", lambda msg, *a, **k: said.append(msg), raising=False)
+    monkeypatch.setattr(qmoe, "get_global_ctx", lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=False)))
+
+    def block(weight, bias=None):
+        m = object.__new__(qmoe.Qwen3_5MoE)
+        m.gate = SimpleNamespace(weight=weight, bias=bias, quant_method=SimpleNamespace(kernel=TorchLinearKernel()))
+        m.experts = SimpleNamespace(top_k=8, renormalize=True)
+        m._router_weight, m._router_off = False, None
+        return m
+
+    x = torch.zeros(1, 2048, dtype=torch.bfloat16)
+    first = block(torch.zeros(256, 2048, dtype=torch.bfloat16))
+    assert first._routes_in_kernel(x) is None
+    assert block(torch.zeros(256, 2048, dtype=torch.bfloat16), bias=torch.zeros(256))._routes_in_kernel(x) is None
+    assert said == ["router fold on decode: off (the router's weight is on cpu)"]
+    assert block(torch.zeros(256, 2048), bias=torch.zeros(256))._router_weight_off() == "the router has a bias"
+    assert block(torch.zeros(256, 2048))._router_weight_off() == "the router's weight is on cpu"
+
+
 def _router_gemv_inputs(rows, num_experts, hidden, seed):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(rows, hidden, generator=gen, device="cuda").to(torch.bfloat16)
