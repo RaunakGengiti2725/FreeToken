@@ -14,6 +14,11 @@ from freetoken.layers.quantization import QuantConfig
 # operations it runs on a token-major copy. Set FREETOKEN_GDN_VALUES_IN_PLACE=0 to hand it the copy again.
 _VALUES_IN_PLACE = os.getenv("FREETOKEN_GDN_VALUES_IN_PLACE", "1") != "0"
 
+# A decode or verify step of up to this many rows takes the b|a projection inside the recurrence kernel when that
+# projection is its own bf16 linear (see GatedDeltaNet._ba_weight_in_kernel). FREETOKEN_GDN_BA_IN_KERNEL=0 launches it.
+_BA_IN_KERNEL = os.getenv("FREETOKEN_GDN_BA_IN_KERNEL", "1") != "0"
+_BA_IN_KERNEL_MAX_ROWS = 64
+
 # cu_seqlens of one sequence, a tensor a length: the chunk kernels look their index tensors up by its identity
 _SPAN_CU: dict[tuple[int, torch.device], torch.Tensor] = {}
 
@@ -96,6 +101,7 @@ class GatedDeltaNet(BaseOP):
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_ba",
             )
+            self._ba_weight: torch.Tensor | None | bool = False  # False until the first decode step decides
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
             self.in_proj = LinearColParallelMerged(
@@ -192,6 +198,29 @@ class GatedDeltaNet(BaseOP):
 
         return gated_norm_row_tile(total * self.num_v_heads, self.head_v_dim, device) is not None
 
+    def _ba_weight_in_kernel(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """The b|a projection's weight when a decode or verify step of ``hidden_states`` takes b and a inside the
+        recurrence kernel: a separate b|a linear (qkv|z quantized, b|a not) run by torch in bf16 without a bias, on
+        NVIDIA, and a bf16 step of 1 to 64 rows. b and a then differ from F.linear's only in the summation order of
+        each dot. Unsplit, b and a come out of the one input GEMM, with no launch of their own to save. The weight
+        is decided once, at the first decode step, when the weights are final."""
+        if not self._split_in_proj or not _BA_IN_KERNEL:
+            return None
+        if self._ba_weight is False:
+            from freetoken.kernel.backend import is_rocm
+            from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
+
+            layer = self.in_proj_ba
+            w = layer.weight
+            takes = layer.bias is None and isinstance(layer.quant_method.kernel, TorchLinearKernel) and not is_rocm()
+            takes = takes and w.is_cuda and w.dtype == torch.bfloat16 and w.shape == (2 * self.num_v_heads, hidden_states.shape[1])
+            self._ba_weight = w if takes and w.is_contiguous() else None
+        w = self._ba_weight
+        rows = hidden_states.shape[0]
+        if w is None or hidden_states.dtype != torch.bfloat16 or hidden_states.stride(1) != 1:
+            return None
+        return w if 0 < rows <= _BA_IN_KERNEL_MAX_ROWS and hidden_states.shape[1] == w.shape[1] else None
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
@@ -209,11 +238,14 @@ class GatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device, pool)
             batch.fla_metadata = fla
 
+        ba_weight = None if batch.is_prefill else self._ba_weight_in_kernel(hidden_states)
         if self._split_in_proj:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
-            ba = self.in_proj_ba.forward(hidden_states)
-            b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
+            b = a = None  # the recurrence kernel takes them from hidden_states (ba_weight)
+            if ba_weight is None:
+                ba = self.in_proj_ba.forward(hidden_states)
+                b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
         else:
             proj = self.in_proj.forward(hidden_states)
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
@@ -247,6 +279,7 @@ class GatedDeltaNet(BaseOP):
                 scale=self.head_k_dim ** -0.5, use_qk_l2norm_in_kernel=True, cu_seqlens=fla.cu_seqlens,
                 disable_state_update=verify, input_stash=fla.verify_scratch.input_stash(li) if verify else None,
                 gated_norm=(z, self.norm.weight, self.norm.eps, self.norm.activation) if norm_in_kernel else None,
+                ba_fold=None if ba_weight is None else (hidden_states, ba_weight),
             )
             if norm_in_kernel:
                 out = core_out[1].reshape(total, -1)
