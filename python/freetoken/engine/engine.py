@@ -34,7 +34,7 @@ from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cach
 from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
-from .config import EngineConfig
+from .config import EngineConfig, prefill_length_within
 from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from .spec_protocol import SpecRuntime
@@ -1564,7 +1564,7 @@ class Engine:
             if longest > 0:
                 risk = (
                     f"a prompt longer than {longest} tokens can end the server with a CUDA out-of-memory error. "
-                    f"--max-prefill-length {longest} or less keeps a chunk inside it"
+                    f"--max-prefill-length {prefill_length_within(longest)} or less keeps a chunk inside it"
                 )
             else:
                 risk = (

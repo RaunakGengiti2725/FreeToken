@@ -19,6 +19,24 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# a rest this short past a whole prefill chunk joins the last chunk (scheduler/prefill.py) instead of costing a forward
+# (~56 ms on an RTX 5090); at most 1/128 of the chunk, so the longest forward and its working memory grow by under 0.8%
+PREFILL_TAIL_MAX = 63
+
+
+def prefill_tail(chunk: int) -> int:
+    """Tokens past a prefill chunk of ``chunk`` tokens (--max-prefill-length) that a prompt's last chunk takes with it."""
+    return max(0, min(PREFILL_TAIL_MAX, chunk // 128))
+
+
+def prefill_length_within(forward: int) -> int:
+    """The longest --max-prefill-length whose forwards, the tail a last chunk takes included, are at most ``forward``
+    tokens."""
+    length = max(forward, 0)
+    while length > 0 and length + prefill_tail(length) > forward:
+        length -= 1
+    return length
+
 
 @dataclass(frozen=True)
 class EngineConfig:

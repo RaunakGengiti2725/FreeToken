@@ -654,6 +654,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch, tmp_path):
 
     from freetoken.engine import engine as eng
     from freetoken.engine.cache_budget import reserve_kept
+    from freetoken.engine.config import prefill_tail
 
     config.max_forward_len = 8192
     need, fields = engine._preset_prefill_reserve(config), config.preset_fields
@@ -688,7 +689,10 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch, tmp_path):
     assert reserve == 9216 and need // 2 <= kept < need // 2 + page_bytes and len(warned) == 1
     longest = int(warned[0].split("a prompt longer than ")[1].split(" tokens")[0])
     assert prefill_working_bytes(longest, **cut) <= kept < prefill_working_bytes(longest + 1, **cut) and 2048 < longest < 8192
-    assert " of the " in engine._preset_left_free(config) and f"--max-prefill-length {longest} or less" in warned[0]
+    # the advised flag's chunk and the rest a last chunk takes with it stay inside that prompt length
+    flag = int(warned[0].split("--max-prefill-length ")[1].split(" or less")[0])
+    assert flag + prefill_tail(flag) <= longest < flag + 1 + prefill_tail(flag + 1)
+    assert " of the " in engine._preset_left_free(config)
     # nothing kept at all: the advice is not a chunk length of 0
     reserve, kept, warned = settled(576, 0)
     assert reserve == 9216 and kept < prefill_working_bytes(1, **cut) and "no prefill chunk fits" in warned[0] and "length 0" not in warned[0]

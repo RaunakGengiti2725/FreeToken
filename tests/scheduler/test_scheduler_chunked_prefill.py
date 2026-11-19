@@ -277,3 +277,48 @@ def test_the_sliding_window_pool_cap_cannot_recut_an_image():
         for r in batch.reqs:
             r.complete_one()
     assert ends[0] == 4900 and ends[-1] == 6000
+
+
+def test_a_short_rest_past_the_budget_goes_into_the_last_chunk():
+    """A prompt a few tokens past a whole chunk ends in that chunk instead of a forward of its own, and a pass never
+    holds more than tail_tokens past its budget, whatever shares it."""
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.utils import PendingReq
+
+    def chunk_lens(prompt_lens, tail, budget=CHUNK):
+        cm, _tm, _dm, pm = _build_managers(num_pages=128)
+        pm.tail_tokens = tail
+        pm.pending_list = [PendingReq(uid=UID + i, input_ids=torch.arange(n, dtype=torch.int32), sampling_params=SamplingParams(max_tokens=4))
+                           for i, n in enumerate(prompt_lens)]
+        passes = []
+        while pm.runnable:
+            batch = pm.schedule_next_batch(budget)
+            cm.allocate_paged(batch.reqs)
+            passes.append([r.extend_len for r in batch.reqs])
+            for r in batch.reqs:
+                r.complete_one()
+        return passes
+
+    assert chunk_lens([CHUNK + 3], tail=3) == [[CHUNK + 3]]
+    assert chunk_lens([2 * CHUNK + 1], tail=3) == [[CHUNK], [CHUNK + 1]]  # only the last chunk takes the rest
+    assert chunk_lens([CHUNK + 4], tail=3) == [[CHUNK], [4]]
+    assert chunk_lens([CHUNK + 3], tail=0) == [[CHUNK], [3]]
+    assert chunk_lens([CHUNK], tail=3) == [[CHUNK]] and chunk_lens([2 * CHUNK], tail=3) == [[CHUNK], [CHUNK]]
+    # a request that takes the rest ends the pass: the next one waits, and the pass is at most budget + tail
+    assert chunk_lens([5, 6, 2], tail=3) == [[5, 6], [2]]
+    assert chunk_lens([5, 3 + CHUNK], tail=3) == [[5, 3], [CHUNK]]
+
+
+def test_the_longest_forward_counts_the_rest_a_last_chunk_takes():
+    from freetoken.engine.config import prefill_length_within, prefill_tail
+    from freetoken.scheduler.config import SchedulerConfig
+
+    assert [prefill_tail(n) for n in (64, 4096, 8192, 32768)] == [0, 32, 63, 63]
+    config = object.__new__(SchedulerConfig)
+    for chunk in (64, 1000, 4096, 8191, 8192, 65536):
+        object.__setattr__(config, "max_extend_tokens", chunk)
+        forward = chunk + prefill_tail(chunk)
+        assert config.max_forward_len == forward
+        assert prefill_length_within(forward) == chunk  # the flag the working-memory warning advises gives that forward
+        shorter = prefill_length_within(forward - 1)
+        assert shorter < chunk and shorter + prefill_tail(shorter) <= forward - 1
