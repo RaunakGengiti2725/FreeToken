@@ -83,6 +83,12 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     reasoning_effort: str | None = None
+    # Tokens the response may spend thinking before the server forces the close tag
+    # (0 = off); unset falls back to --reasoning-budget.
+    reasoning_budget: int | None = Field(default=None, ge=0)
+    # Tokens of max_tokens kept for the answer: the budget's notice is forced into the thinking that many tokens
+    # before max_tokens (0 = off); unset falls back to --reasoning-reserve.
+    reasoning_reserve: int | None = Field(default=None, ge=0)
     # DeepSeek-wire thinking toggle ({"type": "enabled"|"disabled"}). Any so a
     # foreign shape stays ignored (extra="allow" swallowed it before this field
     # existed) instead of becoming a bare 422 at the route boundary; the handler

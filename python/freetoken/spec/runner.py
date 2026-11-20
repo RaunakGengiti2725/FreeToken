@@ -122,6 +122,9 @@ class SpecRunner:
             )
         else:
             out, emitted = reject(logits, drafts, sample_args, engine.sampler)
+        if sample_args.forced is not None:
+            # before the draft advances and the host copy: both must see the step the request commits
+            out, emitted = sample_args.forced.cut(out, emitted)
         host = self._host[:bs]
         host.copy_(torch.cat([out, emitted.unsqueeze(1)], dim=1), non_blocking=True)
         copy_done = torch.cuda.Event()

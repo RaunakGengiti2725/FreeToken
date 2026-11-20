@@ -29,6 +29,13 @@ class SamplingParams:
     # Stamp the ReqStats snapshot on every reply, not just the terminal one (llama.cpp's
     # timings_per_token; the API layer has already ANDed it with --enable-timings-report).
     timings_per_token: bool = False
+    # Tokens a response may spend inside its thinking span before the scheduler forces the
+    # close tag; None = unset (the API layer fills the server default), 0 = off.
+    reasoning_budget: int | None = None
+    # Tokens of max_tokens kept for the answer: the scheduler forces the budget's notice into the thinking once the
+    # response has max_tokens - reasoning_reserve tokens, and forces no close tag; None = unset (the API layer fills the
+    # server default), 0 = off.
+    reasoning_reserve: int | None = None
 
     @property
     def is_greedy(self) -> bool:

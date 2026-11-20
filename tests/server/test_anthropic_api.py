@@ -481,6 +481,8 @@ class FakeState:
         self.config = SimpleNamespace(
             mm=SimpleNamespace(text_model_only=False, disabled_encoders=frozenset()),
             reasoning_parser=None,
+            reasoning_budget=None,
+            reasoning_reserve=None,
             tool_call_parser="llama3",
             served_model_name="test-model",
             model_path="/test",

@@ -1035,4 +1035,19 @@ def build_reasoning_parser(config, force_reasoning: bool) -> Optional[ReasoningP
     return ReasoningParser(name, force_reasoning=force_reasoning)
 
 
+def think_tags(reasoning_parser: str | None) -> Tuple[str, str, Optional[str]] | None:
+    """The named parser's (open tag, close tag, marker that ends reasoning without a close tag).
+
+    None when there is no parser or it has no tag pair (the Harmony and ATEM channel formats): the
+    scheduler tracks the thinking span of a reasoning budget by these tags' tokens.
+    """
+    parser_class = ReasoningParser.ReasoningParserEnum.get(reasoning_parser or "")
+    if parser_class is None:
+        return None
+    detector = parser_class()
+    if not (detector.think_start_token and detector.think_end_token):
+        return None
+    return detector.think_start_token, detector.think_end_token, detector.tool_start_token
+
+
 SUPPORTED_REASONING_PARSERS = list(ReasoningParser.ReasoningParserEnum.keys())

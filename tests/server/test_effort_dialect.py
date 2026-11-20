@@ -36,6 +36,8 @@ class FakeState:
             served_model_name="unit-model",
             tool_call_parser="llama3",
             reasoning_parser=reasoning_parser,
+            reasoning_budget=None,
+            reasoning_reserve=None,
         )
         self.sent: TokenizeMsg | None = None
 

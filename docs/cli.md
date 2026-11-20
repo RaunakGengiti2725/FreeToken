@@ -121,6 +121,8 @@ Speculative decoding needs `--tp 1` and runs without overlap scheduling; a targe
 | `--sampling-defaults` | model | Fill unspecified sampling params from the checkpoint's `generation_config.json` (`none` = framework defaults) |
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
+| `--reasoning-budget` | unset | Default `reasoning_budget` for chat requests: thinking tokens before the close tag is forced |
+| `--reasoning-reserve` | unset | Default `reasoning_reserve` for chat requests: tokens of `max_tokens` kept for the answer, the notice forced that many tokens before it |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
 | `--enable-timings-report` | off | Attach a llama.cpp-shaped per-request `timings` object to responses |
 | `--anthropic-inline-system` | auto | Placement of late Anthropic system instructions: `auto`, `preserve`, or `fold` |
@@ -142,6 +144,36 @@ Responses request may set the llama.cpp top-level body field `"timings_per_token
 to carry the block with growing values on every chunk that follows an ack: text and
 reasoning deltas, tool-argument fragments, and the finish chunk (or the usage chunk
 with `include_usage`). Without the server flag the field is ignored.
+
+A reasoning model can think for thousands of tokens. A `/v1/chat/completions` request may
+set `"reasoning_budget": N`: once the response has generated `N` tokens inside its thinking
+span, the server commits the model's close tag (`</think>` for Qwen) as the next token in
+place of the sampled one, and the answer is generated as usual. At 80% of the budget it
+first forces the notice `(Reasoning budget almost used; conclude.)` into the thinking, once,
+unless the budget leaves less than twice the notice's length after that point; the notice
+counts toward the budget. `--reasoning-budget` sets the default for every chat protocol; a
+request value wins, and `"reasoning_budget": 0` turns a server budget off for that request.
+The thinking span is found by the reasoning parser's tag pair, so a budget needs a
+`<think>`-style parser: a server on the `gpt_oss` or `muse_glimmer` parser, or with none,
+refuses the flag at startup and answers such a request with a 400. Under speculative
+decoding a forced token ends that step's accepted drafts. A `/v1/chat/completions` response
+under a budget reports `usage.completion_tokens_details.reasoning_tokens`, and
+`"reasoning_closed_by": "budget"` in `usage` when the server closed the thinking; on a
+stream both ride the usage chunk (`"stream_options": {"include_usage": true}`).
+
+A request may instead set `"reasoning_reserve": R` to keep the last `R` tokens of its
+`max_tokens` for the answer: once the response has `max_tokens - R` tokens and is still
+thinking, the server forces the same notice into the thinking, once. No close tag is
+forced, so a model that thinks on past the notice is cut at `max_tokens` as without a
+reserve. With `max_tokens` 32,768, `"reasoning_reserve": 2048` places the notice at
+30,720 tokens, where `"reasoning_budget": 38400` places it, without the caller computing
+a budget. `max_tokens` here is the value after the server's clamp to the context. The
+notice is skipped when `R` is less than twice its length or not less than `max_tokens`;
+with no budget the request then runs as one without a reserve and reports no reasoning tokens.
+With a budget set too, the earlier of the two notices is forced and the budget's close
+tag is unchanged. `--reasoning-reserve` sets the default for every chat protocol; a
+request value wins, `"reasoning_reserve": 0` turns it off, and it needs the same
+`<think>`-style parser as a budget.
 
 ### Image input
 

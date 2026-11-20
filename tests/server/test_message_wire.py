@@ -138,6 +138,21 @@ def test_terminal_replies_carry_scheduler_timings_over_the_wire():
     assert plain.timings is None
 
 
+def test_a_reasoning_budget_and_its_report_cross_the_wire():
+    """The budget rides SamplingParams to the scheduler; the count and close reason ride the terminal reply back."""
+    params = SamplingParams(reasoning_budget=256, reasoning_reserve=2048)
+    msg = UserMsg(uid=3, input_ids=torch.arange(4, dtype=torch.int32), sampling_params=params)
+    assert BaseBackendMsg.decoder(msg.encoder()).sampling_params == params
+
+    stats = {"reasoning_tokens": 256, "closed_by": "budget"}
+    decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(
+        DetokenizeMsg(uid=3, next_tokens=[42], finished=True, reasoning=stats)))
+    assert decoded.reasoning == stats
+    reply = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(
+        UserReply(uid=3, incremental_output="", finished=True, reasoning=stats)))
+    assert reply.reasoning == stats
+
+
 def test_client_dicts_with_the_wire_tag_key_survive_intact():
     """Tool JSON Schemas and chat_template_kwargs are free-form client data. A field literally
     named ``__type__`` (a common discriminator) must not be read back as a serialized class --
