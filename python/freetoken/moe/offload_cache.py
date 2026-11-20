@@ -156,6 +156,9 @@ class OffloadMoeCache:
     # of that step's misses are computed on the CPU. 0 -> never fetch (CPU does every
     # miss, the GPU cache stays cold); large -> behaves like pure offload.
     hybrid_max_fetch: int = 1
+    # hybrid only: how fetch_fraction * misses becomes a fetch count (offload_kernels._HYBRID_FETCH_ROUNDING).
+    # None = FREETOKEN_HYBRID_FETCH_ROUND; --moe-strategy auto sets the mode `ft bench decode` measured fastest.
+    hybrid_fetch_round: str | None = None
     # hybrid only, one per MoE layer: when > 0, replaces the fixed cap with a per-step fraction -- fetch
     # ~fraction * misses experts over PCIe (rounded to whichever integer balances the
     # overlap best), the CPU computes the rest. The engine sets it to the benched

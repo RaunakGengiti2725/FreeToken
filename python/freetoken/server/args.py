@@ -699,7 +699,8 @@ def parse_args(
         default=ServerArgs.moe_strategy,
         choices=["auto", *MOE_STRATEGIES],
         help=(
-            "How the routed experts are served. 'auto' resolves a MoE model to 'offload', and to "
+            "How the routed experts are served. 'auto' resolves a MoE model to 'offload', to 'hybrid' "
+            "where `ft bench decode` measured it faster for the same flags on this machine, and to "
             "resident 'fused' experts on unified-memory GPUs (GB10 / DGX Spark)."
         ),
     )

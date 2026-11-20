@@ -22,9 +22,11 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterator, Tuple
 
 import torch
-from freetoken.utils import cached_load_hf_config
+from freetoken.utils import cached_load_hf_config, init_logger
 
 from .register import _load_attr, get_model_spec
+
+logger = init_logger(__name__)
 
 # safetensors header dtype strings -> torch dtypes (for the parallel reader below)
 _ST_DTYPE = {
@@ -36,16 +38,17 @@ _ST_DTYPE = {
 _ODIRECT_BLK = 4096
 
 
-def _read_shard_odirect_parallel(path: str, workers: int, chunk: int) -> mmap.mmap:
+def _read_shard_odirect_parallel(path: str, workers: int, chunk: int, direct: bool = True) -> mmap.mmap:
     """Read a whole shard into a page-aligned mmap via CHUNKED multi-threaded O_DIRECT.
     Multi-threading one fd scales even for single-shard checkpoints (measured ~7x at 8
     threads): the kernel issues the parallel preads at high queue depth. DMA bypasses the
-    page cache, so there's nothing to drop afterwards."""
+    page cache, so there's nothing to drop afterwards. ``direct=False`` does the same preads
+    through the page cache (a restart then reads RAM); the tail past EOF stays zero either way."""
     size = os.path.getsize(path)
     asize = ((size + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK
     buf = mmap.mmap(-1, asize)
     mv = memoryview(buf)
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    fd = os.open(path, os.O_RDONLY | (os.O_DIRECT if direct else 0))
     offs = list(range(0, size, chunk))
 
     def rd(o):
@@ -65,13 +68,39 @@ def _read_shard_odirect_parallel(path: str, workers: int, chunk: int) -> mmap.mm
     return buf
 
 
+def _mem_available() -> int | None:
+    """MemAvailable in bytes, or ``None`` where /proc/meminfo is not readable."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def keep_page_cache(sizes: list[int], prefetch: int) -> tuple[bool, str]:
+    """Read the expert shards through the page cache when free RAM holds them twice over (the
+    cached copy, and host banks built from it) plus the reader's prefetched shard buffers, so a
+    restart reads RAM instead of disk. Otherwise, or when RAM is unknown, O_DIRECT with the cache dropped."""
+    avail = _mem_available()
+    if avail is None or not sizes:
+        return False, "MemAvailable unknown"
+    need = 2 * sum(sizes) + (prefetch + 1) * max(sizes)
+    keep = avail > need
+    gib = 1 << 30
+    return keep, (f"MemAvailable {avail / gib:.1f} GiB {'>' if keep else '<='} {need / gib:.1f} GiB "
+                  f"(2 x {sum(sizes) / gib:.1f} GiB of shards + {prefetch + 1} in flight)")
+
+
 def iter_expert_tensors_parallel(
     model_path: str,
     is_expert: Callable[[str], bool],
     *,
     workers: int = 8,
     chunk: int = 8 << 20,
-    drop_cache: bool = True,
+    drop_cache: bool | None = None,
     prefetch: int = 2,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     """Parallel O_DIRECT analog of a model's serial expert ``iter_weights``.
@@ -86,6 +115,9 @@ def iter_expert_tensors_parallel(
     instead of idling between shards (the gap that made the naive sequential version slow).
     Peak host memory is ~(prefetch+1) shards + the banks the caller fills. Order is
     shard-then-header order (NOT global), so the consumer must place by ``name``.
+
+    ``drop_cache``: ``None`` picks by free RAM (``keep_page_cache``): buffered reads that keep
+    the page cache, or O_DIRECT after dropping it. ``True`` / ``False`` force one. Same bytes either way.
     """
     from freetoken.models.loader import safetensors_weight_map
     from freetoken.utils.hf import download_hf_weight
@@ -97,6 +129,11 @@ def iter_expert_tensors_parallel(
         if is_expert(name):
             shards.setdefault(shard, []).append(name)
     shard_list = sorted(shards)
+    sizes = [os.path.getsize(os.path.join(model_path, s)) for s in shard_list]
+    if drop_cache is None:
+        keep, why = keep_page_cache(sizes, prefetch)
+        drop_cache = not keep
+        logger.info_rank0(f"expert shards: {'buffered read, page cache kept' if keep else 'O_DIRECT read, page cache dropped'}: {why}")
 
     q: queue.Queue = queue.Queue(maxsize=max(1, prefetch))
     _DONE = object()
@@ -113,7 +150,7 @@ def iter_expert_tensors_parallel(
                         os.close(fd)
                     except OSError:
                         pass
-                buf = _read_shard_odirect_parallel(path, workers, chunk)  # overlaps placement
+                buf = _read_shard_odirect_parallel(path, workers, chunk, direct=drop_cache)  # overlaps placement
                 n = struct.unpack("<Q", bytes(buf[:8]))[0]
                 hdr = json.loads(bytes(buf[8:8 + n]))
                 q.put((buf, hdr, 8 + n, shards[shard], os.path.getsize(path)))
@@ -126,8 +163,7 @@ def iter_expert_tensors_parallel(
 
     th = threading.Thread(target=_reader, name="expert-prefetch", daemon=True)
     th.start()
-    bar = byte_bar(sum(os.path.getsize(os.path.join(model_path, s)) for s in shard_list),
-                   "Loading experts (parallel)")
+    bar = byte_bar(sum(sizes), "Loading experts (parallel)")
     try:
         while True:
             item = q.get()

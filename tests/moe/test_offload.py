@@ -1258,3 +1258,52 @@ def test_host_ram_fits_parallel_sizes_subdirectory_shards(tmp_path, monkeypatch)
 
     monkeypatch.setattr(builtins, "open", fake_open)
     assert not _host_ram_fits_parallel(str(tmp_path))
+
+
+@pytest.mark.parametrize("meminfo, keep", [
+    ("MemAvailable:        1048576 kB\n", True),  # 1 GiB covers 2 x the shards plus the prefetched ones
+    ("MemAvailable:            16 kB\n", False),  # under the one 17 KB expert shard
+    (None, False),  # no /proc/meminfo: today's O_DIRECT read
+])
+def test_expert_reader_keeps_page_cache_only_when_ram_fits(tmp_path, monkeypatch, meminfo, keep):
+    """The parallel expert reader reads buffered (page cache kept, no DONTNEED) only when free RAM covers the shards, and yields the same bytes."""
+    import builtins
+    import io
+    import os
+
+    from safetensors.torch import save_file
+
+    import freetoken.models.weight as weight
+
+    want = {
+        "model.layers.0.mlp.experts.0.gate_proj.weight": torch.arange(4099, dtype=torch.int16),  # tail off the 4 KiB block
+        "model.layers.0.mlp.experts.1.down_proj.weight": torch.randn(64, 33),
+    }
+    save_file(want, str(tmp_path / "model-00001-of-00002.safetensors"))
+    save_file({"model.embed_tokens.weight": torch.zeros(8)}, str(tmp_path / "model-00002-of-00002.safetensors"))
+    real_open = builtins.open
+
+    def fake_open(file, *args, **kwargs):
+        if str(file) == "/proc/meminfo":
+            if meminfo is None:
+                raise FileNotFoundError(file)
+            return io.StringIO(meminfo)
+        return real_open(file, *args, **kwargs)
+
+    reads, drops = [], []
+    real_read = weight._read_shard_odirect_parallel
+
+    def read(path, workers, chunk, direct=True):
+        reads.append((os.path.basename(path), direct))
+        return real_read(path, workers, chunk, direct=False)  # O_DIRECT is Linux-only; the bytes are the same
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    monkeypatch.setattr(weight, "_read_shard_odirect_parallel", read)
+    monkeypatch.setattr(os, "posix_fadvise", lambda fd, off, n, advice: drops.append(advice), raising=False)
+    monkeypatch.setattr(os, "POSIX_FADV_DONTNEED", 4, raising=False)
+    got = dict(weight.iter_expert_tensors_parallel(str(tmp_path), lambda n: ".experts." in n, workers=2, chunk=4096))
+    assert reads == [("model-00001-of-00002.safetensors", not keep)]
+    assert drops == ([] if keep else [4])
+    assert got.keys() == want.keys()
+    for name, t in want.items():
+        assert torch.equal(got[name], t)

@@ -182,7 +182,7 @@ def _ensure_experts_hybrid_gpu(
         CHUNK=chunk,
         SMALL=num_slots <= chunk,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
-        ROUND=_HYBRID_FETCH_ROUND,
+        ROUND=_HYBRID_FETCH_ROUND if cache.hybrid_fetch_round is None else _HYBRID_FETCH_ROUNDING[cache.hybrid_fetch_round],
         CLAMP=clamp,
         STATS=cache.collect_stats,
         num_warps=num_warps,

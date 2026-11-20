@@ -357,9 +357,9 @@ def _offload_engine_config(**overrides):
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.config import EngineConfig
 
+    overrides.setdefault("model_path", "/tmp/freetoken-test-model")
+    overrides.setdefault("tp_info", DistributedInfo(rank=0, size=1))
     config = EngineConfig(
-        model_path="/tmp/freetoken-test-model",
-        tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.bfloat16,
         attention_backend="triton" if torch.version.hip is not None else "fi",
         **overrides,
@@ -420,6 +420,278 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     assert is_offload_moe_strategy(config.moe_strategy)
     assert config.moe_cache_auto is True
     assert config.moe_cache_size == 0  # still unresolved -- the scheduler sizes it from VRAM
+
+
+# ---- --moe-strategy auto and the decode rows `ft bench decode` files (moe/decode_profile.py), through the real _adjust_config ----
+
+_ROW_GPU = ("FAKE GPU", "GPU-fake")
+_ROW_FREE = 15 << 30  # GPU memory free when the row was measured
+_HYBRID_FASTER = {"offload": [100.0, 101.0], "offload#2": [100.5, 100.0], "hybrid:min-wait": [131.0, 128.0]}
+_HYBRID_SLOWER = {"offload": [84.0, 83.0], "offload#2": [84.5, 83.2], "hybrid:min-wait": [27.0, 28.0]}  # #278's numbers
+# a workload column and a guard column (output that barely misses the cache): min-wait leads by more on the first and is 17% behind on the second
+_TWO_ARMS = {"offload": [100.0, 230.0], "offload#2": [100.4, 231.0], "hybrid:min-wait": [133.0, 191.0], "hybrid:stochastic": [130.0, 219.0]}
+
+
+@pytest.fixture
+def decode_rows(tmp_path, monkeypatch):
+    """A checkpoint folder, an empty decode profile, and stand-ins for what only a GPU box can answer."""
+    import freetoken.engine.engine as engine
+    from freetoken.moe import decode_profile
+
+    model = tmp_path / "ckpt"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type": "fake"}')
+    (model / "model-00001.safetensors").write_bytes(b"x" * 100)
+    monkeypatch.setenv("FREETOKEN_BENCHDECODE_PATH", str(tmp_path / "benchdecode.json"))
+    monkeypatch.setenv("FREETOKEN_BENCHBW_PATH", str(tmp_path / "benchbw.json"))
+    for name in [n for n in os.environ if n.startswith("FREETOKEN_") and n not in ("FREETOKEN_BENCHDECODE_PATH", "FREETOKEN_BENCHBW_PATH")]:
+        monkeypatch.delenv(name)
+    monkeypatch.setattr(engine, "_is_unified_memory_gpu", lambda index=None: False)
+    monkeypatch.setattr(engine, "_cpu_moe_executor_viable", lambda model_config: True)
+    monkeypatch.setattr(engine, "_profile_gpu", lambda index=None: _ROW_GPU)
+    monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: _ROW_FREE)
+    monkeypatch.setattr(decode_profile, "freetoken_build", lambda: {"version": "9.9.9", "commit": "abc"})
+    # the pick is under test whichever way the switch ships; the hint test turns it off
+    monkeypatch.setattr(decode_profile, "AUTO_TAKES_HYBRID", True)
+    return SimpleNamespace(model=model, engine=engine, dp=decode_profile, tmp=tmp_path)
+
+
+def _resolved(rows, **flags):
+    config = _offload_engine_config(model_path=str(rows.model), **flags)
+    rows.engine._adjust_config(config)
+    return config
+
+
+def _file_row(rows, tok_s, *, slots=40, asked="offload", guard=(), **flags):
+    """File a row the way the bench does: under the setup a server started with an explicit strategy logs."""
+    key = _resolved(rows, moe_strategy=asked, **flags).moe_decode_key
+    row = {"tok_s": tok_s, "columns": ["aime", "repeat"], "guard": list(guard), "slots": {"offload": slots, "hybrid": slots},
+           "total_slots": 80, "slot_bytes": 1 << 20, "gpu_free_bytes": _ROW_FREE, "measured_at": "2026-11-12T10:00:00",
+           "stamp": rows.dp.stamp(*_ROW_GPU)}
+    rows.dp.store(key, row, gpu={"name": _ROW_GPU[0], "uuid": _ROW_GPU[1]})
+    return key
+
+
+def test_auto_stays_on_offload_without_a_decode_row(decode_rows):
+    config = _resolved(decode_rows)
+    assert config.moe_strategy == "offload" and config.moe_decode_row is None
+
+
+@pytest.mark.parametrize("asked", ["offload", "hybrid"])
+@pytest.mark.parametrize("flags", [{}, {"moe_cache_size": 40}, {"moe_cache_rate": 0.5}, {"moe_cache_mem": 4 << 30}, {"memory_ratio": 0.5}])
+def test_auto_takes_hybrid_on_the_row_an_explicit_start_filed(decode_rows, asked, flags):
+    key = _file_row(decode_rows, _HYBRID_FASTER, asked=asked, **flags)
+    config = _resolved(decode_rows, **flags)
+    assert config.moe_decode_key == key
+    assert config.moe_strategy == "hybrid" and config.moe_decode_row["tok_s"] == _HYBRID_FASTER
+    if not flags:
+        assert config.moe_cache_auto is True  # a bare start still gets the auto-sized cache
+
+
+def test_auto_only_hints_at_hybrid_when_the_pick_is_switched_off(decode_rows, monkeypatch, caplog):
+    _file_row(decode_rows, _HYBRID_FASTER)
+    logger = decode_rows.engine.logger
+    logger.addHandler(caplog.handler)  # this logger does not propagate to the root
+    try:
+        assert _resolved(decode_rows).moe_strategy == "hybrid"
+        assert "--moe-strategy auto: hybrid (min-wait rounding): decode A/B of 2026-11-12T10:00:00 at 40 cache slots" in caplog.text
+        caplog.clear()
+        monkeypatch.setattr(decode_rows.dp, "AUTO_TAKES_HYBRID", False)
+        config = _resolved(decode_rows)
+        # offload as without a row, so no cap on the cache and no rounding mode either
+        assert (config.moe_strategy, config.moe_decode_row, config.moe_hybrid_fetch_round) == ("offload", None, None)
+        # the lead on the worst workload column is 128 against a median of 100.5, and the flags that run hybrid are named
+        assert "--moe-strategy auto: offload. The decode bench measured hybrid (min-wait rounding) faster for this setup" in caplog.text
+        assert "+27.4% on its worst workload column" in caplog.text and "`--moe-strategy hybrid` runs it" in caplog.text
+        # the arm that qualified is not the default mode: the hint names the variable that selects it
+        caplog.clear()
+        _file_row(decode_rows, _TWO_ARMS, guard=["repeat"])
+        assert _resolved(decode_rows).moe_strategy == "offload"
+        assert "`--moe-strategy hybrid` with FREETOKEN_HYBRID_FETCH_ROUND=stochastic runs it" in caplog.text
+    finally:
+        logger.removeHandler(caplog.handler)
+
+
+def test_auto_stays_on_offload_when_the_row_says_hybrid_is_slower(decode_rows):
+    _file_row(decode_rows, _HYBRID_SLOWER)
+    config = _resolved(decode_rows)
+    assert config.moe_strategy == "offload" and config.moe_decode_row is None
+
+
+@pytest.mark.parametrize(
+    "served, differs",
+    [
+        ({"max_running_req": 2}, "req"),
+        ({"moe_cache_size": 48}, "cache"),
+        ({"memory_ratio": 0.8}, "cache"),
+        ({"moe_cpu_threads": 6}, "cpu"),
+        ({"speculative_algorithm": "mtp", "speculative_num_steps": 3}, "spec"),
+        ({"moe_hybrid_max_fetch": 2}, "moe_hybrid_max_fetch"),
+        ({"moe_cache_scope": "per-layer"}, "moe_cache_scope"),
+        ({"moe_cpu_layers": "2"}, "moe_cpu_layers"),
+        ({"kv_reserve_tokens": 2048}, "kv_reserve_tokens"),
+        ({"cuda_graph_max_bs": 1}, "cuda_graph_max_bs"),
+        ({"moe_collect_stats": True}, "moe_collect_stats"),
+        ({"hf_overrides": {"rope_scaling": {"factor": 2}}}, "hf_overrides"),
+    ],
+)
+def test_auto_does_not_use_a_row_measured_with_other_settings(decode_rows, served, differs, monkeypatch):
+    # speculative decoding resolves through the proposer; keep that out of this test
+    monkeypatch.setattr(decode_rows.engine, "_adjust_spec_config", lambda *a, **k: None)
+    key = _file_row(decode_rows, _HYBRID_FASTER)
+    assert _resolved(decode_rows).moe_strategy == "hybrid"  # the row is good for its own settings
+    config = _resolved(decode_rows, **served)
+    assert config.moe_strategy == "offload"
+    # and the log can name the setting: that is what tells a user why auto did not take the row
+    assert differs in decode_rows.dp.key_diff(key, config.moe_decode_key)
+
+
+def test_auto_tells_speculative_methods_and_environment_switches_apart(decode_rows, monkeypatch):
+    monkeypatch.setattr(decode_rows.engine, "_adjust_spec_config", lambda *a, **k: None)
+    _file_row(decode_rows, _HYBRID_FASTER, speculative_algorithm="mtp", speculative_num_steps=3)
+    assert _resolved(decode_rows, speculative_algorithm="mtp", speculative_num_steps=3).moe_strategy == "hybrid"
+    assert _resolved(decode_rows, speculative_algorithm="dflash", speculative_num_steps=3).moe_strategy == "offload"
+    _file_row(decode_rows, _HYBRID_FASTER)
+    monkeypatch.setenv("FREETOKEN_API_KEY", "not a setup")  # ignored, and never written into a key
+    assert _resolved(decode_rows).moe_strategy == "hybrid"
+    monkeypatch.setenv("FREETOKEN_CPU_MOE_SPIN", "0")
+    config = _resolved(decode_rows)
+    assert config.moe_strategy == "offload" and "not a setup" not in config.moe_decode_key
+    monkeypatch.delenv("FREETOKEN_CPU_MOE_SPIN")
+    assert _resolved(decode_rows).moe_strategy == "hybrid"
+    monkeypatch.setenv("DSV4_SWITCH_NOBODY_BENCHED", "1")  # the kernels' own switches do not start with FREETOKEN_
+    assert _resolved(decode_rows).moe_strategy == "offload"
+
+
+def test_environment_switches_the_source_reads_are_in_the_decode_key_or_named_as_left_out():
+    """A switch that changes decode speed and is not in the key lets auto apply a row measured without it."""
+    import re
+    from pathlib import Path
+
+    import freetoken
+    from freetoken.moe import decode_profile
+
+    literal = re.compile(r"""["']([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)["']""")
+    unknown = set()
+    for path in Path(freetoken.__file__).parent.rglob("*"):
+        if path.suffix in (".py", ".cpp", ".cu", ".cuh", ".h"):
+            for line in path.read_text(errors="replace").splitlines():
+                if "environ" in line or "getenv" in line:
+                    unknown.update(name for name in literal.findall(line) if decode_profile.env_role(name) is None)
+    assert not unknown, f"say in moe/decode_profile.py whether these are part of the decode key: {sorted(unknown)}"
+
+
+def test_auto_does_not_use_a_row_from_another_build_machine_gpu_or_checkpoint(decode_rows, monkeypatch):
+    dp, engine = decode_rows.dp, decode_rows.engine
+    _file_row(decode_rows, _HYBRID_FASTER)
+    assert _resolved(decode_rows).moe_strategy == "hybrid"
+    now = dp.stamp(*_ROW_GPU)
+    for name, other in (("freetoken", {"version": "9.9.8", "commit": "abc"}), ("freetoken", {"version": "9.9.9", "commit": "other"}),
+                        ("torch", "0.0"), ("triton", "0.0"), ("nvidia", "another driver"), ("cpu", "another CPU"), ("ram_gib", 1),
+                        ("cpu_quota", "200000 100000")):
+        with monkeypatch.context() as m:
+            m.setattr(dp, "stamp", lambda gpu_name=None, gpu_uuid=None, name=name, other=other: {**now, name: other})
+            assert _resolved(decode_rows).moe_strategy == "offload", name
+    assert _resolved(decode_rows).moe_strategy == "hybrid"
+    monkeypatch.setattr(engine, "_profile_gpu", lambda index=None: ("FAKE GPU", "GPU-other"))
+    assert _resolved(decode_rows).moe_strategy == "offload"
+    monkeypatch.setattr(engine, "_profile_gpu", lambda index=None: _ROW_GPU)
+    (decode_rows.model / "README.md").write_text("not a weight file")
+    assert _resolved(decode_rows).moe_strategy == "hybrid"
+    (decode_rows.model / "model-00001.safetensors").write_bytes(b"x" * 101)  # the checkpoint changed on disk
+    assert _resolved(decode_rows).moe_strategy == "offload"
+
+
+def test_auto_drops_the_row_when_the_bandwidth_profile_or_the_cpu_set_changes(decode_rows, monkeypatch):
+    import json
+
+    from freetoken.moe.bench_profile import PROFILE_VERSION
+
+    def bench_bw(cpu_gbs):
+        profile = {"version": PROFILE_VERSION, "gpu": {"name": _ROW_GPU[0]}, "layer_kinds": {"nvfp4:2048x512:top8:t12": {"cpu_moe_overlap_gbs": cpu_gbs}}}
+        (decode_rows.tmp / "benchbw.json").write_text(json.dumps(profile))
+
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1, 2, 3})
+    bench_bw(170.0)
+    _file_row(decode_rows, _HYBRID_FASTER)
+    assert _resolved(decode_rows).moe_strategy == "hybrid"
+    bench_bw(90.0)  # hybrid's fetch split changes with it
+    assert _resolved(decode_rows).moe_strategy == "offload"
+    bench_bw(170.0)
+    assert _resolved(decode_rows).moe_strategy == "hybrid"
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {4, 5, 6, 7})  # as many CPUs, but other ones
+    assert _resolved(decode_rows).moe_strategy == "offload"
+
+
+def test_auto_never_takes_hybrid_where_it_cannot_run_or_is_not_the_default(decode_rows, monkeypatch):
+    from freetoken.distributed import DistributedInfo
+
+    engine = decode_rows.engine
+    _file_row(decode_rows, _HYBRID_FASTER)
+    with monkeypatch.context() as m:
+        m.setattr(engine, "_cpu_moe_executor_viable", lambda model_config: False)
+        assert _resolved(decode_rows).moe_strategy == "offload"
+    with monkeypatch.context() as m:  # unified memory keeps its own default
+        m.setattr(engine, "_is_unified_memory_gpu", lambda index=None: True)
+        m.setattr(engine, "_fused_resident_ok", lambda model_config: True)
+        assert _resolved(decode_rows).moe_strategy == "fused"
+    two_ranks = DistributedInfo(rank=0, size=2)  # each rank would read the rows of its own GPU
+    _file_row(decode_rows, _HYBRID_FASTER, tp_info=two_ranks)
+    assert _resolved(decode_rows, tp_info=two_ranks).moe_strategy == "offload"
+
+
+def test_auto_runs_the_rounding_mode_that_qualified_unless_one_is_forced(decode_rows, monkeypatch):
+    from freetoken.moe import offload_kernels
+
+    # the arms the bench can measure are the modes the kernel has: auto hands the name of one to the kernel
+    assert set(decode_rows.dp.ROUND_MODES) == set(offload_kernels._HYBRID_FETCH_ROUNDING)
+    _file_row(decode_rows, _TWO_ARMS, guard=["repeat"])
+    config = _resolved(decode_rows)
+    assert (config.moe_strategy, config.moe_hybrid_fetch_round) == ("hybrid", "stochastic")  # min-wait leads by more, outside the guard limit
+    # a forced mode is the one that runs, so only its arm counts
+    monkeypatch.setenv("FREETOKEN_HYBRID_FETCH_ROUND", "min-wait")
+    config = _resolved(decode_rows)
+    assert (config.moe_strategy, config.moe_hybrid_fetch_round) == ("offload", None)
+    monkeypatch.setenv("FREETOKEN_HYBRID_FETCH_ROUND", "stochastic")
+    config = _resolved(decode_rows)
+    assert (config.moe_strategy, config.moe_hybrid_fetch_round) == ("hybrid", None)  # the kernel reads the variable itself
+    # offload never carries a rounding mode
+    monkeypatch.delenv("FREETOKEN_HYBRID_FETCH_ROUND")
+    _file_row(decode_rows, _HYBRID_SLOWER)
+    config = _resolved(decode_rows)
+    assert (config.moe_strategy, config.moe_hybrid_fetch_round) == ("offload", None)
+
+
+def test_explicit_strategy_never_reads_the_decode_profile(decode_rows, monkeypatch):
+    _file_row(decode_rows, _HYBRID_SLOWER, moe_cache_size=40)
+    monkeypatch.setattr(decode_rows.dp, "lookup", lambda *a, **k: pytest.fail("an explicit strategy read the decode profile"))
+    assert _resolved(decode_rows, moe_strategy="hybrid", moe_cache_size=40).moe_strategy == "hybrid"
+    assert _resolved(decode_rows, moe_strategy="offload", moe_cache_size=40).moe_strategy == "offload"
+
+
+def test_auto_does_not_take_a_row_whose_hybrid_cache_is_below_the_models_floor(decode_rows):
+    # the fake model has 8 experts a layer: a row edited to 4 slots would cap the cache under the floor and fail the start
+    _file_row(decode_rows, _HYBRID_FASTER, slots=4)
+    assert _resolved(decode_rows).moe_strategy == "offload"
+    _file_row(decode_rows, _HYBRID_FASTER, slots=8)
+    assert _resolved(decode_rows).moe_strategy == "hybrid"
+
+
+def test_auto_sized_cache_takes_the_row_only_with_no_more_memory_than_measured(decode_rows, monkeypatch):
+    engine = decode_rows.engine
+    _file_row(decode_rows, _HYBRID_FASTER)  # 40 of 80 slots at 1 MiB each, with _ROW_FREE bytes free
+    monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: _ROW_FREE - (8 << 30))
+    assert _resolved(decode_rows).moe_strategy == "hybrid"   # less memory: a smaller cache, where hybrid leads by more
+    monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: _ROW_FREE + (1 << 20))
+    assert _resolved(decode_rows).moe_strategy == "hybrid"   # one slot more is inside the tolerance
+    monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: _ROW_FREE + (8 << 20))
+    assert _resolved(decode_rows).moe_strategy == "offload"  # offload would get 7 slots more than hybrid was compared at
+    monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: None)
+    assert _resolved(decode_rows).moe_strategy == "offload"  # unknown is not a yes
+    # an explicit size is not sized from free memory, so free memory does not matter
+    _file_row(decode_rows, _HYBRID_FASTER, moe_cache_size=40)
+    monkeypatch.setattr(engine, "_gpu_free_bytes", lambda: _ROW_FREE + (8 << 30))
+    assert _resolved(decode_rows, moe_cache_size=40).moe_strategy == "hybrid"
 
 
 def test_page_table_width_covers_whole_trailing_pages():

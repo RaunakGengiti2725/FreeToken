@@ -99,7 +99,15 @@ formula, round trip included, came out up to 13% faster than the measured
 steps (see [For developers](#for-developers-where-to-look)).
 
 The crossover moves with the CPU-to-PCIe bandwidth ratio and the model, so on
-another machine compare both strategies at your cache size.
+another machine compare both strategies at your cache size:
+`ft bench decode --model <checkpoint>` runs that comparison, and
+`--moe-strategy auto` then takes the faster one for those flags (see
+[cli.md](../cli.md#ft-bench-decode)). To compare over several cache rates:
+
+```bash
+ft bench bw --model <checkpoint>
+ft bench decode --model <checkpoint> --cache-rates 0.05,0.1,0.2,0.35,0.5,0.75 --csv decode.csv
+```
 
 ## Miss rate vs cache rate
 

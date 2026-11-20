@@ -12,6 +12,7 @@ ft <command> [args]
 | `ft launch` | Configure and launch a coding agent against a server |
 | `ft checkpoint` | Convert an HF checkpoint to the FTW fast-load format |
 | `ft bench bw` | Benchmark CPU vs PCIe bandwidth to calibrate hybrid MoE decode |
+| `ft bench decode` | Decode with `offload` and with `hybrid` on this machine, report the faster and file it for `--moe-strategy auto` |
 
 `ft --version` prints the installed version (torch-free; nightly wheels carry a
 `+g<sha>` build stamp, tagged releases a bare version). Every command supports
@@ -85,7 +86,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does, [performa
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload; fused on unified-memory GPUs (GB10), see [models.md](models.md#unified-memory-gpus-gb10--dgx-spark). `--moe-backend` is the deprecated old spelling |
+| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid where [`ft bench decode`](#ft-bench-decode) measured it faster for the same flags; fused on unified-memory GPUs (GB10), see [models.md](models.md#unified-memory-gpus-gb10--dgx-spark). `--moe-backend` is the deprecated old spelling |
 | `--quant-backend` | auto | Kernel per quantized layer type, `layer[.kind]=name` entries: `linear=marlin,moe=b12x` or `moe.nvfp4=triton`. A layer-level entry applies to every kind whose table lists the name |
 | `--nvfp4-backend` | — | Deprecated: stands in for `--quant-backend moe.nvfp4=<marlin\|b12x\|triton>` (`flashinfer` means b12x); cannot be combined with `--quant-backend` |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-mem` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / memory such as `12GiB` / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family strategies) |
@@ -258,3 +259,56 @@ to split each layer's misses.
 
 On NVLink-C2C hosts, see [models.md](models.md#nvlink-c2c-hosts-gh200--gb200)
 for `FREETOKEN_H2D_BLOCKS_PER_BANK` if `PCIe-gather` sits well below the linear H2D ceiling.
+
+## ft bench decode
+
+```bash
+ft bench decode --model /path/to/model                                # offload against hybrid, with the default flags
+ft bench decode --model /path/to/model --cache-rates 0.05,0.2,0.5     # the two curves and where they cross
+ft bench decode --model /path/to/model -- --moe-cpu-threads 8         # with the flags you serve with, after --
+```
+
+Which of `offload` and `hybrid` decodes faster depends on the machine, the model and the cache size
+([performance/decode.md](performance/decode.md#hybrid-computing-misses-on-the-cpu)). This command measures it
+through the real serving path: it starts `ft serve` once per arm (offload, hybrid with `min-wait`
+rounding, hybrid with `stochastic` rounding, offload again), decodes four prompts one at a time with
+thinking on and the checkpoint's sampling, then several prompts at once, and prints tok/s per arm
+from the server's timings.
+
+- The prompts are an AIME-25 problem and a coding task (the workload columns), and two that each make
+  the model repeat a sentence (the guard columns). Repeated output barely misses the cache, so hybrid
+  gains nothing there and still pays its CPU round trip per layer. How much it loses differs from
+  one repeated text to another, so the bench reads two.
+- Hybrid is reported as faster only if it beats offload by 1.5% (or by the largest spread between two
+  starts of one arm, if that is larger) on every workload column, and is no more than 10% behind on
+  either guard column. If two starts of one arm are more than 5% apart, nothing is decided and
+  offload stays. A close result adds rounds, up to `--rounds`. An arm whose server fails to start or
+  stops answering, in any round, counts as not faster.
+- Run `ft bench bw --model` first: hybrid takes its fetch split from that profile.
+- Each server start loads the model and decodes about 10,000 tokens at the defaults, so the first
+  round at one cache rate is four model loads. A close result adds up to three more per round, and
+  `--cache-rates` runs the whole comparison once per rate.
+- `--greedy`, `--warm`, `--decode`, `--streams`, `--aime`, `--prompts`, `--csv` and `--json` change
+  what is decoded and where the numbers go.
+
+The result is filed as one row per setup in `~/.cache/freetoken/benchdecode/<gpu-uuid>.json`
+(`--no-write` only prints it). `ft serve --moe-strategy auto` takes `hybrid` when it finds a row that
+says hybrid qualifies, runs the fetch rounding mode that qualified with the largest lead (unless
+`FREETOKEN_HYBRID_FETCH_ROUND` names one), and logs the measurement it used.
+It uses a row only if all of this holds, and logs which part differs when it does not:
+
+- the same checkpoint and the same flags: the cache size, `--moe-cpu-threads` and the CPUs the
+  process may use, speculative decoding, `--max-running-requests`, every other engine setting that
+  is not at its default, and the environment switches (`FREETOKEN_*`, and those of the kernels and
+  libraries underneath, such as `CUDA_LAUNCH_BLOCKING`);
+- the same machine and build: the GPU, the FreeToken version and commit (the commit only when both
+  the row and the server know one), torch, triton, the NVIDIA driver (where
+  `/proc/driver/nvidia/version` exists; not under WSL), the CPU model, the amount of RAM, the
+  container's CPU quota and the `ft bench bw` profile;
+- with an automatically sized cache, no more free GPU memory than when the row was measured (5%
+  more slots at most). Hybrid then also runs with no more slots than it was measured with.
+
+Without such a row `auto` stays on `offload`. Tensor-parallel servers are never picked from rows.
+Hybrid computes some experts on the CPU, so where two tokens are nearly tied its output can differ
+from offload's; and on output that barely misses the cache it can be up to the guard limit slower.
+`--moe-strategy offload` keeps offload whatever was measured.

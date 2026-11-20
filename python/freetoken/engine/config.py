@@ -85,6 +85,12 @@ class EngineConfig:
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
+    # --moe-strategy auto: this setup's key in the decode profile (moe/decode_profile.py), and the row auto took hybrid on.
+    # Both are set by _adjust_config.
+    moe_decode_key: str | None = field(default=None, repr=False)
+    moe_decode_row: dict | None = field(default=None, repr=False)
+    # the fetch rounding mode auto measured fastest for hybrid; None = FREETOKEN_HYBRID_FETCH_ROUND, min-wait without it
+    moe_hybrid_fetch_round: str | None = field(default=None, repr=False)
     # Hybrid with locked layers (banks the pin quota could not take, OS-locked instead): a locked layer keeps GPU
     # slots of its own pools and fetches this share of each decode step's misses through pinned staging; the rest
     # are computed on the CPU. -1 (default) = auto: per layer from its `ft bench bw` row (bench_profile.locked_fetch_fraction),
