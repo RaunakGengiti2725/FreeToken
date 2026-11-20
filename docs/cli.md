@@ -388,8 +388,11 @@ row of the router's launch. Both are off by default and on only for `1`, `true`,
 ninth route needs the fold, and a step that the grouped decode kernel or the wide decode GEMM takes
 keeps the shared expert's own kernels. The logits are summed in the kernel's order, not cuBLAS's, so
 a near-tie may route to the other expert. Measured together, with MTP at 5 draft tokens and the
-expert map, they decoded 763.1 and 666.2 tok/s against 648.7 and 524.5 tok/s with both off in the
-same run, at a KL of 0.001636 against the default path. The hard30 and gate rows have not finished.
+expert map, a build with both on (and with the FP8 small-M linears and the b|a fold) decoded 763.1
+and 666.2 tok/s against 648.7 and 524.5 tok/s for a build with none of the four, in the same run. Its
+KL against that build is 0.001636, under the 0.00268 line, and its first hard30 pass scored 27 of 30
+against 27. The gate and the second hard30 pass have not finished, and neither switch has a row of its
+own on this tree.
 
 `--moe-expert-activation-scales` runs prefill forwards of at least 2048 tokens through the W4A4
 expert kernel (see [MoE offload](#moe-offload)). It is off by default and changes the output. It
@@ -399,8 +402,8 @@ row under the line.
 `--preset single-bucket` captures prefill forwards for chunks of exactly 128, 256, 512 and 1,024
 tokens (see [Presets](#presets)). It is off by default: `--preset single` does not include it. A
 1,024-token prompt's first token came in 52.9 ms against 65.3 ms without the buckets. Its replies
-are `single`'s only for chunks of those four sizes, which are the ones that replay a capture; every
-other chunk past 64 tokens runs eagerly.
+equal `single`'s (174 of 174 measured). Only chunks of those four sizes replay a capture; every other
+chunk past 64 tokens runs eagerly, as without the preset.
 
 ### API behaviour
 
