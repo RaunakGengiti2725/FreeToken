@@ -1249,9 +1249,11 @@ def parse_args(
     parser.add_argument(
         "--preset",
         default=ServerArgs.preset,
-        choices=sorted(_PRESETS),
+        choices=[*sorted(_PRESETS), "none"],
         help=(
-            "Settings for a kind of use, applied only where the command line says nothing. 'single' serves one "
+            "Settings for a kind of use, applied only where the command line says nothing. With no --preset, a server "
+            "of one running request (--max-running-requests 1, or the shell) serves as 'single'; 'none' keeps it without "
+            "a preset. 'single' serves one "
             "request at a time on a GPU smaller than the model: --max-running-requests 1, --embed-weights host, "
             "--memory-ratio 0.95, --moe-prefill-hit-d2d, mtp speculative decoding with 3 draft tokens where the "
             "checkpoint has the MTP layers and an offload expert cache holds a fifth of the experts or more, and a --kv-reserve-tokens that holds the default max output tokens and "
@@ -1335,8 +1337,19 @@ def parse_args(
     if kwargs["cuda_graph_bs"] is not None and kwargs["cuda_graph_max_bs"] is not None:
         parser.error("--cuda-graph-bs lists the captured batch sizes itself; give it without --cuda-graph-max-bs")
 
+    # a one-request server without a named preset serves as --preset single; --preset none keeps it without one
+    default_single = kwargs["preset"] is None and kwargs["max_running_req"] == 1
+    if kwargs["preset"] == "none":
+        kwargs["preset"] = None
+    elif default_single:
+        kwargs["preset"] = "single"
     if kwargs["preset"] is not None:
         kwargs["preset_fields"] = _apply_preset(kwargs, left_alone)
+    if default_single:
+        logger.info(
+            "no --preset for a server of one running request: serving as --preset single, which filled "
+            + (", ".join(kwargs["preset_fields"]) or "nothing") + " (--preset none serves without it)"
+        )
     if kwargs["cuda_graph_bs"] is not None:
         sizes, most = sorted(set(kwargs["cuda_graph_bs"])), kwargs["max_running_req"]
         if sizes[0] < 1 or sizes[-1] > most:

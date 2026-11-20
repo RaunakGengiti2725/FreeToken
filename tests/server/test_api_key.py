@@ -150,6 +150,46 @@ def test_explicit_flag_wins_over_the_preset(flag, field, value):
         assert args.speculative_num_steps == 0
 
 
+def test_a_one_request_server_without_a_preset_serves_as_single():
+    """No --preset and one running request: 'single''s fields, filled as --preset single fills them."""
+    alone, single = _parse("--max-running-requests", "1"), _parse("--preset", "single", "--max-running-requests", "1")
+    assert dataclasses.asdict(alone) == dataclasses.asdict(single)
+    assert alone.preset == "single" and alone.preset_fields == tuple(f for f in _PRESET_FIELDS if f != "max_running_req")
+    assert all(getattr(alone, name) == value for name, value in _PRESET_SINGLE.items())
+    # --preset single itself differs only in the field the command line typed here
+    named = _parse("--preset", "single")
+    differ = {f.name for f in dataclasses.fields(named) if getattr(named, f.name) != getattr(alone, f.name)}
+    assert differ == {"preset_fields"} and named.preset_fields == _PRESET_FIELDS
+    # several running requests: no preset, as before
+    assert _parse().preset is None and _parse("--max-running-requests", "2").preset is None
+
+
+def test_preset_none_keeps_a_one_request_server_without_a_preset():
+    bare = _parse("--preset", "none", "--max-running-requests", "1")
+    assert bare.preset is None and bare.preset_fields == ()
+    # today's config without a preset: the class defaults, the one running request it typed apart
+    plain = _parse()
+    differ = {f.name: getattr(bare, f.name) for f in dataclasses.fields(bare) if getattr(bare, f.name) != getattr(plain, f.name)}
+    assert differ == {"max_running_req": 1}
+    assert all(getattr(bare, name) == getattr(ServerArgs, name) for name in _PRESET_SINGLE if name != "max_running_req")
+    assert _parse("--preset", "none") == plain
+
+
+@pytest.mark.parametrize(
+    "flag, field, value",
+    [
+        (("--memory-ratio", "0.9"), "memory_ratio", 0.9),
+        (("--embed-weights", "gpu"), "embed_weights", "gpu"),
+        (("--speculative-algorithm", "off"), "speculative_algorithm", None),
+        (("--kv-reserve-tokens", "8192"), "kv_reserve_tokens", 8192),
+    ],
+)
+def test_explicit_flag_wins_over_the_one_request_default(flag, field, value):
+    args = _parse("--max-running-requests", "1", *flag)
+    assert args.preset == "single" and getattr(args, field) == value and field not in args.preset_fields
+    assert dataclasses.asdict(args) == dataclasses.asdict(_parse("--preset", "single", "--max-running-requests", "1", *flag))
+
+
 def test_preset_single_fast_is_single_and_the_captured_prefill_forwards():
     single, fast = _parse("--preset", "single"), _parse("--preset", "single-fast")
     differ = {f.name for f in dataclasses.fields(single) if getattr(single, f.name) != getattr(fast, f.name)}

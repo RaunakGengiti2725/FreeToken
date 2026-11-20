@@ -13,6 +13,17 @@ and MoE backends, cache sizes, tool-call and reasoning parsers — resolves from
 the checkpoint and the GPU; see [cli.md](cli.md) for the flags. The server is
 ready when the log reaches `API server is ready to serve on 127.0.0.1:1919`.
 
+For one user at a time, serve one request:
+
+```bash
+ft serve --model ~/models/Qwen3.6-35B-A3B --max-running-requests 1
+```
+
+With no `--preset` named, a server of one running request serves as `--preset single`
+([Presets](cli.md#presets)), and one log line names the settings it filled. A flag on the
+command line still wins over the setting it would fill, and `--preset none` serves without a
+preset. A server of several running requests (the default is 4) takes no preset unless one is named.
+
 ## Send a request
 
 Check what is being served:
@@ -48,7 +59,8 @@ ft shell                                    # attach to the server above
 ft shell --model ~/models/Qwen3.6-35B-A3B   # start an engine and chat, one process
 ```
 
-`/help` lists the in-shell commands. Attach mode needs no GPU, so it also drives
+`ft shell --model` serves one request, so it starts as `--preset single` unless a `--preset` is
+named. `/help` lists the in-shell commands. Attach mode needs no GPU, so it also drives
 a server on another machine (`--server URL`).
 
 ## Use a coding agent
