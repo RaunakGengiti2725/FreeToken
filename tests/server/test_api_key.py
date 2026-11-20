@@ -111,7 +111,8 @@ _PRESET_FIELDS = (*_PRESET_SINGLE, "moe_strategy")
 
 
 def test_preset_single_changes_its_fields_and_nothing_without_the_flag():
-    plain, preset = _parse(), _parse("--preset", "single")
+    # --preset none is the server without a preset (no flag at all now serves as single)
+    plain, preset = _parse("--preset", "none"), _parse("--preset", "single")
     changed = {f.name: getattr(preset, f.name) for f in dataclasses.fields(plain) if getattr(plain, f.name) != getattr(preset, f.name)}
     assert changed == {**_PRESET_SINGLE, "preset": "single", "preset_fields": _PRESET_FIELDS}
     # without the flag: the class defaults, and a startup dump of the arguments that does not name it
@@ -160,19 +161,22 @@ def test_a_one_request_server_without_a_preset_serves_as_single():
     named = _parse("--preset", "single")
     differ = {f.name for f in dataclasses.fields(named) if getattr(named, f.name) != getattr(alone, f.name)}
     assert differ == {"preset_fields"} and named.preset_fields == _PRESET_FIELDS
+    # no flag at all resolves to the same config as --preset single
+    assert dataclasses.asdict(_parse()) == dataclasses.asdict(named)
     # several running requests: no preset, as before
-    assert _parse().preset is None and _parse("--max-running-requests", "2").preset is None
+    assert _parse("--max-running-requests", "2").preset is None
 
 
 def test_preset_none_keeps_a_one_request_server_without_a_preset():
     bare = _parse("--preset", "none", "--max-running-requests", "1")
     assert bare.preset is None and bare.preset_fields == ()
     # today's config without a preset: the class defaults, the one running request it typed apart
-    plain = _parse()
+    plain = _parse("--preset", "none")
     differ = {f.name: getattr(bare, f.name) for f in dataclasses.fields(bare) if getattr(bare, f.name) != getattr(plain, f.name)}
     assert differ == {"max_running_req": 1}
     assert all(getattr(bare, name) == getattr(ServerArgs, name) for name in _PRESET_SINGLE if name != "max_running_req")
-    assert _parse("--preset", "none") == plain
+    assert all(getattr(plain, name) == getattr(ServerArgs, name) for name in _PRESET_SINGLE)
+    assert plain.preset is None and plain.preset_fields == ()
 
 
 @pytest.mark.parametrize(

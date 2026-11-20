@@ -19,7 +19,7 @@ For one user at a time, serve one request:
 ft serve --model ~/models/Qwen3.6-35B-A3B --max-running-requests 1
 ```
 
-With no `--preset` named, a server of one running request serves as `--preset single`
+With no `--preset` named and no `--max-running-requests` above 1, the server serves as `--preset single`
 ([Presets](cli.md#presets)), and one log line names the settings it filled. A flag on the
 command line still wins over the setting it would fill, and `--preset none` serves without a
 preset. A server of several running requests (the default is 4) takes no preset unless one is named.

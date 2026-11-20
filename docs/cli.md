@@ -44,7 +44,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--port` | 1919 | Bind port |
 | `--api-key` | `$FREETOKEN_API_KEY`, else off | Require the key on every route except `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`; other requests get a 401 |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
-| `--preset` | `single` with one running request, else none | With no `--preset`, a server of one running request (`--max-running-requests 1`, or `ft shell --model`) serves as `single`; `none` serves without a preset. `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. `single-fast`: `single` with a captured prefill forward for continuations of up to 64 tokens, with `single`'s replies. `single-bucket`: `single-fast` with captured forwards for chunks of exactly 128, 256, 512 and 1,024 tokens, with `single`'s replies. `multi`: `single` for several requests at a time, 8 unless `--max-running-requests` names another number. See [Presets](#presets) |
+| `--preset` | `single` unless `--max-running-requests` is above 1 | With no `--preset` and no `--max-running-requests` above 1 (no flag, `--max-running-requests 1`, or `ft shell --model`), the server serves as `single`; `none` serves without a preset. `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing. `single-measured`: the same, and the first start times what the settings cannot choose. `single-fast`: `single` with a captured prefill forward for continuations of up to 64 tokens, with `single`'s replies. `single-bucket`: `single-fast` with captured forwards for chunks of exactly 128, 256, 512 and 1,024 tokens, with `single`'s replies. `multi`: `single` for several requests at a time, 8 unless `--max-running-requests` names another number. See [Presets](#presets) |
 | `--calibrate-again` | off | With `--preset single-measured`: time on this start also when a choice is stored for this checkpoint, flags and machine: the candidates the stored calibration had no time for, or all of them once none is left. See [Presets](#presets) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
@@ -134,8 +134,8 @@ default max output tokens plus a 4096-token prompt (36864), so that an answer of
 not cut off with `finish_reason: length`. What each of these costs or buys in expert slots is in
 [performance/decode.md](performance/decode.md#getting-more-slots).
 
-With no `--preset` named, a server of one running request (`--max-running-requests 1`, or
-`ft shell --model`, which serves one) serves as `--preset single`: the same fields, filled and dropped
+With no `--preset` named and no `--max-running-requests` above 1 (no flag at all, `--max-running-requests 1`, or
+`ft shell --model`, which serves one), the server serves as `--preset single`: the same fields, filled and dropped
 by the same rules, and one log line names the fields it filled. `--preset none` serves without a
 preset, as a server with no `--preset` did before. A server of several running requests takes no
 preset unless one is named.
