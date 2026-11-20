@@ -1014,7 +1014,13 @@ _KEY_SINGLE_FAST = _KEY_HEAD + "|prefill_graph_chunks=1-64|prefill_graph_tokens=
         # a demand length changes a prefill only: typed, it does not make another setup either, nor did the preset's going from 96 to 512
         (("--preset", "single", "--moe-prefill-demand-tokens", "32"), _KEY_SINGLE),
         (("--preset", "single", "--moe-prefill-demand-tokens", "96"), _KEY_SINGLE),
-        (("--moe-prefill-demand-tokens", "32"), "ckpt@bf41ffe2|cache=auto:0.9|cpu=0/4@e5b47b|spec=off|tp=1|req=4|dtype=bfloat16"),
+        # with no preset named and no --max-running-requests above 1 the server serves as --preset single, so its key is
+        # single's; --preset none keeps the server without a preset and its own key
+        (("--moe-prefill-demand-tokens", "32"), _KEY_SINGLE),
+        (
+            ("--preset", "none", "--moe-prefill-demand-tokens", "32"),
+            "ckpt@bf41ffe2|cache=auto:0.9|cpu=0/4@e5b47b|spec=off|tp=1|req=4|dtype=bfloat16",
+        ),
     ],
 )
 def test_a_preset_start_finds_the_rows_filed_before_its_prefill_demand_length(decode_rows, monkeypatch, flags, key):
